@@ -413,6 +413,18 @@ The date doesn't have to go on the right -- this reads left-to-right as
 people as writing it the more usual way,
 `birth.date.sortval < Date('Jan 1, 1900')`.
 
+### Goal: Find families where the mother's surname contains the father's
+
+```
+Family "father.surname in mother.surname"
+```
+
+The substring form of `in` can take a field on the left now, not just a
+literal -- this reads "does the mother's surname contain the father's,"
+the same test as `'Jan' in given_name` but with a field standing in for
+the literal substring. Works the same for two plain columns on the same
+row too (`Person "given_name in surname"`).
+
 ## Things this can't do (yet)
 
 - Anything beyond the patterns shown above -- this is a small, fixed set of

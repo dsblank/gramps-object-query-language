@@ -18,12 +18,6 @@ does today.
   [Chained comparisons / operand ordering](#chained-comparisons--operand-ordering)
   below.
 
-**`in` / substring**
-- `'text' in field` (the substring-test shape) requires a string *literal* on
-  the left -- `other_field in field` (comparing two fields for substring
-  containment) isn't supported, only a literal against a field.
-  (docs/where_expr.md)
-
 **Relationships**
 - Six one-to-one relationship links are registered: `Person` -> `birth`/
   `death` (-> `Event`), `Family` -> `father`/`mother` (-> `Person`), `Event`
@@ -353,6 +347,70 @@ constants), and real end-to-end SQLite execution
 returns the identical result set as writing it the usual way, not just an
 identical wire shape.
 
+### Field-vs-field substring `in` (`other_field in field`)
+
+Implemented -- item D. Turned out to need real `query.py`/`evaluator.py`
+changes, not just a parser tweak (revised down from an initial "closer to
+1" estimate, made before actually checking whether `Contains` already
+supported a field-vs-field `value` the way the base `Comparison` class
+does -- it didn't): `Contains.compile()` overrides `compile()` entirely
+and unconditionally treated `self.value` as a Python string to escape at
+*compile* time (`self.value.replace(...)`), with no `is_field_comparison`
+branch at all. Same gap in `evaluator.py`'s `Contains` branch, and
+`query_lang.py`'s `_condition_from_json` (the `"contains"` case returned
+before the `value_column` check even ran).
+
+`query_lang.py`'s `_translate_compare` now checks `_is_path_node(node.left)`
+inside the `in`-branch before falling back to `_translate_value` --
+producing `{"column": ..., "op": "contains", "value_column": ...}`,
+parallel to every other operator's field-vs-field shape. `Contains.compile()`
+gained an `is_field_comparison` branch: since the needle is only known at
+query *execution* time now, not compile time, the wildcard-escaping
+Python's `.replace(...)` does upfront for a literal has to happen in SQL
+instead, via nested `REPLACE(...)` in the same backslash-first order,
+wrapped in `'%' || ... || '%'` -- both dialects support `REPLACE`/`||`
+identically, no per-dialect branch needed. `evaluator.py`'s `Contains`
+branch mirrors it: resolves `expr.value` via `resolve_column_ref` when it's
+a field, treating a missing *needle* as `None`/unknown the same way a
+missing haystack already was.
+
+**Found a real, pre-existing, silent correctness bug in the process, not
+just missing Contains support**: every field-vs-field test/doc example
+before this change happened to cross a relationship or JSON path
+(`father.surname == mother.surname`, `mother.death.date.sortval <
+father.death.date.sortval`) -- both `RelatedObject`, unambiguous. Two plain
+flat columns on the *same* table, compared directly (`given_name ==
+surname`), was never actually exercised anywhere. `_translate_column`
+resolves a flat column to a bare `str`, and `Comparison.compile()`'s
+`is_field_comparison = isinstance(self.value, (JsonPath, RelatedObject))`
+doesn't recognize a bare `str` as a field at all (by design -- see the
+class's own docstring: "a bare string is exactly as likely to be a literal
+value... as a column name"). Confirmed empirically:
+`compile_expr("person", "given_name == surname")` silently compiled to
+comparing `given_name` against the *literal text* `"surname"`, not the two
+columns -- reachable directly from the documented language, not a
+contrived edge case, and would have made the new Contains feature wrong
+for the most natural case (two flat columns) if left unfixed.
+
+Fixed with a new `FlatColumnRef(name: str)` wrapper (query.py) -- added to
+`ColumnRef`, recognized in `_render_column` (unwraps to a plain column,
+same as a bare `str` already was), and added to every
+`isinstance(..., (JsonPath, RelatedObject))` field-comparison check across
+`Comparison.compile()`, `Contains.compile()`, and `evaluator.py`'s two
+matching branches plus `resolve_column_ref`. `query_lang.py`'s
+`_condition_from_json` wraps a `value_column` that resolves to a bare
+`str` in `FlatColumnRef` before constructing the comparison object --
+the one place this ambiguity needs resolving, since it's the only code
+path that turns a wire-format `value_column` into a real object.
+
+Verified with a dedicated regression suite (`test_query.py`'s "FlatColumnRef"
+section): SQL-shape assertions, real end-to-end SQLite execution proving
+`given_name == surname` actually compares columns (not a string literal),
+and a SQL-vs-evaluator agreement test in the same style as
+`evaluate_where`'s `Not`/missing-value regression guard (see Done above) --
+the same AST run through the real SQLite compiler and through
+`evaluate_where` against equivalent fake data, asserting they agree.
+
 ## Possibilities
 
 ### Chained comparisons / operand ordering
@@ -595,7 +653,7 @@ database/collation concern, not a `where_expr` language gap.)
 Each row is lettered so the dependency analysis right below it can refer
 back to individual items. Letters are kept stable as items get implemented
 (rather than renumbered) so old discussion of e.g. "B depends on..." stays
-correct -- **B and C have shipped** (see Done above) and are kept here,
+correct -- **B, C, and D have shipped** (see Done above) and are kept here,
 struck through, so that history stays legible.
 
 | # | Example | Gap | Difficulty |
@@ -603,7 +661,7 @@ struck through, so that history stays legible.
 | A | `1 < gender < 3` (chained, literal on the right of each leg) | no chained comparisons | 1 |
 | ~~B~~ | ~~`Date(...) < mother.birth.sortval` (literal on the left)~~ | **Done** -- see [Operand ordering](#operand-ordering-value-op-field) above | ~~2~~ |
 | ~~C~~ | ~~`gender is None`, `mother is not None`, `tag not in tags`~~ | **Done** -- see `is` / `is not` / `not in` above | ~~1~~ |
-| D | `other_field in field` | substring `in` requires a string literal on the left | 2 |
+| ~~D~~ | ~~`other_field in field`~~ | **Done** -- see [Field-vs-field substring `in`](#field-vs-field-substring-in-other_field-in-field) above | ~~2~~ |
 | E | a person's non-birth/death event, one-to-one | only 6 `_RELATIONSHIPS` entries registered | 1 |
 | F | `event.type == EventType.MARRIAGE` (or `FamilyRelType.*`, `NameType.*`, ...) | ~~only `Person`/`Citation`/`Note` constants wired~~ -- **stale, already Done**: `_CONSTANT_CLASSES` (query_lang.py) already covers `EventType`/`FamilyRelType`/`NameType`/`PlaceType`/and 10 more `GrampsType` classes, verified directly against a live parse (`event.type.value == EventType.BIRTH` compiles today). This row's original premise no longer holds; kept only as a note to fix the "Values and functions" bullet in Current limitations, not as an open item. | n/a |
 | G | `len(primary_name.surname_list) > 1` | see `len()` section above | 3 |
@@ -635,27 +693,37 @@ the actual diff (a new `_is_count_call` helper, a `_FLIP_OP` table, and
 both at the parser level and end-to-end against real SQLite execution, not
 just wire-shape equivalence.
 
+**D was re-estimated *up*, not down, once actually checked** -- the
+opposite direction from B/C. Before implementing, D looked like it should
+be cheaper than its original 2 (B's operand-classification pattern seemed
+directly reusable); checking the actual `Contains`/evaluator code first
+showed it overrides `compile()` entirely with no field-vs-field support at
+all, unlike the base `Comparison` class B's pattern lives on. Landed at its
+original difficulty-2 estimate, plus an unplanned, larger side-fix: a
+pre-existing silent correctness bug in the field-vs-field mechanism itself
+(flat-column-vs-flat-column silently comparing against a literal instead
+of the other column), found only because D's own tests were the first ones
+to try two bare flat columns directly. See
+[Field-vs-field substring `in`](#field-vs-field-substring-in-other_field-in-field)
+under Done above.
+
 ### Dependencies between the items above
 
 Checked directly against `_translate_compare`'s actual branches rather than
 assumed -- most items are independent, but a few share code paths or make
 each other cheaper:
 
-- **C had no dependency on anything else here** (now moot, since it
-  shipped) -- it was already ~90% built by composition of already-Done
-  pieces (see the note above), so it didn't block, and wasn't blocked by,
-  A/B/D.
-- **D still benefits from B, now that B has shipped.** D's bug
-  (`_translate_value(node.left)` assumes the left side of `in` is always a
-  literal) is the identical *shape* of bug B just fixed for `<`/`>`/etc. --
-  both are "one operand's role is hardcoded by position instead of
-  classified." B's fix didn't introduce a single shared "classify this
-  operand" function, though -- it reused `_is_path_node`/a new
-  `_is_count_call` inline inside `_translate_compare`'s `else` branch, so D
-  doesn't get fixed for free. But the exact same `_is_path_node` helper,
-  now proven correct in production for this exact class of bug, is right
-  there for D's `in`-branch to call on `node.left` too -- still a small,
-  mostly-copy-paste change, difficulty stays close to 1.
+- **C and D had no real dependency on anything else here** (both now moot,
+  since both shipped). C was already ~90% built by composition of
+  already-Done pieces (see the note above). D's predicted dependency on
+  B (the `_is_path_node` check B proved out) turned out correct as far as
+  it went -- D's `in`-branch does call the same `_is_path_node(node.left)`
+  check on the way to `{"column": ..., "op": "contains", "value_column":
+  ...}` -- but that piece was the *easy* part of D. The larger, unpredicted
+  piece (the `Contains`/evaluator compiler work, plus the pre-existing
+  flat-column field-vs-field bug) had no relationship to B at all -- it was
+  a gap in `Contains`'s own `compile()` override, not in
+  `_translate_compare`'s operand classification.
 - **B and F turned out to both already be moot, for different reasons.**
   B has shipped (see Done above). F's premise was already stale before
   this session touched it -- `_CONSTANT_CLASSES` covers the full
@@ -694,11 +762,17 @@ each other cheaper:
   from `where_expr` compilation -- touches neither `_translate_compare`
   nor `evaluator.py`'s comparison logic at all.
 
-**Net effect on build order (as originally planned, before B/C shipped):**
+**Net effect on build order (as originally planned, before B/C/D shipped):**
 B was the one item worth doing early even though its own difficulty (2)
 wasn't special on its own -- it was the only item on this list with
 downstream leverage (cheapens D, and is the seam G/H would need if their
 scope grows). C shipped first instead, since it turned out to be nearly
-free once checked directly -- B followed right after. Of what's left, D is
-now the cheapest next pick given B's classifier pattern is proven in
-production.
+free once checked directly -- B followed right after, then D. **D is the
+one lesson from this whole exercise worth remembering going forward**:
+"looks cheap because a related item just shipped" is a hypothesis to check
+against the actual code (does the target class already have the pattern
+B/C proved, or does it override behavior entirely, like `Contains` did?),
+not a difficulty estimate to trust on its own -- D's own difficulty barely
+moved (2 either way), but the *reason* moved entirely, from "reuse B's
+classifier" to "`Contains` never had field-vs-field support at all, and
+neither did anything flat-column-vs-flat-column."

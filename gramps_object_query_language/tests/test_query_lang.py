@@ -164,11 +164,14 @@ def test_contains_operator_rejects_non_string_literal_lhs():
         parse_expr("person", "5 in given_name")
 
 
-def test_contains_operator_rejects_field_on_both_sides():
-    # Field-vs-field isn't supported for "contains" -- only a literal
-    # substring on the left.
-    with pytest.raises(QueryLangError):
-        parse_expr("person", "given_name in surname")
+def test_contains_field_vs_field():
+    # "other_field in field" -- field-vs-field substring test. given_name is
+    # the needle (left); surname the haystack (right), same reversed order
+    # as the literal-substring form.
+    result = parse_expr("person", "given_name in surname")
+    assert result == [
+        {"column": "surname", "op": "contains", "value_column": "given_name"}
+    ]
 
 
 def test_like_call():
@@ -871,12 +874,18 @@ def test_field_vs_field_subscript_rhs():
     ]
 
 
-def test_field_vs_field_rejected_for_in_operator():
-    # 'in' always expects a list literal RHS; a bare path there is not a
-    # valid list and should be rejected the same way any other non-list
-    # value would be, not silently treated as a value_column.
-    with pytest.raises(QueryLangError):
-        parse_expr("family", "father.surname in mother.surname")
+def test_contains_field_vs_field_through_relationships():
+    # Same field-vs-field substring test, crossing a relationship on each
+    # side -- resolve_column_path handles "father"/"mother" the same way it
+    # would for any other comparison.
+    result = parse_expr("family", "father.surname in mother.surname")
+    assert result == [
+        {
+            "column": {"json_path": ["mother", "surname"]},
+            "op": "contains",
+            "value_column": {"json_path": ["father", "surname"]},
+        }
+    ]
 
 
 def test_field_vs_field_rhs_class_constant_still_treated_as_value():

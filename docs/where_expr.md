@@ -227,10 +227,18 @@ before the father" -- both sides cross a relationship (`Family` -> `Person`
 all.
 
 `field in [...]` always expects a list literal on the right, never a
-field-vs-field form -- and the substring form of `in` always expects a
-string literal on the left, never a field-vs-field form either
-(`other_field in field` is rejected, not interpreted as "does field
-contain other_field's value").
+field-vs-field form. The substring form of `in`, though, now supports a
+field on the left too:
+
+```python
+Family "father.surname in mother.surname"
+```
+
+This reads "does the mother's surname contain the father's" -- the same
+substring test as `'Jan' in given_name`, just with a field standing in for
+the literal. Works the same whether both fields cross a relationship (as
+above) or are plain columns on the same row (`Person "given_name in
+surname"`).
 
 ## One-to-many relationships: `exists(...)`
 

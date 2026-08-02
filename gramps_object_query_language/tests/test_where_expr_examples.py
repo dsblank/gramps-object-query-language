@@ -409,6 +409,14 @@ def test_field_vs_field_same_hop(db):
     assert result == [("fam1",)]
 
 
+def test_contains_field_vs_field_readme_example(db):
+    # "does the mother's surname contain the father's" -- fam1's parents
+    # (dad1, mom1) are both Smiths, so "Smith" is (trivially) a substring
+    # of "Smith". fam2's parents (granddad1 Smith, grandma1 Doyle) aren't.
+    result = run(db, "Family", "father.surname in mother.surname")
+    assert result == [("fam1",)]
+
+
 # --- relationship traversal (Family -> Person -> Event) ----------------------
 
 

@@ -144,6 +144,7 @@ from .query import (
     Contains,
     Eq,
     Exists,
+    FlatColumnRef,
     Gt,
     Gte,
     In,
@@ -505,19 +506,27 @@ def _translate_compare(node: ast.Compare, spec: ObjectTypeSpec) -> dict:
                 raise QueryLangError("'in' requires a non-empty list")
             leaf = {"column": column, "op": "in", "value": value}
         elif _is_path_node(rhs):
-            # "'substring' in field" -- a plain substring test, mirroring
-            # what `in` already means for two real Python strings. The
-            # field is on the *right* here (unlike every other operator),
-            # since that's what makes `'Jan' in given_name` read the same
-            # as it would in real Python.
-            substring = _translate_value(node.left)
-            if not isinstance(substring, str):
-                raise QueryLangError(
-                    "'... in path' (substring test) requires a string literal "
-                    f"on the left, e.g. \"'Jan' in given_name\": {ast.dump(node)}"
-                )
+            # "'substring' in field" / "other_field in field" -- a plain
+            # substring test, mirroring what `in` already means for two real
+            # Python strings. The field being searched is on the *right*
+            # here (unlike every other operator), since that's what makes
+            # `'Jan' in given_name` read the same as it would in real Python.
             column = _translate_column(rhs, spec)
-            leaf = {"column": column, "op": "contains", "value": substring}
+            if _is_path_node(node.left):
+                # "other_field in field" -- field-vs-field: the needle is
+                # itself a path, only known at query execution time, not a
+                # literal to bind now.
+                value_column = _translate_column(node.left, spec)
+                leaf = {"column": column, "op": "contains", "value_column": value_column}
+            else:
+                substring = _translate_value(node.left)
+                if not isinstance(substring, str):
+                    raise QueryLangError(
+                        "'... in path' (substring test) requires a string literal "
+                        "or a field path on the left, e.g. \"'Jan' in given_name\" "
+                        f"or \"nickname in given_name\": {ast.dump(node)}"
+                    )
+                leaf = {"column": column, "op": "contains", "value": substring}
         else:
             raise QueryLangError(
                 "'in' requires either a list literal ('field in [1, 2]') or a "
@@ -760,13 +769,22 @@ def _condition_from_json(condition: dict, spec: ObjectTypeSpec) -> Any:
         return In(column, condition["value"])
     if op == "like":
         return Like(column, condition["value"])
-    if op == "contains":
-        return Contains(column, condition["value"])
     if "value_column" in condition:
-        # Field-vs-field, e.g. "mother.death.date.sortval < father.death.date.sortval".
+        # Field-vs-field, e.g. "mother.death.date.sortval < father.death.date.sortval",
+        # or (for "contains") "other_field in field".
         value = _json_column_to_ref(condition["value_column"], spec)
+        if isinstance(value, str):
+            # A flat (same-table) column resolves to a bare str here --
+            # identical in shape to an ordinary literal, which
+            # Comparison/Contains would otherwise (silently, wrongly) treat
+            # this as. Wrap it so it's unambiguously "a field", the same
+            # way a JsonPath/RelatedObject already unambiguously is -- see
+            # FlatColumnRef's docstring.
+            value = FlatColumnRef(value)
     else:
         value = condition["value"]
+    if op == "contains":
+        return Contains(column, value)
     return _OP_CLASSES[op](column, value)
 
 

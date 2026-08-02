@@ -477,12 +477,38 @@ def resolve_column_path(
     return JsonPath(tuple(segments))
 
 
+@dataclass(frozen=True)
+class FlatColumnRef:
+    """A flat column referenced as a comparison's *value* -- the right-hand
+    side of a field-vs-field comparison whose column happens to be a plain
+    (same-table) flat column rather than a `JsonPath`/`RelatedObject`.
+
+    `Comparison.value` (and `Contains.value`) already support a field
+    reference on the value side -- but only ever recognize `JsonPath`/
+    `RelatedObject` as one (see `Comparison`'s docstring: "a bare string is
+    exactly as likely to be a literal value... as a column name, and
+    there's no way to tell which was meant"). A flat column resolves to a
+    bare `str`, identical in shape to an ordinary string literal -- so
+    without this wrapper, "given_name == surname" would silently compile to
+    comparing `given_name` against the *literal text* `"surname"`, not the
+    two columns against each other. This wraps a flat column specifically
+    for that one role, so `is_field_comparison`-style checks can tell it
+    apart from a real literal the same way they already can for `JsonPath`/
+    `RelatedObject`. Renders identically to a plain column reference --
+    `name` is unwrapped and passed straight through wherever a bare `str`
+    column already worked (see `_render_column`, `resolve_column_ref`).
+    """
+
+    name: str
+
+
 # A column reference is either a plain (whitelisted) column name, a path
-# into one column's JSON content, or a field reached via a relationship
-# (see `RelatedObject`/`resolve_column_path`) -- `field: ColumnRef` on
-# `RelatedObject` makes this recursive, so a chain like `birth.place.title`
-# is itself a valid `ColumnRef`.
-ColumnRef = Union[str, JsonPath, RelatedObject, CollectionCount]
+# into one column's JSON content, a field reached via a relationship (see
+# `RelatedObject`/`resolve_column_path`), or (value-position only, see
+# `FlatColumnRef`) a flat column marked as a field rather than a literal --
+# `field: ColumnRef` on `RelatedObject` makes this recursive, so a chain
+# like `birth.place.title` is itself a valid `ColumnRef`.
+ColumnRef = Union[str, JsonPath, RelatedObject, CollectionCount, FlatColumnRef]
 SelectRef = ColumnRef
 
 
@@ -738,6 +764,8 @@ def _render_column(
         return _render_json_path(column, _require_dialect(dialect, column), value)
     if isinstance(column, CollectionCount):
         return _render_collection_count(column, spec.table, dialect, treeid)
+    if isinstance(column, FlatColumnRef):
+        column = column.name
     _check_column(column, spec.columns)
     return _quote_column(column), []
 
@@ -766,14 +794,18 @@ class Comparison:
     """Base class for single-column comparison leaves (`Eq`, `Lt`, ...).
 
     `value` is normally a literal, always bound as a `?` parameter. It can
-    also be another `JsonPath`/`RelatedObject` -- a *field-vs-field*
-    comparison, e.g. "families where the mother's death date is before the
-    father's" (`Lt(mother_death_sortval, father_death_sortval)`). Plain
-    `str` is deliberately never treated as a field reference here (only
-    `JsonPath`/`RelatedObject` are) -- a bare string is exactly as likely
-    to be a literal value (`Eq("surname", "Smith")`) as a column name, and
-    there's no way to tell which was meant; `JsonPath`/`RelatedObject`
-    carry no such ambiguity; nothing constructs one to represent a literal.
+    also be another `JsonPath`/`RelatedObject`/`FlatColumnRef` -- a
+    *field-vs-field* comparison, e.g. "families where the mother's death
+    date is before the father's" (`Lt(mother_death_sortval,
+    father_death_sortval)`). Plain `str` is deliberately never treated as a
+    field reference here (only `JsonPath`/`RelatedObject`/`FlatColumnRef`
+    are) -- a bare string is exactly as likely to be a literal value
+    (`Eq("surname", "Smith")`) as a column name, and there's no way to tell
+    which was meant; a same-table flat column being compared as a field
+    (not a literal) has to be wrapped in `FlatColumnRef` for exactly this
+    reason -- see its docstring. `JsonPath`/`RelatedObject`/`FlatColumnRef`
+    carry no such ambiguity; nothing constructs a bare `str` to represent a
+    field reference.
     """
 
     op: str
@@ -788,7 +820,7 @@ class Comparison:
         dialect: Optional[Dialect] = None,
         treeid: Optional[int] = None,
     ) -> Tuple[str, list]:
-        is_field_comparison = isinstance(self.value, (JsonPath, RelatedObject))
+        is_field_comparison = isinstance(self.value, (JsonPath, RelatedObject, FlatColumnRef))
         # A field-vs-field comparison has no literal runtime value to infer
         # a numeric/boolean cast from (unlike field-vs-value) -- pick it
         # structurally instead: an *ordering* comparison between two paths
@@ -859,9 +891,19 @@ class Like(Comparison):
 class Contains(Comparison):
     """WHERE column LIKE '%<value>%' ESCAPE '\\' -- a plain substring test
     (`'Jan' in given_name`), as opposed to `Like`'s user-authored SQL pattern
-    with real `%`/`_` wildcards. `value` is the literal substring being
-    searched for -- any `%`, `_`, or `\\` it contains is escaped here so it
-    matches literally instead of being reinterpreted as a wildcard.
+    with real `%`/`_` wildcards. `value` is normally the literal substring
+    being searched for -- any `%`, `_`, or `\\` it contains is escaped here
+    so it matches literally instead of being reinterpreted as a wildcard.
+
+    `value` can also be a `JsonPath`/`RelatedObject`/`FlatColumnRef` -- a
+    *field-vs-field* substring test (`other_field in field`). The substring
+    is then only known at query *execution* time, not compile time, so the
+    escaping that Python's `.replace(...)` does up front for a literal has
+    to happen in SQL instead, via nested `REPLACE(...)` in the same order
+    (backslash first, so it doesn't double-escape the `%`/`_` replacements
+    that follow it) -- both dialects support `REPLACE`/`||` identically, so
+    there's no per-dialect branch needed here, unlike most of this module's
+    other field-crossing rendering.
     """
 
     op = "LIKE"
@@ -872,6 +914,25 @@ class Contains(Comparison):
         dialect: Optional[Dialect] = None,
         treeid: Optional[int] = None,
     ) -> Tuple[str, list]:
+        if isinstance(self.value, (JsonPath, RelatedObject, FlatColumnRef)):
+            # Any string content works as the cast hint here -- Contains
+            # always wants a TEXT extraction (LIKE has no numeric/boolean
+            # form), never the numeric/boolean cast `_render_json_path`
+            # would otherwise pick for an ordering comparison.
+            column_sql, column_params = _render_column(
+                self.column, spec, dialect, value="", treeid=treeid
+            )
+            value_sql, value_params = _render_column(
+                self.value, spec, dialect, value="", treeid=treeid
+            )
+            escaped = (
+                f"REPLACE(REPLACE(REPLACE({value_sql}, '\\', '\\\\'), "
+                f"'%', '\\%'), '_', '\\_')"
+            )
+            return (
+                f"{column_sql} LIKE '%' || {escaped} || '%' ESCAPE '\\'",
+                column_params + value_params,
+            )
         escaped = (
             self.value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         )

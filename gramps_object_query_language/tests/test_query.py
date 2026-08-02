@@ -40,6 +40,7 @@ from gramps_object_query_language.query import (
     Dialect,
     Eq,
     Exists,
+    FlatColumnRef,
     Gt,
     Gte,
     In,
@@ -750,6 +751,110 @@ def test_field_vs_field_end_to_end_sqlite_execution():
     assert rows == [("f1",)]
 
 
+# --- FlatColumnRef: field-vs-field between two plain flat columns -------------
+#
+# Every field-vs-field test above crosses a relationship or a JSON path
+# (RelatedObject/JsonPath) -- both unambiguous field references already.
+# Two flat columns on the *same* table (e.g. "given_name == surname") is the
+# one case where the natural translation, a bare `str`, is indistinguishable
+# from an ordinary literal (Eq("surname", "Smith") is exactly as valid) --
+# a real, pre-existing bug (found while adding Contains's field-vs-field
+# support): without FlatColumnRef, "given_name == surname" silently compiled
+# to comparing given_name against the *literal text* "surname", never
+# caught because no existing test/doc example happened to compare two bare
+# flat columns directly.
+
+
+def test_flat_column_field_vs_field_renders_as_column_not_literal():
+    sql, params = compile_query(
+        PERSON,
+        Query(select=["handle"], where=Eq("given_name", FlatColumnRef("surname"))),
+        dialect=Dialect.SQLITE,
+    )
+    assert "given_name IS NOT DISTINCT FROM surname" in sql
+    # No bound parameter for "surname" -- it's a column reference, not a value.
+    assert "surname" not in params
+
+
+def test_bare_str_value_still_treated_as_literal_not_flat_column_field():
+    # The critical distinction FlatColumnRef exists to draw: Eq("surname",
+    # "Smith") (an ordinary literal comparison) must be completely unaffected.
+    sql, params = compile_query(
+        PERSON, Query(select=["handle"], where=Eq("surname", "Smith")), dialect=Dialect.SQLITE
+    )
+    assert "surname IS NOT DISTINCT FROM ?" in sql
+    assert params[0] == "Smith"
+
+
+def test_flat_column_field_vs_field_end_to_end_sqlite_execution():
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE person (handle TEXT, given_name TEXT, surname TEXT)")
+    # p1: given_name and surname genuinely equal -- matches. p2: same
+    # given_name text as p1's *surname*, but its own surname differs -- must
+    # NOT match (proves the comparison is column-vs-column, not
+    # column-vs-the-literal-text-"surname").
+    conn.execute("INSERT INTO person VALUES ('p1', 'Same', 'Same')")
+    conn.execute("INSERT INTO person VALUES ('p2', 'surname', 'Different')")
+    sql, params = compile_query(
+        PERSON,
+        Query(select=["handle"], where=Eq("given_name", FlatColumnRef("surname"))),
+        dialect=Dialect.SQLITE,
+    )
+    rows = conn.execute(sql, params).fetchall()
+    assert rows == [("p1",)]
+
+
+def test_flat_column_field_vs_field_sql_matches_evaluator():
+    # The same regression-guard pattern used for evaluate_where's
+    # Not/missing-value fix (see ROADMAP.md's Done section) -- run the same
+    # AST through the real SQLite compiler and through evaluate_where
+    # against equivalent data, and assert they agree, rather than trusting
+    # either path in isolation.
+    import sqlite3
+
+    from gramps_object_query_language.evaluator import evaluate_where
+
+    class _FakeSurname:
+        def __init__(self, surname):
+            self.surname = surname
+
+    class _FakeName:
+        def __init__(self, given_name, surname):
+            self._given_name = given_name
+            self._surname = surname
+
+        def get_first_name(self):
+            return self._given_name
+
+        def get_surname_list(self):
+            return [_FakeSurname(self._surname)]
+
+    class _FakePerson:
+        def __init__(self, given_name, surname):
+            self._name = _FakeName(given_name, surname)
+
+        def get_primary_name(self):
+            return self._name
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE person (handle TEXT, given_name TEXT, surname TEXT)")
+    conn.execute("INSERT INTO person VALUES ('p1', 'Same', 'Same')")
+    conn.execute("INSERT INTO person VALUES ('p2', 'surname', 'Different')")
+    where = Eq("given_name", FlatColumnRef("surname"))
+    sql, params = compile_query(
+        PERSON, Query(select=["handle"], where=where), dialect=Dialect.SQLITE
+    )
+    sql_matches = {row[0] for row in conn.execute(sql, params).fetchall()}
+
+    people = {"p1": _FakePerson("Same", "Same"), "p2": _FakePerson("surname", "Different")}
+    evaluator_matches = {
+        handle for handle, obj in people.items() if evaluate_where(None, obj, where, PERSON)
+    }
+    assert sql_matches == evaluator_matches == {"p1"}
+
+
 # --- NULL-safe equality (`=`/`!=` -> IS [NOT] DISTINCT FROM) ------------------
 #
 # Plain SQL `=`/`!=` use three-valued logic: if either side is NULL, the
@@ -830,6 +935,95 @@ def test_contains_escapes_like_metacharacters_in_value():
 
 def test_contains_repr_shows_raw_substring_not_escaped_pattern():
     assert repr(Contains("surname", "100%")) == "Contains('surname', '100%')"
+
+
+# --- Contains, field-vs-field ("other_field in field") -----------------------
+#
+# Unlike a literal substring, the needle here is only known at query
+# *execution* time -- Python's compile-time `.replace(...)` escaping can't
+# apply, so the same escaping has to happen in SQL itself via nested
+# `REPLACE(...)`, in the same backslash-first order.
+#
+# A flat (same-table) column has to be wrapped in FlatColumnRef to be
+# recognized as a field rather than a literal -- a bare `"given_name"`
+# string is exactly what Contains("surname", "given_name") means when the
+# *literal text* "given_name" is the substring being searched for; nothing
+# distinguishes that from a column reference except this wrapper (see
+# FlatColumnRef's docstring). The parser (query_lang.py) applies this
+# wrapping automatically -- these tests construct the query.py objects
+# directly, so they apply it explicitly.
+
+
+def test_contains_field_vs_field_sqlite_shape():
+    sql, params = compile_query(
+        PERSON,
+        Query(select=["handle"], where=Contains("surname", FlatColumnRef("given_name"))),
+        dialect=Dialect.SQLITE,
+    )
+    assert "REPLACE(REPLACE(REPLACE(given_name" in sql
+    assert "surname LIKE '%' || " in sql
+    assert "ESCAPE '\\'" in sql
+    assert params == [50]  # only the outer treeid param -- no bound pattern
+
+
+def test_contains_field_vs_field_through_relationships_postgresql_shape():
+    birth_place_title = resolve_column_path(PERSON, ["birth", "place", "title"])
+    death_place_title = resolve_column_path(PERSON, ["death", "place", "title"])
+    sql, params = compile_query(
+        PERSON,
+        Query(select=["handle"], where=Contains(death_place_title, birth_place_title)),
+        dialect=Dialect.POSTGRESQL,
+    )
+    # Both sides are correlated subqueries (birth/death events -> place),
+    # same as any other field-vs-field comparison -- Contains adds the
+    # REPLACE/concatenation wrapper around the value side only.
+    assert sql.count("SELECT") >= 2
+    assert "REPLACE(REPLACE(REPLACE(" in sql
+    assert "LIKE '%' || " in sql
+
+
+def test_contains_field_vs_field_end_to_end_sqlite_execution():
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE person (handle TEXT, given_name TEXT, surname TEXT)")
+    # kid1's nickname ("Rob") is a substring of their given name ("Robert") --
+    # matches. other1's nickname ("Al") is not a substring of their surname
+    # ("Jones") -- doesn't match.
+    conn.execute("INSERT INTO person VALUES ('kid1', 'Rob', 'Robert')")
+    conn.execute("INSERT INTO person VALUES ('other1', 'Al', 'Jones')")
+    sql, params = compile_query(
+        PERSON,
+        Query(select=["handle"], where=Contains("surname", FlatColumnRef("given_name"))),
+        dialect=Dialect.SQLITE,
+    )
+    rows = conn.execute(sql, params).fetchall()
+    assert rows == [("kid1",)]
+
+
+def test_contains_field_vs_field_escapes_wildcard_characters_in_needle():
+    # The needle field's *runtime* value contains a real "%" -- it must
+    # still be matched literally (as the literal-substring form already
+    # guarantees via Python's .replace(...)), not reinterpreted as a LIKE
+    # wildcard, even though the escaping now has to happen in SQL via
+    # REPLACE(...) instead of at compile time.
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE person (handle TEXT, given_name TEXT, surname TEXT)")
+    conn.execute("INSERT INTO person VALUES ('p1', '50% off', 'a 50% off coupon')")
+    conn.execute("INSERT INTO person VALUES ('p2', '50X off', 'a 50% off coupon')")
+    sql, params = compile_query(
+        PERSON,
+        Query(select=["handle"], where=Contains("surname", FlatColumnRef("given_name"))),
+        dialect=Dialect.SQLITE,
+    )
+    rows = conn.execute(sql, params).fetchall()
+    # p1's needle ("50% off") really is a literal substring of its haystack
+    # -- matches. p2's needle ("50X off") isn't -- if "%" had instead been
+    # treated as a wildcard, p2 would incorrectly match too ("50" + anything
+    # + " off" is a substring of "a 50% off coupon").
+    assert rows == [("p1",)]
 
 
 def test_null_safe_equality_end_to_end_sqlite_execution():

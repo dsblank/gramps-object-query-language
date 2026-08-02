@@ -57,6 +57,7 @@ from .query import (
     Comparison,
     Contains,
     Exists,
+    FlatColumnRef,
     In,
     JsonPath,
     Not,
@@ -204,6 +205,8 @@ def resolve_column_ref(db: Any, obj: Any, ref: ColumnRef, spec: ObjectTypeSpec) 
         return get_json_path(obj, ref)
     if isinstance(ref, CollectionCount):
         return _collection_count(db, obj, ref)
+    if isinstance(ref, FlatColumnRef):
+        return get_flat_column(obj, ref.name, spec)
     return get_flat_column(obj, ref, spec)
 
 
@@ -359,17 +362,28 @@ def _evaluate_tri(db: Any, obj: Any, expr: Any, spec: ObjectTypeSpec) -> Optiona
         return value in expr.values
     if isinstance(expr, Contains):
         # A plain substring test -- unlike `Like`'s SQL-pattern matching
-        # (`_like_to_regex`), `expr.value` here is a literal substring with
-        # no wildcard characters to reinterpret, so a direct (case-insensitive,
-        # matching SQLite's default `LIKE` behavior) Python `in` check is both
+        # (`_like_to_regex`), `expr.value` (when a literal) has no wildcard
+        # characters to reinterpret, so a direct (case-insensitive, matching
+        # SQLite's default `LIKE` behavior) Python `in` check is both
         # correct and simpler than routing through the LIKE/regex machinery.
+        # `expr.value` can also be a `JsonPath`/`RelatedObject` -- a
+        # field-vs-field substring test -- resolved the same way `expr.column`
+        # is; a missing needle (as opposed to a missing haystack) is just as
+        # much "unknown" as a missing haystack, so it collapses to the same
+        # `None` (SQL's `LIKE` against a NULL pattern is `UNKNOWN` too).
         value = resolve_column_ref(db, obj, expr.column, spec)
         if value is None:
             return None
-        return expr.value.lower() in str(value).lower()
+        if isinstance(expr.value, (JsonPath, RelatedObject, FlatColumnRef)):
+            substring = resolve_column_ref(db, obj, expr.value, spec)
+            if substring is None:
+                return None
+        else:
+            substring = expr.value
+        return str(substring).lower() in str(value).lower()
     if isinstance(expr, Comparison):
         left = resolve_column_ref(db, obj, expr.column, spec)
-        if isinstance(expr.value, (JsonPath, RelatedObject)):
+        if isinstance(expr.value, (JsonPath, RelatedObject, FlatColumnRef)):
             right = resolve_column_ref(db, obj, expr.value, spec)
         else:
             right = expr.value
