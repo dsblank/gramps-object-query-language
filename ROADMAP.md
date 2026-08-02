@@ -10,9 +10,9 @@ does today.
 ## Current limitations
 
 **Boolean structure**
-- No `or` -- conditions can only be combined with `and`. (README-query-language.md,
-  docs/where_expr.md)
-- No `not` -- a whole condition can't be negated. (same)
+- No `not` -- a whole condition can't be negated. (README-query-language.md,
+  docs/where_expr.md) `and`/`or` are both supported, and can be mixed and
+  nested (`(a and b) or c`), following Python's own precedence.
 - No chained comparisons (`1 < gender < 3`) -- write `gender > 1 and gender < 3`
   instead. (docs/where_expr.md)
 - No `is`, `is not`, `not in`. (docs/where_expr.md)
@@ -69,6 +69,21 @@ does today.
   `object_query.py`'s `where` field takes the JSON shape directly;
   `parse_expr`/`compile_expr` exist as a standalone layer on top, not yet
   exposed to a client that only has a query string.
+
+## Done
+
+### `or`
+
+Implemented. Turned out much smaller than this document originally
+estimated ("likely the largest single item here") -- `query.py`'s `Or`
+class and `evaluator.py`'s `Or` branch already existed, fully working and
+tested, before this change; the only work was teaching `query_lang.py`'s
+parser to walk `ast.BoolOp` recursively instead of rejecting anything but a
+top-level `and`, and choosing a wire shape (`{"or": [...]}`, with nested
+`{"and": [...]}` where needed) that's additive -- any expression that
+doesn't use `or` still produces the exact same flat list it always did. No
+SQL or evaluator changes were needed at all. See `query_lang.py`'s
+`_translate_bool_or_leaf`/`_translate_top_level`/`_node_from_json`.
 
 ## Possibilities
 
@@ -145,15 +160,23 @@ side only; missing path treated as `0` (matches user intuition -- "no list
 recorded" reads as "zero", not "unknown"); non-array-value and NULL-vs-zero
 edge cases written as tests *before* either dialect is wired up.
 
+### `not`
+
+The remaining boolean-structure gap now that `or` is done (see "Done"
+below). Expected to be small: `query.py`'s `Not` class and `evaluator.py`'s
+`Not` branch already exist and are already tested (same as `Or` was before
+`or` support landed) -- the work is almost entirely in `query_lang.py`,
+teaching `_translate_bool_or_leaf` to also recognize `ast.UnaryOp` with
+`ast.Not` and produce a `{"not": node}` wire shape, plus a matching case in
+`_node_from_json`. No new SQL, no dialect work, no NULL-semantics decisions
+-- the same reason `or` turned out to be smaller than originally estimated
+here.
+
 ### Other gaps (not yet scoped to this level of detail)
 
 Each maps to a limitation above; none has had the same close look as
 `len()` yet:
 
-- **`or`/`not`** -- the current `where` wire shape is a flat, implicitly-AND'd
-  list of leaf conditions; representing `or`/`not` needs a real tree shape
-  (nested `{"and"/"or"/"not": [...]}"`), which is a wire-format change, not
-  just a parser addition -- likely the largest single item here.
 - **More relationships** (children, non-birth/death events, notes,
   citations, sources, media, tags) -- mechanically similar to the existing
   five (a `_RELATIONSHIPS` registry entry each), *if* they stay one-to-one.

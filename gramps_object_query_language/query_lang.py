@@ -37,10 +37,16 @@ wire-it-up-later path this session.
 Current scope, matching what `object_query.py`'s wire format actually
 supports today:
 
-- Top level is a conjunction of comparisons (`a == b and c > d and ...`)
-  -- `or`/`not` have no JSON representation in the current `where` shape
-  (a flat list of leaf conditions, implicitly AND'd), so they're rejected
-  here too, not silently dropped.
+- Top level is a boolean expression of comparisons combined with `and`/`or`,
+  nested however Python's own precedence and grouping resolves it (`and`
+  binds tighter than `or`, and parentheses group as usual) -- `a == b and
+  c > d or e == f` parses the same way real Python would. `not` still has
+  no representation and is rejected. The wire shape stays a flat list of
+  leaf conditions, implicitly AND'd, for any expression that doesn't use
+  `or` at all -- byte-identical to before `or` support existed. An
+  expression that does use `or` gets an `{"or": [...]}` node (possibly
+  containing nested `{"and": [...]}` nodes) in place of a leaf wherever
+  it's needed -- see `_translate_top_level`/`_translate_bool_or_leaf`.
 - A comparison is `path OP value` where `OP` is one of
   `== != < <= > >=` or Python's `in` (`path in [v1, v2, ...]`) -- these are
   all the same `ast.Compare` node shape, just different `ops`.
@@ -109,6 +115,7 @@ from .query import (
     Lte,
     Ne,
     ObjectTypeSpec,
+    Or,
     resolve_column_path,
 )
 
@@ -383,18 +390,42 @@ def _translate_comparison_like_node(node: ast.AST, spec: ObjectTypeSpec) -> dict
     )
 
 
-def _translate_top_level(node: ast.AST, spec: ObjectTypeSpec) -> List[dict]:
+def _translate_bool_or_leaf(node: ast.AST, spec: ObjectTypeSpec) -> dict:
+    """Translate one node of a (possibly nested) boolean expression: a leaf
+    comparison/`like(...)` call, or an `and`/`or` of further such nodes.
+
+    `ast.parse` has already resolved Python's own `and`/`or` precedence and
+    grouping into correctly nested `BoolOp` nodes (`and` binds tighter than
+    `or`, so `a and b or c` arrives as `BoolOp(Or, [BoolOp(And, [a, b]),
+    c])`) -- this only walks whatever shape it's handed, it doesn't
+    re-implement precedence itself. `not` has no case here (or anywhere in
+    this module): an `ast.UnaryOp` isn't a `BoolOp`, so it falls straight
+    through to `_translate_comparison_like_node`, which rejects it with a
+    clear error, the same as any other unrecognized node shape.
+    """
     if isinstance(node, ast.BoolOp):
-        if not isinstance(node.op, ast.And):
-            raise QueryLangError(
-                "'or' has no JSON representation in the current where format yet "
-                "-- only 'and' is supported"
-            )
-        conditions = []
-        for value in node.values:
-            conditions.append(_translate_comparison_like_node(value, spec))
-        return conditions
-    return [_translate_comparison_like_node(node, spec)]
+        key = "and" if isinstance(node.op, ast.And) else "or"
+        return {key: [_translate_bool_or_leaf(value, spec) for value in node.values]}
+    return _translate_comparison_like_node(node, spec)
+
+
+def _translate_top_level(node: ast.AST, spec: ObjectTypeSpec) -> List[dict]:
+    """The whole expression, translated to `parse_expr`'s public shape: a
+    list of nodes, implicitly AND'd together.
+
+    A top-level `{"and": [...]}` -- i.e. any expression that doesn't use
+    `or` at all, including a single bare comparison -- is unwrapped back
+    into a flat list here, so the wire shape for those expressions is
+    exactly what it was before `or` support existed. An expression that
+    does use `or` produces a list containing an `{"or": [...]}` node
+    (alongside plain leaves too, e.g. `"(a or b) and c"` -> `[{"or": [a,
+    b]}, c]`), rather than changing the top-level shape from a list to
+    something else.
+    """
+    translated = _translate_bool_or_leaf(node, spec)
+    if isinstance(translated, dict) and tuple(translated) == ("and",):
+        return translated["and"]
+    return [translated]
 
 
 def parse_expr_for_spec(spec: ObjectTypeSpec, expr: str) -> List[dict]:
@@ -484,14 +515,27 @@ def _condition_from_json(condition: dict, spec: ObjectTypeSpec) -> Any:
     return _OP_CLASSES[op](column, value)
 
 
+def _node_from_json(node: dict, spec: ObjectTypeSpec) -> Any:
+    """One `parse_expr`-shaped node -- a leaf condition, or an `{"and"/"or":
+    [...]}` combinator produced by `or` support -- translated to a
+    `query.py` boolean expression (`Eq`/`Lt`/`In`/... for a leaf, `And`/
+    `Or` for a combinator), recursing into each child the same way.
+    """
+    if "and" in node:
+        return And(*(_node_from_json(child, spec) for child in node["and"]))
+    if "or" in node:
+        return Or(*(_node_from_json(child, spec) for child in node["or"]))
+    return _condition_from_json(node, spec)
+
+
 def compile_expr_for_spec(spec: ObjectTypeSpec, expr: str) -> Any:
     """Parse and translate a where-expression string into a `query.py` `where`
-    AST (a single comparison, or an `And` of them), ready for `compile_query`/
-    `compile_count_query`. For callers that already have `spec` -- see
-    `parse_expr_for_spec`.
+    AST (a single comparison, or an `And`/`Or` tree of them), ready for
+    `compile_query`/`compile_count_query`. For callers that already have
+    `spec` -- see `parse_expr_for_spec`.
     """
     conditions = parse_expr_for_spec(spec, expr)
-    asts = [_condition_from_json(condition, spec) for condition in conditions]
+    asts = [_node_from_json(condition, spec) for condition in conditions]
     return asts[0] if len(asts) == 1 else And(*asts)
 
 

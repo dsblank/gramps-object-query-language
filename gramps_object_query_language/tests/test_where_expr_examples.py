@@ -204,6 +204,30 @@ def test_contains_operator_readme_example(db):
     assert result == [("mom1",)]
 
 
+# --- disjunction (or) ---------------------------------------------------------
+
+
+def test_or_operator(db):
+    # John (dad1) matches on given_name; Mary Doyle (grandma1) matches on
+    # surname instead -- neither would match if this were "and".
+    result = run(db, "Person", "given_name == 'John' or surname == 'Doyle'")
+    assert result == [("dad1",), ("grandma1",)]
+
+
+def test_and_binds_tighter_than_or_end_to_end(db):
+    # "(male Smiths) or (anyone named Mary)" -- without the parentheses this
+    # would read as "male, and (a Smith or named Mary)", a different (and
+    # here empty for the male-only half) set of people. Matches: every male
+    # Smith (dad1, granddad1, kid1) plus Mary Doyle (grandma1), who isn't a
+    # Smith at all but is named Mary.
+    result = run(
+        db,
+        "Person",
+        "(gender == Person.MALE and surname == 'Smith') or given_name == 'Mary'",
+    )
+    assert result == [("dad1",), ("granddad1",), ("grandma1",), ("kid1",)]
+
+
 # --- relationship traversal (Person -> Event) --------------------------------
 
 

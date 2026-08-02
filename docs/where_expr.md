@@ -39,7 +39,7 @@ Person "gender == Person.MALE"
 [Constants](#constants)) -- `gender == Person.MALE` and `gender == 1` compile
 to exactly the same thing.
 
-## Combining conditions with `and`
+## Combining conditions with `and` and `or`
 
 Multiple comparisons can be joined with `and`:
 
@@ -47,9 +47,30 @@ Multiple comparisons can be joined with `and`:
 Person "gender == Person.MALE and surname == 'Smith'"
 ```
 
-`or` and `not` have no representation in the current query format and are
-rejected -- as are chained comparisons like `1 < gender < 3` (write
-`gender > 1 and gender < 3` instead).
+...or with `or`:
+
+```python
+Person "given_name == 'John' or surname == 'Doyle'"
+```
+
+`and`/`or` can be mixed in one expression, and follow the same precedence
+and grouping real Python uses -- `and` binds tighter than `or`, so
+
+```python
+Person "gender == Person.MALE and surname == 'Smith' or given_name == 'Mary'"
+```
+
+reads as `(gender == Person.MALE and surname == 'Smith') or given_name ==
+'Mary'`, not `gender == Person.MALE and (surname == 'Smith' or given_name ==
+'Mary')`. Parentheses group explicitly, exactly as in Python:
+
+```python
+Person "(gender == Person.MALE and surname == 'Smith') or given_name == 'Mary'"
+```
+
+`not` has no representation in the current query format and is rejected --
+as are chained comparisons like `1 < gender < 3` (write `gender > 1 and
+gender < 3` instead).
 
 ## `in`, contains, and `like`
 
@@ -239,7 +260,7 @@ Person "birth.date.sortval >= Date('Jan 1, 1968')"
 
 ## What's *not* supported
 
-- `or`, `not` -- no representation in the current query format yet.
+- `not` -- no representation in the current query format yet.
 - Chained comparisons (`1 < gender < 3`) -- write `gender > 1 and gender < 3`.
 - `is`, `is not`, `not in` -- only `==`, `!=`, `<`, `<=`, `>`, `>=`, `in`
   (both its list-membership and substring-test shapes), and `like(...)`

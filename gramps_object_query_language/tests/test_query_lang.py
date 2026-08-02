@@ -36,6 +36,7 @@ from gramps_object_query_language.query import (
     Gte,
     JsonPath,
     Lt,
+    Or,
     RelatedObject,
 )
 
@@ -232,12 +233,91 @@ def test_and_conjunction_of_three():
     assert len(result) == 3
 
 
+# --- disjunction (or) --------------------------------------------------------
+
+
+def test_or_produces_or_node():
+    result = parse_expr("person", "gender == 1 or gender == 2")
+    assert result == [
+        {
+            "or": [
+                {"column": "gender", "op": "eq", "value": 1},
+                {"column": "gender", "op": "eq", "value": 2},
+            ]
+        }
+    ]
+
+
+def test_or_of_three():
+    # A single `BoolOp` node holds all three values, not nested pairs --
+    # mirrors how `and` already collapses `a and b and c` into one node.
+    result = parse_expr("person", "gender == 1 or gender == 2 or gender == 3")
+    assert result == [
+        {
+            "or": [
+                {"column": "gender", "op": "eq", "value": 1},
+                {"column": "gender", "op": "eq", "value": 2},
+                {"column": "gender", "op": "eq", "value": 3},
+            ]
+        }
+    ]
+
+
+def test_and_binds_tighter_than_or():
+    # Python's own precedence, resolved by ast.parse before this module ever
+    # sees the tree: "a and b or c" is "(a and b) or c", not "a and (b or c)".
+    result = parse_expr(
+        "person", "gender == 1 and surname == 'Smith' or given_name == 'John'"
+    )
+    assert result == [
+        {
+            "or": [
+                {
+                    "and": [
+                        {"column": "gender", "op": "eq", "value": 1},
+                        {"column": "surname", "op": "eq", "value": "Smith"},
+                    ]
+                },
+                {"column": "given_name", "op": "eq", "value": "John"},
+            ]
+        }
+    ]
+
+
+def test_parenthesized_or_inside_and_stays_flat_and_list():
+    # "(a or b) and c" -- the top-level "and" is still unwrapped into a flat
+    # list (implicitly AND'd, exactly like before "or" support existed),
+    # with the "or" node as one of its elements rather than changing the
+    # top-level shape.
+    result = parse_expr(
+        "person", "(gender == 1 or gender == 2) and surname == 'Smith'"
+    )
+    assert result == [
+        {
+            "or": [
+                {"column": "gender", "op": "eq", "value": 1},
+                {"column": "gender", "op": "eq", "value": 2},
+            ]
+        },
+        {"column": "surname", "op": "eq", "value": "Smith"},
+    ]
+
+
+def test_or_wraps_like_and_contains():
+    # "or" composes with the other leaf shapes (like(...), the substring
+    # form of "in"), not just plain comparisons.
+    result = parse_expr("person", "like(given_name, 'J%') or 'an' in given_name")
+    assert result == [
+        {
+            "or": [
+                {"column": "given_name", "op": "like", "value": "J%"},
+                {"column": "given_name", "op": "contains", "value": "an"},
+            ]
+        }
+    ]
+
+
 # --- explicitly rejected: things with no wire-format equivalent yet -------------
-
-
-def test_or_rejected():
-    with pytest.raises(QueryLangError):
-        parse_expr("person", "gender == 1 or gender == 2")
 
 
 def test_not_rejected():
@@ -667,6 +747,24 @@ def test_compile_expr_multiple_conditions_become_and():
     _, where = compile_expr("person", "gender == Person.MALE and surname == 'Smith'")
     assert isinstance(where, And)
     assert where.exprs == (Eq("gender", 1), Eq("surname", "Smith"))
+
+
+def test_compile_expr_or_becomes_or():
+    _, where = compile_expr("person", "given_name == 'John' or given_name == 'Jane'")
+    assert isinstance(where, Or)
+    assert where.exprs == (Eq("given_name", "John"), Eq("given_name", "Jane"))
+
+
+def test_compile_expr_mixed_and_or_nests_correctly():
+    # "(a or b) and c" -- Or nested inside And, matching Python's own
+    # grouping, not flattened or reordered.
+    _, where = compile_expr(
+        "person", "(gender == 1 or gender == 2) and surname == 'Smith'"
+    )
+    assert isinstance(where, And)
+    assert where.exprs[1] == Eq("surname", "Smith")
+    assert isinstance(where.exprs[0], Or)
+    assert where.exprs[0].exprs == (Eq("gender", 1), Eq("gender", 2))
 
 
 def test_compile_expr_end_to_end_sqlite_execution():
