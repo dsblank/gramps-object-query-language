@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gramps-object-query-language"
+version = "0.1.0"
+description = "A small, closed object query language and SQL compiler for Gramps genealogy data"
+readme = "README.md"
+license = { text = "AGPL-3.0-or-later" }
+requires-python = ">=3.9"
+authors = [{ name = "Douglas Blank", email = "doug.blank@gmail.com" }]
+classifiers = [
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Topic :: Sociology :: Genealogy",
+]
+dependencies = [
+    "gramps>=6.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/dsblank/gramps-object-query-language"
+
+[tool.setuptools.packages.find]
+include = ["gramps_object_query_language*"]
+exclude = ["gramps_object_query_language.tests*"]
+
+[tool.setuptools.package-data]
+gramps_object_query_language = ["py.typed"]

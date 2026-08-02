@@ -1,0 +1,274 @@
+#
+# Gramps Web API - A RESTful API for the Gramps genealogy program
+#
+# Copyright (C) 2026      Douglas Blank
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+#
+
+"""Evaluate `query.py`'s AST directly against real Gramps objects.
+
+`query.py` compiles a `Query`/`where` expression to SQL, which is only safe
+to run against an *unproxied* database -- it has no notion of privacy or any
+other proxy-applied rule, and reimplementing one in SQL is exactly the
+mistake this module exists to avoid (see `query.py`'s module docstring).
+This module instead walks the same AST and evaluates it directly against a
+real object, fetched through whatever `db` the caller passes in. When `db`
+is a proxy, every object this module ever sees -- the row object itself and
+anything reached via a `RelatedObject` hop, at any depth -- has already been
+through that proxy's own `include_*`/`sanitize_*` rules. Correctness follows
+from that alone: there is no separate privacy guard here the way
+`Comparison.compile()` needs a `CASE WHEN` guard for NULL-safe `Eq`/`Ne` --
+a masked field already reads back as whatever the proxy's `sanitize_*` left
+it as (typically `None`), and plain Python `==`/`!=`/`is None` against that
+already-correct value is automatically the right, non-leaking answer.
+
+Not fast: no SQL push-down, no keyset narrowing before objects are fetched.
+Intended for the proxied path, where the query's result set is expected to
+be small relative to the table, or where correctness matters more than
+p99 latency -- see `object_query.py`'s dispatch.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Any
+
+from gramps.gen.errors import HandleError
+from gramps.gen.lib import json_utils
+
+from .query import (
+    And,
+    ColumnIndex,
+    ColumnRef,
+    Comparison,
+    In,
+    JsonPath,
+    Not,
+    ObjectTypeSpec,
+    Or,
+    RelatedObject,
+)
+
+# Real getter method name for each `ObjectTypeSpec.table`, used to fetch a
+# `RelatedObject` hop's target through `db` (whatever proxy or plain
+# database that is) -- never a direct/unproxied lookup.
+GETTER_BY_TABLE: dict[str, str] = {
+    "person": "get_person_from_handle",
+    "family": "get_family_from_handle",
+    "event": "get_event_from_handle",
+    "place": "get_place_from_handle",
+    "repository": "get_repository_from_handle",
+    "source": "get_source_from_handle",
+    "citation": "get_citation_from_handle",
+    "media": "get_media_from_handle",
+    "note": "get_note_from_handle",
+    "tag": "get_tag_from_handle",
+}
+
+
+def _given_name(obj: Any) -> str:
+    primary_name = obj.get_primary_name()
+    return primary_name.get_first_name() if primary_name else ""
+
+
+def _surname(obj: Any) -> str:
+    primary_name = obj.get_primary_name()
+    if not primary_name:
+        return ""
+    surname_list = primary_name.get_surname_list()
+    if not surname_list or not surname_list[0]:
+        return ""
+    return surname_list[0].surname
+
+
+def _enclosed_by(obj: Any) -> str:
+    for placeref in obj.get_placeref_list():
+        return placeref.ref
+    return ""
+
+
+# `given_name`/`surname`/`enclosed_by` are real SQL columns (populated by the
+# DB layer at write time), but not real attributes on the in-memory object --
+# mirrors gramps core's `gen/db/generic.py` `DbGeneric._get_person_data`/
+# `_get_place_data` exactly, the functions that populate those same columns.
+_DERIVED_COLUMNS: dict[str, dict[str, Any]] = {
+    "person": {"given_name": _given_name, "surname": _surname},
+    "place": {"enclosed_by": _enclosed_by},
+}
+
+
+def get_flat_column(obj: Any, column: str, spec: ObjectTypeSpec) -> Any:
+    """A flat column's value straight off a real object.
+
+    `getattr` for anything `get_secondary_fields()` already exposes as a
+    real attribute (`gramps_id`, `gender`, `private`, `handle`,
+    `father_handle`, `place`, ...) -- which is everything except the small,
+    fixed set of derived columns above.
+    """
+    derived = _DERIVED_COLUMNS.get(spec.table, {})
+    if column in derived:
+        return derived[column](obj)
+    return getattr(obj, column)
+
+
+def _walk_json_path(data: Any, segments: Any, root_obj: Any) -> Any:
+    """Walk `JsonPath.segments` against `data` (an `object_to_dict()` dict).
+
+    A `ColumnIndex` segment resolves against `root_obj` -- the row the path
+    started from -- not whatever `data` has been narrowed to by that point,
+    mirroring `_render_handle_ref`'s "this row's `<column>`" semantics
+    exactly (only ever appears as a `RelatedObject.handle_ref` segment, so
+    this only matters one level deep in practice).
+    """
+    current = data
+    for segment in segments:
+        if current is None:
+            return None
+        if isinstance(segment, ColumnIndex):
+            index = getattr(root_obj, segment.column)
+            if index is None or index < 0:
+                return None
+            segment = index
+        if isinstance(segment, int):
+            if not isinstance(current, list) or not -len(current) <= segment < len(current):
+                return None
+            current = current[segment]
+        else:
+            if not isinstance(current, dict):
+                return None
+            current = current.get(segment)
+    return current
+
+
+def get_json_path(obj: Any, path: JsonPath) -> Any:
+    """`JsonPath.segments` extracted from `obj`'s real, in-memory data.
+
+    `object_to_dict()` is the same JSON-shaped structure the compiled SQL
+    path navigates via `json_extract`/`->` against the stored `json_data`
+    column -- using it here keeps the two paths interpreting a `JsonPath`
+    identically without hand-duplicating that shape.
+    """
+    if path.base_column != "json_data":
+        raise ValueError(f"unsupported JsonPath base column: {path.base_column!r}")
+    data = json_utils.object_to_dict(obj)
+    return _walk_json_path(data, path.segments, obj)
+
+
+def _resolve_related_object(
+    db: Any, obj: Any, ref: RelatedObject, spec: ObjectTypeSpec
+) -> Any:
+    if isinstance(ref.handle_ref, JsonPath):
+        handle = get_json_path(obj, ref.handle_ref)
+    else:
+        handle = get_flat_column(obj, ref.handle_ref, spec)
+    if not handle:
+        return None
+    getter = getattr(db, GETTER_BY_TABLE[ref.target.table])
+    try:
+        return getter(handle)
+    except HandleError:
+        return None
+
+
+def resolve_column_ref(db: Any, obj: Any, ref: ColumnRef, spec: ObjectTypeSpec) -> Any:
+    """`query.py`'s `_render_column`, evaluated in Python against a real
+    object instead of rendered as SQL.
+
+    `db` is whatever the caller is running under (proxy or plain) --
+    every `RelatedObject` hop is fetched through it (`_resolve_related_object`),
+    so the same rules that applied to `obj` itself apply to everything
+    reached from it, at any depth, with no separate handling needed here.
+    """
+    if obj is None:
+        return None
+    if isinstance(ref, RelatedObject):
+        related_obj = _resolve_related_object(db, obj, ref, spec)
+        return resolve_column_ref(db, related_obj, ref.field, ref.target)
+    if isinstance(ref, JsonPath):
+        return get_json_path(obj, ref)
+    return get_flat_column(obj, ref, spec)
+
+
+def _like_to_regex(pattern: str) -> re.Pattern:
+    """Translate a SQL `LIKE` pattern (`%`/`_` wildcards) to a regex.
+
+    Case-insensitive, matching SQLite's default `LIKE` behavior for ASCII --
+    the backend every test fixture and single-tree/dev deployment actually
+    runs (see `object_query.py`'s `_resolve_dialect`). Any other character
+    is escaped literally via `re.escape` before the wildcard translation.
+    """
+    out = []
+    for char in pattern:
+        if char == "%":
+            out.append(".*")
+        elif char == "_":
+            out.append(".")
+        else:
+            out.append(re.escape(char))
+    return re.compile("^" + "".join(out) + "$", re.IGNORECASE)
+
+
+_ORDERING_OPS = {
+    "<": lambda a, b: a < b,
+    "<=": lambda a, b: a <= b,
+    ">": lambda a, b: a > b,
+    ">=": lambda a, b: a >= b,
+}
+
+
+def _compare(op: str, left: Any, right: Any) -> bool:
+    if op == "=":
+        return left == right
+    if op == "!=":
+        return left != right
+    if op == "LIKE":
+        if left is None or right is None:
+            return False
+        return _like_to_regex(str(right)).match(str(left)) is not None
+    if op in _ORDERING_OPS:
+        # SQL's ordering comparisons exclude a NULL operand via standard
+        # three-valued logic (a masked or genuinely-missing value never
+        # satisfies `<`/`<=`/`>`/`>=`) -- Python raises TypeError instead,
+        # so this has to be explicit.
+        if left is None or right is None:
+            return False
+        return _ORDERING_OPS[op](left, right)
+    raise ValueError(f"unsupported operator: {op!r}")
+
+
+def evaluate_where(db: Any, obj: Any, expr: Any, spec: ObjectTypeSpec) -> bool:
+    """`query.py`'s `.compile()` tree, evaluated in Python against a real
+    object instead of rendered as SQL. See module docstring for why no
+    privacy guard is needed here the way `Comparison.compile()` needs one.
+    """
+    if expr is None:
+        return True
+    if isinstance(expr, And):
+        return all(evaluate_where(db, obj, e, spec) for e in expr.exprs)
+    if isinstance(expr, Or):
+        return any(evaluate_where(db, obj, e, spec) for e in expr.exprs)
+    if isinstance(expr, Not):
+        return not evaluate_where(db, obj, expr.expr, spec)
+    if isinstance(expr, In):
+        value = resolve_column_ref(db, obj, expr.column, spec)
+        return value in expr.values
+    if isinstance(expr, Comparison):
+        left = resolve_column_ref(db, obj, expr.column, spec)
+        if isinstance(expr.value, (JsonPath, RelatedObject)):
+            right = resolve_column_ref(db, obj, expr.value, spec)
+        else:
+            right = expr.value
+        return _compare(expr.op, left, right)
+    raise TypeError(f"unsupported where expression: {expr!r}")

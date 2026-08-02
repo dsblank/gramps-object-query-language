@@ -1,0 +1,587 @@
+#
+# Gramps Web API - A RESTful API for the Gramps genealogy program
+#
+# Copyright (C) 2026      Douglas Blank
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+#
+
+"""Tests for the "almost Python" expression parser (`gramps_webapi.api.query_lang`)."""
+
+import pytest
+
+from gramps_object_query_language.query_lang import (
+    QueryLangError,
+    parse_expr,
+    resolve_namespace,
+)
+from gramps_object_query_language.query import PERSON, FAMILY
+
+
+# --- namespace resolution -----------------------------------------------------
+
+
+def test_resolve_namespace_lowercase():
+    assert resolve_namespace("person") is PERSON
+
+
+def test_resolve_namespace_class_name_casing():
+    assert resolve_namespace("Person") is PERSON
+    assert resolve_namespace("Family") is FAMILY
+
+
+def test_resolve_namespace_unknown_raises():
+    with pytest.raises(QueryLangError):
+        resolve_namespace("bogus")
+
+
+def test_resolve_namespace_no_single_letter_alias():
+    with pytest.raises(QueryLangError):
+        resolve_namespace("P")
+
+
+# --- plain-column vs JsonPath resolution --------------------------------------
+
+
+def test_single_segment_matching_flat_column_becomes_plain_string():
+    assert parse_expr("person", "gender == 1") == [
+        {"column": "gender", "op": "eq", "value": 1}
+    ]
+
+
+def test_multi_segment_path_becomes_json_path():
+    result = parse_expr("person", "primary_name.first_name == 'John'")
+    assert result == [
+        {
+            "column": {"json_path": ["primary_name", "first_name"]},
+            "op": "eq",
+            "value": "John",
+        }
+    ]
+
+
+def test_single_segment_not_matching_flat_column_becomes_json_path():
+    # "birth_year" isn't a real flat column on PERSON -- falls back to
+    # json_path even though it's a single segment.
+    result = parse_expr("person", "birth_year == 1900")
+    assert result == [
+        {"column": {"json_path": ["birth_year"]}, "op": "eq", "value": 1900}
+    ]
+
+
+def test_integer_subscript_becomes_int_segment():
+    result = parse_expr("person", "primary_name.surname_list[0].surname == 'Smith'")
+    assert result == [
+        {
+            "column": {
+                "json_path": ["primary_name", "surname_list", 0, "surname"]
+            },
+            "op": "eq",
+            "value": "Smith",
+        }
+    ]
+
+
+# --- comparison operators ------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "op_src,op_json",
+    [
+        ("==", "eq"),
+        ("!=", "ne"),
+        ("<", "lt"),
+        ("<=", "lte"),
+        (">", "gt"),
+        (">=", "gte"),
+    ],
+)
+def test_all_comparison_operators(op_src, op_json):
+    result = parse_expr("person", f"gender {op_src} 1")
+    assert result == [{"column": "gender", "op": op_json, "value": 1}]
+
+
+def test_in_operator():
+    result = parse_expr("person", "gender in [1, 2]")
+    assert result == [{"column": "gender", "op": "in", "value": [1, 2]}]
+
+
+def test_in_operator_requires_nonempty_list():
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "gender in []")
+
+
+def test_in_operator_rejects_non_list_rhs():
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "gender in (1, 2)")  # tuple, not list
+
+
+def test_like_call():
+    result = parse_expr("person", "like(primary_name.first_name, 'Jo%')")
+    assert result == [
+        {
+            "column": {"json_path": ["primary_name", "first_name"]},
+            "op": "like",
+            "value": "Jo%",
+        }
+    ]
+
+
+def test_like_call_wrong_arity_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "like(gender)")
+
+
+def test_like_call_non_string_pattern_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "like(gender, 5)")
+
+
+# --- literals --------------------------------------------------------------------
+
+
+def test_string_int_float_bool_literals():
+    assert parse_expr("person", "gender == True") == [
+        {"column": "gender", "op": "eq", "value": True}
+    ]
+    assert parse_expr("person", "gender == 1.5") == [
+        {"column": "gender", "op": "eq", "value": 1.5}
+    ]
+    assert parse_expr("person", "gender == None") == [
+        {"column": "gender", "op": "eq", "value": None}
+    ]
+
+
+def test_negative_number_literal():
+    result = parse_expr("family", "some_field == -5")
+    assert result[0]["value"] == -5
+
+
+def test_unary_minus_on_non_numeric_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "gender == -'x'")
+
+
+# --- conjunction (and) -----------------------------------------------------------
+
+
+def test_and_conjunction_produces_multiple_conditions():
+    result = parse_expr("person", "gender == 1 and primary_name.first_name == 'John'")
+    assert result == [
+        {"column": "gender", "op": "eq", "value": 1},
+        {
+            "column": {"json_path": ["primary_name", "first_name"]},
+            "op": "eq",
+            "value": "John",
+        },
+    ]
+
+
+def test_and_conjunction_of_three():
+    result = parse_expr("person", "gender == 1 and gender != 2 and gender < 3")
+    assert len(result) == 3
+
+
+# --- explicitly rejected: things with no wire-format equivalent yet -------------
+
+
+def test_or_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "gender == 1 or gender == 2")
+
+
+def test_not_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "not (gender == 1)")
+
+
+def test_not_in_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "gender not in [1, 2]")
+
+
+def test_is_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "gender is None")
+
+
+def test_chained_comparison_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "1 < gender < 3")
+
+
+def test_bare_name_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "gender")
+
+
+def test_syntax_error_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "gender == 1 +")
+
+
+# --- safety: arbitrary code must never be reachable ------------------------------
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        "__import__('os').system('ls')",
+        "foo(gender, 1)",  # arbitrary function call, not the whitelisted `like`
+        "lambda x: x",
+        "[x for x in range(10)]",
+        "{x: x for x in range(10)}",
+        "(yield 1)",
+        "gender if True else 1",
+        "f'{gender}'",
+    ],
+)
+def test_unsupported_node_shapes_rejected(expr):
+    with pytest.raises(QueryLangError):
+        parse_expr("person", expr)
+
+
+def test_subscript_with_non_constant_index_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "primary_name.surname_list[i].surname == 'Smith'")
+
+
+def test_subscript_with_bool_index_rejected():
+    # bool is an int subclass -- explicitly excluded, matching JsonPath's own
+    # segment validation in query.py.
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "primary_name.surname_list[True].surname == 'Smith'")
+
+
+# --- ClassName.CONST value constants --------------------------------------------
+
+
+def test_person_gender_constants():
+    from gramps.gen.lib import Person
+
+    assert parse_expr("person", "gender == Person.MALE") == [
+        {"column": "gender", "op": "eq", "value": Person.MALE}
+    ]
+    assert parse_expr("person", "gender == Person.FEMALE") == [
+        {"column": "gender", "op": "eq", "value": Person.FEMALE}
+    ]
+    assert parse_expr("person", "gender == Person.UNKNOWN") == [
+        {"column": "gender", "op": "eq", "value": Person.UNKNOWN}
+    ]
+    assert parse_expr("person", "gender == Person.OTHER") == [
+        {"column": "gender", "op": "eq", "value": Person.OTHER}
+    ]
+
+
+def test_citation_confidence_constants():
+    from gramps.gen.lib import Citation
+
+    result = parse_expr("citation", "confidence >= Citation.CONF_HIGH")
+    assert result == [{"column": "confidence", "op": "gte", "value": Citation.CONF_HIGH}]
+
+
+def test_note_format_constants():
+    from gramps.gen.lib import Note
+
+    result = parse_expr("note", "format == Note.FLOWED")
+    assert result == [{"column": "format", "op": "eq", "value": Note.FLOWED}]
+
+
+def test_constant_inside_in_list():
+    from gramps.gen.lib import Person
+
+    result = parse_expr("person", "gender in [Person.MALE, Person.OTHER]")
+    assert result == [
+        {"column": "gender", "op": "in", "value": [Person.MALE, Person.OTHER]}
+    ]
+
+
+def test_unknown_constant_namespace_treated_as_path():
+    # `Foo.BAR`'s base name isn't a registered constant class
+    # (`_CONSTANT_CLASSES`), so `_is_path_node` can't tell it apart from a
+    # genuine (if made-up) relationship-style path like `father.surname` --
+    # same deferred-validation philosophy as any other unrecognized path
+    # segment (see test_bare_relationship_name_parses_here_rejected_downstream).
+    # It parses to a value_column, not an error, here.
+    result = parse_expr("person", "gender == Foo.BAR")
+    assert result == [
+        {"column": "gender", "op": "eq", "value_column": {"json_path": ["Foo", "BAR"]}}
+    ]
+
+
+def test_unknown_constant_namespace_still_rejected_inside_in_list():
+    # `in [...]` elements always go through `_translate_value` directly
+    # (`_translate_list` never consults `_is_path_node` -- a list literal
+    # has no path-shaped elements to disambiguate), so strict constant
+    # validation still applies there.
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "gender in [Foo.BAR]")
+
+
+def test_unknown_constant_name_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "gender == Person.NOT_A_REAL_CONSTANT")
+
+
+def test_two_level_attribute_chain_treated_as_path():
+    # `_is_path_node` only special-cases a single-level Attribute(Name, attr)
+    # as a possible constant; a deeper chain like `a.Person.MALE` is
+    # structurally identical to any other multi-segment path (e.g.
+    # `birth.place.title`), so it's treated the same permissive way --
+    # not an error at this layer.
+    result = parse_expr("person", "gender == a.Person.MALE")
+    assert result == [
+        {
+            "column": "gender",
+            "op": "eq",
+            "value_column": {"json_path": ["a", "Person", "MALE"]},
+        }
+    ]
+
+
+def test_two_level_attribute_chain_still_rejected_inside_in_list():
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "gender in [a.Person.MALE]")
+
+
+# --- Date(...) call ---------------------------------------------------------------
+
+
+def test_date_call_resolves_to_sortval():
+    result = parse_expr("event", "date.sortval == Date('Jan 1, 1968')")
+    assert result == [
+        {"column": {"json_path": ["date", "sortval"]}, "op": "eq", "value": 2439857}
+    ]
+
+
+def test_date_call_supports_ordering_comparisons():
+    gte = parse_expr("event", "date.sortval >= Date('Jan 1, 1968')")
+    assert gte[0]["op"] == "gte"
+    assert gte[0]["value"] == 2439857
+
+    lt = parse_expr("event", "date.sortval < Date('Jan 1, 1968')")
+    assert lt[0]["op"] == "lt"
+    assert lt[0]["value"] == 2439857
+
+
+def test_date_call_range_via_and():
+    result = parse_expr(
+        "event",
+        "date.sortval >= Date('Jan 1, 1968') and date.sortval <= Date('Dec 31, 1968')",
+    )
+    assert len(result) == 2
+    assert result[0]["value"] < result[1]["value"]
+
+
+def test_date_call_in_list():
+    result = parse_expr("event", "date.sortval in [Date('Jan 1, 1968')]")
+    assert result == [
+        {"column": {"json_path": ["date", "sortval"]}, "op": "in", "value": [2439857]}
+    ]
+
+
+def test_date_call_unparseable_string_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("event", "date.sortval >= Date('not a real date')")
+
+
+def test_date_call_wrong_arity_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("event", "date.sortval >= Date()")
+    with pytest.raises(QueryLangError):
+        parse_expr("event", "date.sortval >= Date('a', 'b')")
+
+
+def test_date_call_non_string_argument_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("event", "date.sortval >= Date(5)")
+
+
+def test_date_call_rejected_as_like_pattern():
+    # like(...)'s second argument must stay a plain string -- Date()
+    # resolves to an int, which the existing string check already rejects.
+    with pytest.raises(QueryLangError):
+        parse_expr("event", "like(description, Date('Jan 1, 1968'))")
+
+
+# --- Relationship-crossing paths in where_expr (birth/death/father/mother/place) --
+#
+# query_lang.py has no relationship-specific knowledge of its own -- a
+# multi-segment path always becomes {"json_path": [...]}, the same as any
+# other multi-segment path; query.py's resolve_column_path (exercised via
+# object_query.py's _parse_column_ref/_build_where, not here) is what
+# actually recognizes "birth"/"father"/etc. as relationships. These tests
+# only check what this module itself produces: the raw wire JSON.
+
+
+def test_birth_date_sortval_reference():
+    result = parse_expr("person", "birth.date.sortval >= Date('Jan 1, 1968')")
+    assert result == [
+        {"column": {"json_path": ["birth", "date", "sortval"]}, "op": "gte", "value": 2439857}
+    ]
+
+
+def test_death_date_sortval_reference():
+    result = parse_expr("person", "death.date.sortval < Date('Jan 1, 2000')")
+    assert result == [
+        {"column": {"json_path": ["death", "date", "sortval"]}, "op": "lt", "value": 2451545}
+    ]
+
+
+def test_birth_date_sortval_range_via_and():
+    result = parse_expr(
+        "person",
+        "birth.date.sortval >= Date('Jan 1, 1968') and birth.date.sortval < Date('Jan 1, 1969')",
+    )
+    assert len(result) == 2
+    assert result[0]["column"] == result[1]["column"] == {
+        "json_path": ["birth", "date", "sortval"]
+    }
+    assert result[0]["value"] < result[1]["value"]
+
+
+def test_birth_date_sortval_in_list():
+    result = parse_expr("person", "birth.date.sortval in [Date('Jan 1, 1968')]")
+    assert result == [
+        {"column": {"json_path": ["birth", "date", "sortval"]}, "op": "in", "value": [2439857]}
+    ]
+
+
+def test_father_surname_reference():
+    result = parse_expr("family", "father.surname == 'Smith'")
+    assert result == [
+        {"column": {"json_path": ["father", "surname"]}, "op": "eq", "value": "Smith"}
+    ]
+
+
+def test_mother_surname_reference():
+    result = parse_expr("family", "mother.surname == 'Jones'")
+    assert result == [
+        {"column": {"json_path": ["mother", "surname"]}, "op": "eq", "value": "Jones"}
+    ]
+
+
+def test_two_hop_chain_reference():
+    result = parse_expr("person", "birth.place.title == 'Chicago'")
+    assert result == [
+        {
+            "column": {"json_path": ["birth", "place", "title"]},
+            "op": "eq",
+            "value": "Chicago",
+        }
+    ]
+
+
+def test_bare_relationship_name_parses_here_rejected_downstream():
+    # query_lang.py itself doesn't know "birth" is special -- a bare
+    # relationship name with nothing after it just becomes a single-segment
+    # json_path here (there's nothing to compare it to at this layer's
+    # level); object_query.py's resolve_column_path is what rejects it, one
+    # layer down (see test_object_query_parsing.py).
+    result = parse_expr("person", "birth == 5")
+    assert result == [{"column": {"json_path": ["birth"]}, "op": "eq", "value": 5}]
+
+
+# --- Field-vs-field comparisons (value_column) -------------------------------------
+
+
+def test_field_vs_field_produces_value_column():
+    result = parse_expr(
+        "family", "mother.death.date.sortval < father.death.date.sortval"
+    )
+    assert result == [
+        {
+            "column": {"json_path": ["mother", "death", "date", "sortval"]},
+            "op": "lt",
+            "value_column": {"json_path": ["father", "death", "date", "sortval"]},
+        }
+    ]
+
+
+def test_field_vs_field_all_comparable_operators():
+    for op_src, op_json in [
+        ("==", "eq"),
+        ("!=", "ne"),
+        ("<", "lt"),
+        ("<=", "lte"),
+        (">", "gt"),
+        (">=", "gte"),
+    ]:
+        result = parse_expr("family", f"father.surname {op_src} mother.surname")
+        assert result == [
+            {
+                "column": {"json_path": ["father", "surname"]},
+                "op": op_json,
+                "value_column": {"json_path": ["mother", "surname"]},
+            }
+        ]
+
+
+def test_field_vs_field_flat_column_both_sides():
+    # Single-segment paths that happen to match a real flat column name
+    # (not a relationship name) stay plain strings on both sides, same as
+    # the single-path case.
+    result = parse_expr("family", "father_handle == mother_handle")
+    assert result == [
+        {"column": "father_handle", "op": "eq", "value_column": "mother_handle"}
+    ]
+
+
+def test_field_vs_field_subscript_rhs():
+    # A `Subscript` RHS (e.g. an indexed path) is also path-shaped, not a
+    # literal -- `_is_path_node` must recognize it too.
+    result = parse_expr(
+        "person", "primary_name.surname_list[0].surname == primary_name.surname_list[1].surname"
+    )
+    assert result == [
+        {
+            "column": {"json_path": ["primary_name", "surname_list", 0, "surname"]},
+            "op": "eq",
+            "value_column": {"json_path": ["primary_name", "surname_list", 1, "surname"]},
+        }
+    ]
+
+
+def test_field_vs_field_rejected_for_in_operator():
+    # 'in' always expects a list literal RHS; a bare path there is not a
+    # valid list and should be rejected the same way any other non-list
+    # value would be, not silently treated as a value_column.
+    with pytest.raises(QueryLangError):
+        parse_expr("family", "father.surname in mother.surname")
+
+
+def test_field_vs_field_rhs_class_constant_still_treated_as_value():
+    # The one genuinely ambiguous shape: `Person.MALE` is a single-level
+    # Attribute(Name, attr) just like `father.surname` -- must resolve as a
+    # constant (plain `value`), not misfire as `value_column`.
+    result = parse_expr("person", "gender == Person.MALE")
+    assert result == [{"column": "gender", "op": "eq", "value": 1}]
+
+
+def test_field_vs_field_lhs_and_rhs_paths_combined_with_and():
+    result = parse_expr(
+        "family",
+        "father.surname == mother.surname and father.gender == 1",
+    )
+    assert len(result) == 2
+    assert result[0] == {
+        "column": {"json_path": ["father", "surname"]},
+        "op": "eq",
+        "value_column": {"json_path": ["mother", "surname"]},
+    }
+    assert result[1] == {
+        "column": {"json_path": ["father", "gender"]},
+        "op": "eq",
+        "value": 1,
+    }
