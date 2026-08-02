@@ -383,6 +383,36 @@ Citation "source.title == 'Census Records'"
 `source` reaches from a citation to the source it cites -- works just like
 `father`/`mother` reaching from a family to a parent.
 
+### Goal: Find people with no death record at all
+
+```
+Person "death.date.sortval is None"
+```
+
+`is None` reads more naturally than `== None` for "this isn't recorded at
+all" -- they mean exactly the same thing, so use whichever reads better in
+context.
+
+### Goal: Find everyone except the Smiths and the Joneses
+
+```
+Person "surname not in ['Smith', 'Jones']"
+```
+
+`not in` is the same list-membership check as `in`, just flipped -- this
+matches anyone whose last name is neither of the two listed.
+
+### Goal: Find everyone born before 1900
+
+```
+Person "Date('Jan 1, 1900') > birth.date.sortval"
+```
+
+The date doesn't have to go on the right -- this reads left-to-right as
+"1900 is after this person's birthdate," and matches exactly the same
+people as writing it the more usual way,
+`birth.date.sortval < Date('Jan 1, 1900')`.
+
 ## Things this can't do (yet)
 
 - Anything beyond the patterns shown above -- this is a small, fixed set of

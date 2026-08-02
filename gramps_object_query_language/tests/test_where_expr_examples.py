@@ -806,3 +806,29 @@ def test_name_type_constant():
 
     result = run(conn, "Person", "primary_name.type.value == NameType.BIRTH")
     assert result == [("p1",)]
+
+
+# --- is / is not / not in, and operand ordering (README cookbook additions) ---
+
+
+def test_is_none_readme_example(db):
+    # Same people as "everyone who has died" (test_not_operator's sibling),
+    # complemented: no recorded death date at all -- only kid1, still living.
+    assert run(db, "Person", "death.date.sortval is None") == [("kid1",)]
+
+
+def test_not_in_list_readme_example(db):
+    # Excludes every Smith (dad1, mom1, kid1, granddad1) and the one Jones
+    # (other1), leaving only Mary Doyle (grandma1).
+    result = run(db, "Person", "surname not in ['Smith', 'Jones']")
+    assert result == [("grandma1",)]
+
+
+def test_operand_order_date_on_left_readme_example(db):
+    # Born before 1900: granddad1 (1845) and grandma1 (1848) -- everyone
+    # else (dad1, mom1, kid1) was born after, and other1 was born exactly in
+    # 1900, not strictly before.
+    forward = run(db, "Person", "birth.date.sortval < Date('Jan 1, 1900')")
+    reversed_ = run(db, "Person", "Date('Jan 1, 1900') > birth.date.sortval")
+    assert reversed_ == forward
+    assert forward == [("granddad1",), ("grandma1",)]
