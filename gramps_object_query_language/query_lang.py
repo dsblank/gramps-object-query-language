@@ -64,11 +64,15 @@ supports today:
   resolve to a plain column reference (a real indexed SQL column); every
   other path becomes a `{"json_path": [...]}` reference.
 - On the *value* side of a comparison, `ClassName.CONST` (e.g. `Person.MALE`,
-  `Note.FLOWED`) resolves to the real value read off the actual Gramps class
-  -- see `_CONSTANTS` -- so `gender == Person.MALE` and `gender == 1` compile
-  identically. Only a `Name.Attribute` shape one level deep is recognized
-  (not `a.b.CONST`), and only for the fields already reachable as a flat
-  column today (`Person.gender`, `Citation.confidence`, `Note.format`).
+  `Note.FLOWED`, `Date.MOD_ABOUT`, `EventType.BIRTH`) resolves to the real
+  value read off the actual Gramps class -- see `_CONSTANTS` -- so
+  `gender == Person.MALE` and `gender == 1` compile identically. Only a
+  `Name.Attribute` shape one level deep is recognized (not `a.b.CONST`).
+  Covers both flat-column fields (`Person.gender`, `Citation.confidence`,
+  `Note.format`) and fields that only live nested in `json_data`
+  (`birth.date.modifier == Date.MOD_ABOUT`, `type.value == EventType.BIRTH`)
+  -- the constant class list is unrelated to where the field it's compared
+  against happens to live.
 - Also on the value side, `Date('Jan 1, 1968')` -- the second and last
   whitelisted call form -- parses a human date string with Gramps' own
   date parser and resolves to `.sortval`, a plain comparable integer
@@ -90,7 +94,27 @@ import ast
 from typing import Any, List, Tuple, Union
 
 from gramps.gen.datehandler import parser as _date_parser
-from gramps.gen.lib import Citation, Note, Person
+from gramps.gen.lib import (
+    AttributeType,
+    ChildRefType,
+    Citation,
+    Date,
+    EventRoleType,
+    EventType,
+    FamilyRelType,
+    MarkerType,
+    NameOriginType,
+    NameType,
+    Note,
+    NoteType,
+    Person,
+    PlaceType,
+    RepositoryType,
+    SourceMediaType,
+    SrcAttributeType,
+    StyledTextTagType,
+    UrlType,
+)
 
 from .query import (
     CITATION,
@@ -142,25 +166,67 @@ _NAMESPACES: dict[str, ObjectTypeSpec] = {
     **{name.capitalize(): spec for name, spec in _NAMES.items()},
 }
 
-# `ClassName.CONST` value constants, e.g. `gender == Person.MALE`. Read off
-# the real Gramps classes (not hardcoded ints) so they can't drift out of
-# sync if a constant's underlying value ever changes. Scoped to constants
-# that attach to fields already reachable as a *flat* column today
-# (`Person.gender`, `Citation.confidence`, `Note.format`) -- deliberately
-# not the much larger set of GrampsType constants on other fields
-# (`EventType.BIRTH`, `FamilyRelType.MARRIED`, ...), which live nested in
-# `json_data` (`{"_class": "EventType", "value": 12, "string": ""}`) and
-# additionally support arbitrary user-defined custom values with no fixed
-# constant to name -- a separate, larger piece of work.
-_CONSTANT_NAMES: dict[str, tuple[str, ...]] = {
-    "Person": ("MALE", "FEMALE", "UNKNOWN", "OTHER"),
-    "Citation": ("CONF_VERY_LOW", "CONF_LOW", "CONF_NORMAL", "CONF_HIGH", "CONF_VERY_HIGH"),
-    "Note": ("FLOWED", "FORMATTED"),
+# `ClassName.CONST` value constants, e.g. `gender == Person.MALE`,
+# `type.value == EventType.BIRTH`, `birth.date.modifier == Date.MOD_ABOUT`.
+# Values are read off the real Gramps classes, never hardcoded, so they
+# can't drift out of sync with core if a constant's underlying value ever
+# changes -- see `_int_constants`. Covers both constants that attach to a
+# *flat* column (`Person.gender`, `Citation.confidence`, `Note.format`) and
+# ones that only live nested in `json_data` (`Event.type` is stored as
+# `{"_class": "EventType", "value": 12, "string": ""}`, so the constant is
+# compared against `type.value`, not `type` itself) -- `_translate_constant`
+# doesn't care which; that distinction is entirely in how the *path* side of
+# the comparison resolves (`resolve_column_path`).
+#
+# Deliberately still not covering arbitrary user-defined custom type values
+# (a `PlaceType` of "Ranch", say) -- those have no fixed constant to name in
+# the first place, only ever a per-tree string paired with `.CUSTOM`.
+_CONSTANT_CLASSES: dict[str, type] = {
+    "Person": Person,
+    "Citation": Citation,
+    "Note": Note,
+    "Date": Date,
+    "AttributeType": AttributeType,
+    "ChildRefType": ChildRefType,
+    "EventRoleType": EventRoleType,
+    "EventType": EventType,
+    "FamilyRelType": FamilyRelType,
+    "MarkerType": MarkerType,
+    "NameOriginType": NameOriginType,
+    "NameType": NameType,
+    "NoteType": NoteType,
+    "PlaceType": PlaceType,
+    "RepositoryType": RepositoryType,
+    "SourceMediaType": SourceMediaType,
+    "SrcAttributeType": SrcAttributeType,
+    "StyledTextTagType": StyledTextTagType,
+    "UrlType": UrlType,
 }
-_CONSTANT_CLASSES = {"Person": Person, "Citation": Citation, "Note": Note}
+
+
+def _int_constants(cls: type) -> dict[str, int]:
+    """Every ALL_CAPS `int` class attribute on `cls`, e.g. `{"MALE": 1,
+    "FEMALE": 0, ...}` for `Person`.
+
+    Auto-derived rather than hand-listed so a new constant added to a
+    Gramps class (or the value of an existing one changing) shows up here
+    automatically instead of silently drifting out of sync. `bool` is
+    excluded despite being an `int` subclass -- no Gramps class defines a
+    meaningful all-caps boolean constant, and including it would risk
+    picking up something like a stray `True`/`False` class attribute as if
+    it were a real value.
+    """
+    return {
+        name: value
+        for name in dir(cls)
+        if name.isupper() and not name.startswith("_")
+        for value in [getattr(cls, name)]
+        if isinstance(value, int) and not isinstance(value, bool)
+    }
+
+
 _CONSTANTS: dict[str, dict[str, Any]] = {
-    class_name: {name: getattr(_CONSTANT_CLASSES[class_name], name) for name in names}
-    for class_name, names in _CONSTANT_NAMES.items()
+    class_name: _int_constants(cls) for class_name, cls in _CONSTANT_CLASSES.items()
 }
 
 

@@ -452,3 +452,170 @@ def test_multiple_surnames():
 
     result = run(conn, "Person", "primary_name.surname_list[1].surname != None")
     assert result == [("maria1",)]
+
+
+# --- Date modifier/quality/dateval, via Date.MOD_*/QUAL_* constants ----------
+
+
+def test_date_modifier_constant():
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE person (handle TEXT, birth_ref_index INTEGER, json_data TEXT)"
+    )
+    conn.execute("CREATE TABLE event (handle TEXT, json_data TEXT)")
+
+    def person(handle):
+        conn.execute(
+            "INSERT INTO person VALUES (?, ?, ?)",
+            (handle, 0, json.dumps({"event_ref_list": [{"ref": f"{handle}-birth"}]})),
+        )
+
+    def event(handle, modifier, quality=0, dateval=None):
+        conn.execute(
+            "INSERT INTO event VALUES (?, ?)",
+            (
+                handle,
+                json.dumps(
+                    {
+                        "date": {
+                            "modifier": modifier,
+                            "quality": quality,
+                            "dateval": dateval or [1, 1, 1968, False],
+                        }
+                    }
+                ),
+            ),
+        )
+
+    # p1's birth is recorded as "about 1968" (MOD_ABOUT); p2's is exact
+    # (MOD_NONE) -- same calendar position, different modifier.
+    person("p1")
+    event("p1-birth", modifier=3)  # Date.MOD_ABOUT
+    person("p2")
+    event("p2-birth", modifier=0)  # Date.MOD_NONE
+
+    result = run(conn, "Person", "birth.date.modifier == Date.MOD_ABOUT")
+    assert result == [("p1",)]
+
+
+def test_date_quality_constant():
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE person (handle TEXT, birth_ref_index INTEGER, json_data TEXT)"
+    )
+    conn.execute("CREATE TABLE event (handle TEXT, json_data TEXT)")
+
+    def person(handle):
+        conn.execute(
+            "INSERT INTO person VALUES (?, ?, ?)",
+            (handle, 0, json.dumps({"event_ref_list": [{"ref": f"{handle}-birth"}]})),
+        )
+
+    def event(handle, quality):
+        conn.execute(
+            "INSERT INTO event VALUES (?, ?)",
+            (handle, json.dumps({"date": {"quality": quality}})),
+        )
+
+    # p1's birth date is marked "estimated"; p2's has no quality flag.
+    person("p1")
+    event("p1-birth", quality=1)  # Date.QUAL_ESTIMATED
+    person("p2")
+    event("p2-birth", quality=0)  # Date.QUAL_NONE
+
+    result = run(conn, "Person", "birth.date.quality != Date.QUAL_NONE")
+    assert result == [("p1",)]
+
+
+def test_date_span_dateval_index():
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE person (handle TEXT, birth_ref_index INTEGER, json_data TEXT)"
+    )
+    conn.execute("CREATE TABLE event (handle TEXT, json_data TEXT)")
+
+    def person(handle):
+        conn.execute(
+            "INSERT INTO person VALUES (?, ?, ?)",
+            (handle, 0, json.dumps({"event_ref_list": [{"ref": f"{handle}-birth"}]})),
+        )
+
+    def event(handle, dateval):
+        conn.execute(
+            "INSERT INTO event VALUES (?, ?)",
+            (handle, json.dumps({"date": {"dateval": dateval}})),
+        )
+
+    # p1's birth is a span "1968 to 1970" (8-element dateval, end year at
+    # index 6); p2's is a single exact date (4-element dateval, no index 6
+    # at all) -- sortval alone can't tell a span's end from an exact date's
+    # start, but dateval[6] can.
+    person("p1")
+    event("p1-birth", dateval=[1, 6, 1968, False, 31, 12, 1970, False])  # MOD_SPAN
+    person("p2")
+    event("p2-birth", dateval=[1, 1, 1968, False])
+
+    result = run(conn, "Person", "birth.date.dateval[6] == 1970")
+    assert result == [("p1",)]
+
+
+# --- GrampsType constants (EventType, FamilyRelType, NameType) ---------------
+
+
+def test_event_type_constant():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE event (handle TEXT, json_data TEXT)")
+    conn.execute(
+        "INSERT INTO event VALUES ('e1', ?)",
+        (json.dumps({"type": {"_class": "EventType", "value": 12, "string": ""}}),),
+    )  # EventType.BIRTH
+    conn.execute(
+        "INSERT INTO event VALUES ('e2', ?)",
+        (json.dumps({"type": {"_class": "EventType", "value": 13, "string": ""}}),),
+    )  # EventType.DEATH
+
+    result = run(conn, "Event", "type.value == EventType.BIRTH")
+    assert result == [("e1",)]
+
+
+def test_family_rel_type_constant():
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE family (handle TEXT, father_handle TEXT, mother_handle TEXT, "
+        "json_data TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO family VALUES ('fam1', 'dad1', 'mom1', ?)",
+        (json.dumps({"type": {"_class": "FamilyRelType", "value": 0, "string": ""}}),),
+    )  # FamilyRelType.MARRIED
+    conn.execute(
+        "INSERT INTO family VALUES ('fam2', 'dad2', 'mom2', ?)",
+        (json.dumps({"type": {"_class": "FamilyRelType", "value": 1, "string": ""}}),),
+    )  # FamilyRelType.UNMARRIED
+
+    result = run(conn, "Family", "type.value == FamilyRelType.MARRIED")
+    assert result == [("fam1",)]
+
+
+def test_name_type_constant():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE person (handle TEXT, json_data TEXT)")
+    conn.execute(
+        "INSERT INTO person VALUES ('p1', ?)",
+        (
+            json.dumps(
+                {"primary_name": {"type": {"_class": "NameType", "value": 2, "string": ""}}}
+            ),
+        ),
+    )  # NameType.BIRTH
+    conn.execute(
+        "INSERT INTO person VALUES ('p2', ?)",
+        (
+            json.dumps(
+                {"primary_name": {"type": {"_class": "NameType", "value": 1, "string": ""}}}
+            ),
+        ),
+    )  # NameType.AKA
+
+    result = run(conn, "Person", "primary_name.type.value == NameType.BIRTH")
+    assert result == [("p1",)]

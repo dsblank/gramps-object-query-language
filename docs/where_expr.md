@@ -262,19 +262,52 @@ Family "father.death.place.title == mother.death.place.title"
 
 ## Constants
 
-`ClassName.CONST` reads a named constant straight off the real Gramps class,
-so it can never drift out of sync with the class's actual values:
+`ClassName.CONST` reads a named constant straight off the real Gramps class
+(every all-caps `int` attribute the class defines -- see
+`query_lang._int_constants`), so it can never drift out of sync with the
+class's actual values, and picks up anything a future Gramps release adds
+without code changes here:
 
-| Class      | Constants |
-|------------|-----------|
-| `Person`   | `MALE`, `FEMALE`, `UNKNOWN`, `OTHER` |
-| `Citation` | `CONF_VERY_LOW`, `CONF_LOW`, `CONF_NORMAL`, `CONF_HIGH`, `CONF_VERY_HIGH` |
-| `Note`     | `FLOWED`, `FORMATTED` |
+| Class               | Constants |
+|---------------------|-----------|
+| `Person`             | `MALE`, `FEMALE`, `UNKNOWN`, `OTHER` |
+| `Citation`           | `CONF_VERY_LOW`, `CONF_LOW`, `CONF_NORMAL`, `CONF_HIGH`, `CONF_VERY_HIGH` |
+| `Note`               | `FLOWED`, `FORMATTED` |
+| `Date`               | `MOD_NONE`, `MOD_BEFORE`, `MOD_AFTER`, `MOD_ABOUT`, `MOD_RANGE`, `MOD_SPAN`, `MOD_TEXTONLY`, `MOD_FROM`, `MOD_TO`, `QUAL_NONE`, `QUAL_ESTIMATED`, `QUAL_CALCULATED`, `CAL_GREGORIAN`, `CAL_JULIAN`, `CAL_HEBREW`, `CAL_FRENCH`, `CAL_PERSIAN`, `CAL_ISLAMIC`, `CAL_SWEDISH`, `NEWYEAR_JAN1`, `NEWYEAR_MAR1`, `NEWYEAR_MAR25`, `NEWYEAR_SEP1` |
+| `EventType`          | `BIRTH`, `DEATH`, `MARRIAGE`, `DIVORCE`, `BURIAL`, ... (every standard Gramps event type) |
+| `EventRoleType`      | `PRIMARY`, `WITNESS`, `FAMILY`, `CLERGY`, ... |
+| `FamilyRelType`      | `MARRIED`, `UNMARRIED`, `CIVIL_UNION`, `UNKNOWN`, `CUSTOM` |
+| `ChildRefType`       | `BIRTH`, `ADOPTED`, `STEPCHILD`, `FOSTER`, `SPONSORED`, `UNKNOWN`, `CUSTOM`, `NONE` |
+| `NameType`           | `AKA`, `BIRTH`, `MARRIED`, `UNKNOWN`, `CUSTOM` |
+| `NameOriginType`     | `PATRONYMIC`, `MATRONYMIC`, `INHERITED`, `GIVEN`, `TAKEN`, `PATRILINEAL`, `MATRILINEAL`, `FEUDAL`, `PSEUDONYM`, `OCCUPATION`, `LOCATION`, `NONE`, `UNKNOWN`, `CUSTOM` |
+| `AttributeType`      | `CASTE`, `DESCRIPTION`, `ID`, `NATIONAL`, `NUM_CHILD`, `SSN`, `NICKNAME`, `CAUSE`, `AGENCY`, `AGE`, `FATHER_AGE`, `MOTHER_AGE`, `WITNESS`, `TIME`, `OCCUPATION`, `UNKNOWN`, `CUSTOM` |
+| `UrlType`            | `EMAIL`, `WEB_HOME`, `WEB_SEARCH`, `WEB_FTP`, `UNKNOWN`, `CUSTOM` |
+| `RepositoryType`     | `LIBRARY`, `CEMETERY`, `CHURCH`, `ARCHIVE`, `ALBUM`, `WEBSITE`, `BOOKSTORE`, `COLLECTION`, `SAFE`, `UNKNOWN`, `CUSTOM` |
+| `SourceMediaType`    | `AUDIO`, `BOOK`, `CARD`, `ELECTRONIC`, `FICHE`, `FILM`, `MAGAZINE`, `MANUSCRIPT`, `MAP`, `NEWSPAPER`, `PHOTO`, `TOMBSTONE`, `VIDEO`, `UNKNOWN`, `CUSTOM` |
+| `NoteType`           | `GENERAL`, `RESEARCH`, `TRANSCRIPT`, `PERSON`, `ATTRIBUTE`, `ADDRESS`, `ASSOCIATION`, `LDS`, `FAMILY`, `EVENT`, `EVENTREF`, `PLACE`, `REPO`, `REPOREF`, `SOURCE`, `SOURCEREF`, `CHILDREF`, `PERSONNAME`, `SOURCE_TEXT`, `HTML_CODE`, `TODO`, `LINK`, `ANALYSIS`, `REPORT_TEXT`, `CITATION`, `UNKNOWN`, `CUSTOM` |
+| `PlaceType`          | `COUNTRY`, `STATE`, `COUNTY`, `CITY`, `PARISH`, `LOCALITY`, `STREET`, `PROVINCE`, `REGION`, `DEPARTMENT`, `NEIGHBORHOOD`, `DISTRICT`, `BOROUGH`, `MUNICIPALITY`, `TOWN`, `VILLAGE`, `HAMLET`, `FARM`, `BUILDING`, `NUMBER`, `UNKNOWN`, `CUSTOM` |
+| `MarkerType`         | `NONE`, `COMPLETE`, `TODO_TYPE`, `CUSTOM` |
+| `StyledTextTagType`  | `BOLD`, `ITALIC`, `UNDERLINE`, `FONTFACE`, `FONTSIZE`, `FONTCOLOR`, `HIGHLIGHT`, `SUPERSCRIPT`, `LINK`, `STRIKETHROUGH`, `SUBSCRIPT`, `NONE_TYPE` |
+| `SrcAttributeType`   | `UNKNOWN`, `CUSTOM` |
+
+Some of these attach to a real flat column (`Person.gender`,
+`Citation.confidence`), most don't -- `Event`'s `type`, a `Family`'s
+`type` (its relationship type), a name's `type`, and so on are all stored
+nested in `json_data` as `{"_class": "EventType", "value": 12, "string":
+""}`, so the field to compare is `<field>.value`, not `<field>` itself:
 
 ```python
 Person "gender == Person.MALE"
 Citation "confidence >= Citation.CONF_HIGH"
+Event "type.value == EventType.BIRTH"
+Family "type.value == FamilyRelType.MARRIED"
+Person "primary_name.type.value == NameType.BIRTH"
 ```
+
+These cover Gramps' built-in, fixed values for each type -- not a
+tree's own custom type values (e.g. a `PlaceType` of "Ranch" someone typed
+in), which have no fixed constant to name; only `.CUSTOM` identifies "this
+is a custom one," not which.
 
 ## Dates
 
@@ -284,6 +317,35 @@ day number) -- so it can be compared with the ordinary numeric operators:
 
 ```python
 Person "birth.date.sortval >= Date('Jan 1, 1968')"
+```
+
+`sortval` is a bare point on the calendar; it drops the date's modifier
+(`MOD_ABOUT`, `MOD_BEFORE`, `MOD_AFTER`, `MOD_FROM`/`MOD_TO`) and quality
+entirely, so e.g. a `MOD_BEFORE` date and a plain exact date for the same
+year/month/day produce the same `sortval` (verified: year-only "before
+1968" and exact "1968" both sort-value to the same JDN as `Date('Jan 1,
+1968')`). For `MOD_SPAN`/`MOD_RANGE` dates, `sortval` is the start of the
+range, not the end or a midpoint. Comparisons against `sortval` alone can't
+distinguish "before X", "about X", "after X", or "X to Y" from plain "X" --
+they only compare calendar position.
+
+The modifier, quality, and raw values *are* separately reachable, though,
+as ordinary `json_path` fields compared against the `Date` constants from
+the table above:
+
+```python
+Person "birth.date.modifier == Date.MOD_ABOUT"
+Person "birth.date.quality != Date.QUAL_NONE"
+```
+
+`dateval` is the raw `[day, month, year, is_bce]` tuple Gramps stores the
+date as -- 4 elements normally, 8 for a `MOD_SPAN`/`MOD_RANGE` date
+(`[day1, month1, year1, is_bce1, day2, month2, year2, is_bce2]`), so
+`dateval[6]` reaches a span/range's *end* year, something `sortval` can't
+give you at all:
+
+```python
+Person "birth.date.dateval[6] == 1970"
 ```
 
 ## What's *not* supported

@@ -475,6 +475,57 @@ def test_note_format_constants():
     assert result == [{"column": "format", "op": "eq", "value": Note.FLOWED}]
 
 
+def test_date_modifier_and_quality_constants():
+    # `Date` isn't a flat-column field on anything -- `birth.date.modifier`
+    # is a `json_path`, so this also proves constants work against
+    # `json_path` fields, not just real SQL columns.
+    from gramps.gen.lib import Date
+
+    result = parse_expr("person", "birth.date.modifier == Date.MOD_ABOUT")
+    assert result == [
+        {
+            "column": {"json_path": ["birth", "date", "modifier"]},
+            "op": "eq",
+            "value": Date.MOD_ABOUT,
+        }
+    ]
+    result = parse_expr("person", "birth.date.quality == Date.QUAL_ESTIMATED")
+    assert result == [
+        {
+            "column": {"json_path": ["birth", "date", "quality"]},
+            "op": "eq",
+            "value": Date.QUAL_ESTIMATED,
+        }
+    ]
+
+
+def test_grampstype_constants():
+    # One example each for a few of the `GrampsType` subclasses -- these
+    # attach to fields that are always nested `json_data` (Event.type,
+    # Family's rel_type, a name's type), never a flat column, e.g.
+    # `Event.type` is stored as `{"_class": "EventType", "value": 12,
+    # "string": ""}`, so the comparison is against `type.value`.
+    from gramps.gen.lib import EventType, FamilyRelType, NameType
+
+    assert parse_expr("event", "type.value == EventType.BIRTH") == [
+        {"column": {"json_path": ["type", "value"]}, "op": "eq", "value": EventType.BIRTH}
+    ]
+    assert parse_expr("family", "type.value == FamilyRelType.MARRIED") == [
+        {
+            "column": {"json_path": ["type", "value"]},
+            "op": "eq",
+            "value": FamilyRelType.MARRIED,
+        }
+    ]
+    assert parse_expr("person", "primary_name.type.value == NameType.BIRTH") == [
+        {
+            "column": {"json_path": ["primary_name", "type", "value"]},
+            "op": "eq",
+            "value": NameType.BIRTH,
+        }
+    ]
+
+
 def test_constant_inside_in_list():
     from gramps.gen.lib import Person
 

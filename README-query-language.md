@@ -149,6 +149,31 @@ Person "birth.date.sortval >= Date('Jan 1, 1968')"
 "the date of this person's birth event" -- `birth` reaches over to their
 birth event, and `.date` is that event's date.
 
+`sortval` is always a single point in time -- the year/month/day recorded on
+the date, turned into one comparable number. It does *not* carry any
+"about," "before," "after," or "estimated" qualifier along with it -- those
+are recorded separately, in a field of their own called `modifier` (and
+`quality`, for "estimated"/"calculated"). For example, a birth date entered
+as "before 1968" has the *exact same* `sortval` as one entered as plain
+"Jan 1, 1968", so `birth.date.sortval >= Date('Jan 1, 1968')` would count
+that "before 1968" person as born on or after the cutoff, even though
+"before" means the opposite. A date span or range (like "1968 to 1970")
+behaves the same way -- its `sortval` is just the start of the range, not
+the whole thing.
+
+If that distinction matters, check `modifier` directly instead of, or
+alongside, `sortval`:
+
+```
+Person "birth.date.modifier == Date.MOD_ABOUT"
+```
+
+`Date.MOD_ABOUT` is a named constant read straight from Gramps itself, the
+same way `Person.MALE` is elsewhere in this guide -- see
+[`docs/where_expr.md`](docs/where_expr.md#constants) for the full list of
+modifiers (`MOD_BEFORE`, `MOD_AFTER`, `MOD_RANGE`, `MOD_SPAN`, ...) and the
+other named constants available for event types, name types, and more.
+
 ### Goal: Find everyone who has died (not people still living)
 
 ```
