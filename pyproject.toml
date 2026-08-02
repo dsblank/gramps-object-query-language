@@ -17,6 +17,8 @@ classifiers = [
 ]
 dependencies = [
     "gramps>=6.0",
+    "pygobject",
+    "pycairo",
 ]
 
 [project.optional-dependencies]
