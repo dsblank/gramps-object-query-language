@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gramps-object-query-language"
-version = "0.2.0"
+version = "0.2.1"
 description = "A small, closed object query language and SQL compiler for Gramps genealogy data"
 readme = "README.md"
 license = { text = "AGPL-3.0-or-later" }
@@ -17,8 +17,6 @@ classifiers = [
 ]
 dependencies = [
     "gramps>=6.0",
-    "pygobject",
-    "pycairo",
 ]
 
 [project.optional-dependencies]
