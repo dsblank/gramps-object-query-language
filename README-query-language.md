@@ -32,6 +32,8 @@ A few symbols you'll see over and over:
 | `<`, `<=` | is less than / is less than or equal to (earlier, smaller) |
 | `>`, `>=` | is greater than / is greater than or equal to (later, bigger) |
 | `and`  | both things must be true |
+| `or`  | at least one of the two things must be true |
+| `not`  | flips true/false -- matches when the thing *isn't* true |
 | `in [ ... ]` | matches any one of a list of values |
 | `'text' in field` | matches if `field` contains `'text'` anywhere in it |
 | `like(field, 'pattern')` | matches a text pattern, where `%` stands for "anything" |
@@ -71,6 +73,49 @@ Person "given_name in ['John', 'Jane']"
 
 `in [...]` matches any name in the list -- add as many as you like, separated
 by commas.
+
+### Goal: Find everyone named John, or anyone with the last name Doyle
+
+`in [...]` only works when it's the *same* field each time (like `given_name`
+above). To match on two *different* fields instead, use `or`:
+
+```
+Person "given_name == 'John' or surname == 'Doyle'"
+```
+
+This finds anyone who satisfies *either* condition, not just people who
+satisfy both -- unlike `and`, which needs both sides to be true.
+
+### Goal: Find every man named Smith, or anyone at all named Mary
+
+`and` and `or` can be combined -- `and` is checked before `or`, the same as
+in ordinary arithmetic where multiplication happens before addition, so use
+parentheses to group things exactly how you mean:
+
+```
+Person "(gender == Person.MALE and surname == 'Smith') or given_name == 'Mary'"
+```
+
+Without the parentheses, `gender == Person.MALE and surname == 'Smith' or
+given_name == 'Mary'` still reads the *same* way -- `and` grouping happens
+first regardless -- but writing the parentheses out makes the intent clear
+to a future reader (including yourself).
+
+### Goal: Find everyone whose last name *isn't* Smith
+
+```
+Person "not (surname == 'Smith')"
+```
+
+`not` flips a condition -- it matches whenever the thing inside it *isn't*
+true. It works on a single condition, or a whole parenthesized group:
+
+```
+Person "not (gender == Person.MALE and surname == 'Smith')"
+```
+
+That finds everyone who *isn't* a male Smith -- women, and Smiths of any
+other gender, and everyone whose last name isn't Smith at all.
 
 ### Goal: Find everyone whose first name starts with "J"
 
@@ -221,11 +266,21 @@ Citation "confidence >= Citation.CONF_HIGH"
 (from lowest to highest: `CONF_VERY_LOW`, `CONF_LOW`, `CONF_NORMAL`,
 `CONF_HIGH`, `CONF_VERY_HIGH`).
 
+### Goal: Find people who have more than one last name recorded
+
+```
+Person "primary_name.surname_list[1].surname != None"
+```
+
+Gramps lets a person have several last names at once (a maiden name and a
+married name, say) -- `surname_list[0]` is always the first one, and this
+checks whether a *second* one (`[1]`) exists at all. There's no direct way
+to ask "how many last names does this person have," but checking whether a
+particular position in the list is filled in works just as well for "two or
+more."
+
 ## Things this can't do (yet)
 
-- **"or"** -- there's no way today to say "match this condition *or* that
-  one." You can only combine conditions with `and`.
-- **"not"** -- there's no way to negate a whole condition.
 - Anything beyond the patterns shown above -- this is a small, fixed set of
   building blocks, not a full programming language, so anything outside it
   is rejected with an error rather than guessed at.

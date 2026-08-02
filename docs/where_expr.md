@@ -17,9 +17,9 @@ Exactly which fields exist to query depends on that type -- `gender` is a
 
 It is **not** general Python: it is parsed as syntax only (`ast.parse`,
 never `eval`/`exec`), and only a small, explicitly whitelisted set of node
-shapes is understood. Anything else -- `or`, `not`, chained comparisons,
-list/dict comprehensions, lambdas, arbitrary function calls, f-strings,
-imports -- is rejected outright rather than silently misinterpreted.
+shapes is understood. Anything else -- chained comparisons, list/dict
+comprehensions, lambdas, arbitrary function calls, f-strings, imports --
+is rejected outright rather than silently misinterpreted.
 
 Every example on this page is executed against a real (in-memory) SQLite
 database in
@@ -39,7 +39,7 @@ Person "gender == Person.MALE"
 [Constants](#constants)) -- `gender == Person.MALE` and `gender == 1` compile
 to exactly the same thing.
 
-## Combining conditions with `and`
+## Combining conditions with `and`, `or`, and `not`
 
 Multiple comparisons can be joined with `and`:
 
@@ -47,9 +47,58 @@ Multiple comparisons can be joined with `and`:
 Person "gender == Person.MALE and surname == 'Smith'"
 ```
 
-`or` and `not` have no representation in the current query format and are
-rejected -- as are chained comparisons like `1 < gender < 3` (write
-`gender > 1 and gender < 3` instead).
+...or with `or`:
+
+```python
+Person "given_name == 'John' or surname == 'Doyle'"
+```
+
+`and`/`or` can be mixed in one expression, and follow the same precedence
+and grouping real Python uses -- `and` binds tighter than `or`, so
+
+```python
+Person "gender == Person.MALE and surname == 'Smith' or given_name == 'Mary'"
+```
+
+reads as `(gender == Person.MALE and surname == 'Smith') or given_name ==
+'Mary'`, not `gender == Person.MALE and (surname == 'Smith' or given_name ==
+'Mary')`. Parentheses group explicitly, exactly as in Python:
+
+```python
+Person "(gender == Person.MALE and surname == 'Smith') or given_name == 'Mary'"
+```
+
+`not` negates a single condition (or a parenthesized group):
+
+```python
+Person "not (surname == 'Smith')"
+```
+
+`not` binds tighter than `and`, which binds tighter than `or`, matching
+Python -- `not gender == Person.MALE and surname == 'Smith'` reads as
+`(not gender == Person.MALE) and surname == 'Smith'`, not `not (gender ==
+Person.MALE and surname == 'Smith')`. As always, use parentheses when that
+matters:
+
+```python
+Person "not (gender == Person.MALE and surname == 'Smith')"
+```
+
+`not` composes with `like(...)` and the substring form of `in` too, not
+just plain comparisons: `not like(given_name, 'J%')`, `not ('Jan' in
+given_name)`.
+
+One thing worth knowing: `not` follows the same three-valued logic SQL
+does for a missing value -- negating a condition that's *unknown* (because
+it depends on a value that isn't recorded, e.g. `death.date.sortval` for
+someone still living) stays unknown, and an unknown condition never
+matches a `WHERE` clause, whether or not it's negated. So `not
+(death.date.sortval < Date('Jan 1, 2100'))` still excludes someone with no
+recorded death date, the same as the un-negated form does -- `not` doesn't
+turn "we don't know" into "yes."
+
+Chained comparisons like `1 < gender < 3` aren't supported (write `gender
+> 1 and gender < 3` instead).
 
 ## `in`, contains, and `like`
 
@@ -239,7 +288,6 @@ Person "birth.date.sortval >= Date('Jan 1, 1968')"
 
 ## What's *not* supported
 
-- `or`, `not` -- no representation in the current query format yet.
 - Chained comparisons (`1 < gender < 3`) -- write `gender > 1 and gender < 3`.
 - `is`, `is not`, `not in` -- only `==`, `!=`, `<`, `<=`, `>`, `>=`, `in`
   (both its list-membership and substring-test shapes), and `like(...)`

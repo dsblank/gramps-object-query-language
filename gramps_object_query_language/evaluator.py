@@ -43,7 +43,7 @@ p99 latency -- see `object_query.py`'s dispatch.
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Optional
 
 from gramps.gen.errors import HandleError
 from gramps.gen.lib import json_utils
@@ -229,41 +229,76 @@ _ORDERING_OPS = {
 }
 
 
-def _compare(op: str, left: Any, right: Any) -> bool:
+def _compare(op: str, left: Any, right: Any) -> Optional[bool]:
+    """`None` means SQL's `UNKNOWN` -- see `_evaluate_tri`'s docstring for
+    why this three-valued result matters, not just a plain `bool`.
+    """
     if op == "=":
         return left == right
     if op == "!=":
         return left != right
     if op == "LIKE":
         if left is None or right is None:
-            return False
+            return None
         return _like_to_regex(str(right)).match(str(left)) is not None
     if op in _ORDERING_OPS:
-        # SQL's ordering comparisons exclude a NULL operand via standard
-        # three-valued logic (a masked or genuinely-missing value never
-        # satisfies `<`/`<=`/`>`/`>=`) -- Python raises TypeError instead,
-        # so this has to be explicit.
+        # SQL's ordering comparisons against a NULL operand are UNKNOWN, not
+        # False, under standard three-valued logic -- Python raises
+        # TypeError instead, so this has to be explicit. Collapsing this
+        # straight to False here (rather than in `_evaluate_tri`, one layer
+        # up) would be indistinguishable from a genuine False to `Not`,
+        # which needs to leave UNKNOWN as UNKNOWN rather than flip it to
+        # True -- see `_evaluate_tri`.
         if left is None or right is None:
-            return False
+            return None
         return _ORDERING_OPS[op](left, right)
     raise ValueError(f"unsupported operator: {op!r}")
 
 
-def evaluate_where(db: Any, obj: Any, expr: Any, spec: ObjectTypeSpec) -> bool:
-    """`query.py`'s `.compile()` tree, evaluated in Python against a real
-    object instead of rendered as SQL. See module docstring for why no
-    privacy guard is needed here the way `Comparison.compile()` needs one.
+def _evaluate_tri(db: Any, obj: Any, expr: Any, spec: ObjectTypeSpec) -> Optional[bool]:
+    """`evaluate_where`'s actual recursion, in SQL's three-valued logic
+    (`True`/`False`/`None` for `UNKNOWN`) rather than a plain `bool`.
+
+    A leaf comparison against a missing value (a masked field, or a path/
+    relationship that doesn't resolve) is `UNKNOWN`, not `False` -- SQL's
+    `NOT UNKNOWN` is still `UNKNOWN`, not `True`, so if this collapsed to a
+    definite `False` at each leaf the way a plain `bool` would force it to,
+    `Not` wrapping that leaf would incorrectly flip it to `True` where SQL
+    would still exclude the row. Recursing in three-valued logic here, and
+    collapsing to a real `bool` exactly once -- in `evaluate_where`, at the
+    very end -- keeps `Not`/`And`/`Or` behaving the same as their compiled-
+    SQL counterparts at any nesting depth, not just one level deep.
+
+    `And`/`Or` follow SQL's own precedence for combining three values:
+    a definite `False` always wins an `And` (regardless of any `UNKNOWN`
+    sibling), a definite `True` always wins an `Or` the same way -- checked
+    first, before falling back to "`UNKNOWN` if any operand is, else the
+    identity value" -- matching `AND`/`OR`'s truth tables exactly, not just
+    "any/all treat `None` as falsy" (which would get the dominance wrong).
     """
     if expr is None:
         return True
     if isinstance(expr, And):
-        return all(evaluate_where(db, obj, e, spec) for e in expr.exprs)
+        results = [_evaluate_tri(db, obj, e, spec) for e in expr.exprs]
+        if any(r is False for r in results):
+            return False
+        if any(r is None for r in results):
+            return None
+        return True
     if isinstance(expr, Or):
-        return any(evaluate_where(db, obj, e, spec) for e in expr.exprs)
+        results = [_evaluate_tri(db, obj, e, spec) for e in expr.exprs]
+        if any(r is True for r in results):
+            return True
+        if any(r is None for r in results):
+            return None
+        return False
     if isinstance(expr, Not):
-        return not evaluate_where(db, obj, expr.expr, spec)
+        result = _evaluate_tri(db, obj, expr.expr, spec)
+        return None if result is None else not result
     if isinstance(expr, In):
         value = resolve_column_ref(db, obj, expr.column, spec)
+        if value is None:
+            return None
         return value in expr.values
     if isinstance(expr, Contains):
         # A plain substring test -- unlike `Like`'s SQL-pattern matching
@@ -273,7 +308,7 @@ def evaluate_where(db: Any, obj: Any, expr: Any, spec: ObjectTypeSpec) -> bool:
         # correct and simpler than routing through the LIKE/regex machinery.
         value = resolve_column_ref(db, obj, expr.column, spec)
         if value is None:
-            return False
+            return None
         return expr.value.lower() in str(value).lower()
     if isinstance(expr, Comparison):
         left = resolve_column_ref(db, obj, expr.column, spec)
@@ -283,3 +318,17 @@ def evaluate_where(db: Any, obj: Any, expr: Any, spec: ObjectTypeSpec) -> bool:
             right = expr.value
         return _compare(expr.op, left, right)
     raise TypeError(f"unsupported where expression: {expr!r}")
+
+
+def evaluate_where(db: Any, obj: Any, expr: Any, spec: ObjectTypeSpec) -> bool:
+    """`query.py`'s `.compile()` tree, evaluated in Python against a real
+    object instead of rendered as SQL. See module docstring for why no
+    privacy guard is needed here the way `Comparison.compile()` needs one.
+
+    Delegates the actual recursion to `_evaluate_tri`, which tracks SQL's
+    three-valued logic (`True`/`False`/`UNKNOWN`) rather than a plain
+    `bool` -- collapsed to a real `bool` here, exactly once, the same way
+    a SQL `WHERE` clause only keeps rows that are definitely `True`,
+    treating `UNKNOWN` the same as `False`.
+    """
+    return _evaluate_tri(db, obj, expr, spec) is True
