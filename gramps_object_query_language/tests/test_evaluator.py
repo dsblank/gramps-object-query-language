@@ -286,6 +286,137 @@ def test_evaluate_where_and_or_not(db_handles):
     assert evaluate_where(db, father, Not(Eq("surname", "Anderson")), PERSON) is False
 
 
+# --- three-valued logic (UNKNOWN propagation through Not/And/Or) -------------
+#
+# SQL's `NOT`/`AND`/`OR` follow three-valued logic: a comparison against a
+# missing value is UNKNOWN, not False, and `NOT UNKNOWN` is still UNKNOWN,
+# not True. These tests lock in `_evaluate_tri`'s handling of that -- each
+# one has a real SQL-side counterpart it must agree with (see the
+# SQL-vs-evaluator agreement tests further down), but is checked here in
+# isolation too since these are the exact shapes that diverged before
+# `_evaluate_tri` existed (a plain `bool`-returning recursion collapsed
+# UNKNOWN to False at each leaf, so `Not` wrapping one flipped it to True
+# -- wrong).
+
+
+def test_evaluate_where_not_of_ordering_comparison_against_missing_value(db_handles):
+    # Before the fix: Not(Gt(...)) against a missing value incorrectly
+    # returned True (a plain False, negated). SQL's NOT UNKNOWN stays
+    # UNKNOWN -- excluded either way, matching test_evaluate_where_gt_excludes_none
+    # above for the un-negated form.
+    db, handles = db_handles
+    person = db.get_person_from_handle(handles["no_birth"])
+    ref = resolve_column_path(PERSON, ["birth", "gramps_id"])
+    assert evaluate_where(db, person, Gt(ref, "E0000"), PERSON) is False
+    assert evaluate_where(db, person, Not(Gt(ref, "E0000")), PERSON) is False
+
+
+def test_evaluate_where_not_of_in_against_missing_value(db_handles):
+    db, handles = db_handles
+    person = db.get_person_from_handle(handles["no_birth"])
+    ref = resolve_column_path(PERSON, ["birth", "gramps_id"])
+    assert evaluate_where(db, person, In(ref, ["E0000"]), PERSON) is False
+    assert evaluate_where(db, person, Not(In(ref, ["E0000"])), PERSON) is False
+
+
+def test_evaluate_where_not_of_like_against_missing_value(db_handles):
+    db, handles = db_handles
+    person = db.get_person_from_handle(handles["no_birth"])
+    ref = resolve_column_path(PERSON, ["birth", "gramps_id"])
+    assert evaluate_where(db, person, Like(ref, "E%"), PERSON) is False
+    assert evaluate_where(db, person, Not(Like(ref, "E%")), PERSON) is False
+
+
+def test_evaluate_where_and_false_dominates_unknown_sibling(db_handles):
+    # And(False, UNKNOWN) must be a definite False, not UNKNOWN -- checking
+    # for a False sibling has to happen *before* checking for an UNKNOWN
+    # one, the same precedence SQL's AND uses. Getting this order backwards
+    # would make Not(And(...)) wrongly stay excluded here instead of
+    # matching.
+    db, handles = db_handles
+    father = db.get_person_from_handle(handles["father"])  # surname "Anderson", no death ref
+    death_gramps_id = resolve_column_path(PERSON, ["death", "gramps_id"])
+    condition = And(Eq("surname", "Baker"), Gt(death_gramps_id, "E0000"))
+    assert evaluate_where(db, father, condition, PERSON) is False
+    assert evaluate_where(db, father, Not(condition), PERSON) is True
+
+
+def test_evaluate_where_or_true_dominates_unknown_sibling(db_handles):
+    # Or(True, UNKNOWN) must be a definite True -- same dominance rule,
+    # mirrored for OR.
+    db, handles = db_handles
+    father = db.get_person_from_handle(handles["father"])  # surname "Anderson", no death ref
+    death_gramps_id = resolve_column_path(PERSON, ["death", "gramps_id"])
+    condition = Or(Eq("surname", "Anderson"), Gt(death_gramps_id, "E0000"))
+    assert evaluate_where(db, father, condition, PERSON) is True
+    assert evaluate_where(db, father, Not(condition), PERSON) is False
+
+
+def test_evaluate_where_and_of_true_and_unknown_excludes_both_ways(db_handles):
+    # And(True, UNKNOWN) is UNKNOWN, not False or True -- so neither the
+    # condition nor its negation matches. The "obviously wrong" bug this
+    # guards against: treating And(True, UNKNOWN) as True (so Not incorrectly
+    # excludes) or as False (so Not incorrectly includes) -- it's neither.
+    db, handles = db_handles
+    father = db.get_person_from_handle(handles["father"])  # surname "Anderson", no death ref
+    death_gramps_id = resolve_column_path(PERSON, ["death", "gramps_id"])
+    condition = And(Eq("surname", "Anderson"), Gt(death_gramps_id, "E0000"))
+    assert evaluate_where(db, father, condition, PERSON) is False
+    assert evaluate_where(db, father, Not(condition), PERSON) is False
+
+
+# --- SQL vs evaluator agreement (the regression guard for the above) ---------
+
+
+def test_sql_and_evaluator_agree_on_not_with_missing_values():
+    """Runs the same `where` AST through the real SQLite compiler and
+    through `evaluate_where` against equivalent data, for every shape that
+    diverged before `_evaluate_tri` -- this is the test that would have
+    caught that bug, and is meant to catch any future one shaped like it.
+    Uses a plain flat column (`gramps_id`), not a `JsonPath`, so the
+    evaluator side can use a simple stand-in object instead of a real
+    Gramps object (`get_flat_column` is a plain `getattr`; `JsonPath`
+    resolution needs `json_utils.object_to_dict`, which does not).
+    """
+    import sqlite3
+
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE person (handle TEXT, gramps_id TEXT)")
+    conn.execute("INSERT INTO person VALUES ('has_id', 'E0001')")
+    conn.execute("INSERT INTO person VALUES ('no_id', NULL)")
+
+    class Row:
+        def __init__(self, gramps_id):
+            self.gramps_id = gramps_id
+
+    rows = {"has_id": Row("E0001"), "no_id": Row(None)}
+
+    wheres = [
+        Gt("gramps_id", "E0002"),
+        Not(Gt("gramps_id", "E0002")),
+        In("gramps_id", ["E0009"]),
+        Not(In("gramps_id", ["E0009"])),
+        Like("gramps_id", "Z%"),
+        Not(Like("gramps_id", "Z%")),
+        And(Eq("gramps_id", "E0001"), Not(Gt("gramps_id", "E0002"))),
+        Or(Eq("gramps_id", "nope"), Not(Gt("gramps_id", "E0002"))),
+        Not(And(Eq("gramps_id", "nope"), Gt("gramps_id", "E0002"))),
+        Not(Or(Eq("gramps_id", "E0001"), Gt("gramps_id", "E0002"))),
+    ]
+
+    for where in wheres:
+        sql, params = compile_query(
+            PERSON, Query(select=["handle"], where=where), dialect=Dialect.SQLITE
+        )
+        sql_matches = {row[0] for row in conn.execute(sql, params).fetchall()}
+        for handle, row in rows.items():
+            expected = handle in sql_matches
+            actual = evaluate_where(None, row, where, PERSON)
+            assert actual == expected, f"{where!r} on {handle!r}: SQL={expected} eval={actual}"
+
+
 # --- Proxy correctness -------------------------------------------------------
 
 

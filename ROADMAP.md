@@ -85,6 +85,32 @@ doesn't use `or` still produces the exact same flat list it always did. No
 SQL or evaluator changes were needed at all. See `query_lang.py`'s
 `_translate_bool_or_leaf`/`_translate_top_level`/`_node_from_json`.
 
+### `evaluate_where`'s `Not`/missing-value divergence
+
+Fixed. `evaluate_where` computed a plain `bool` at every leaf, collapsing a
+missing value (a masked field, or a relationship/path that doesn't resolve)
+straight to `False` -- correct on its own, but wrong once `Not` wraps it:
+SQL's `NOT UNKNOWN` is still `UNKNOWN` (excluded from a `WHERE` clause,
+same as the un-negated form), not `True`, and the old code had no way to
+tell "definitely false" and "unknown" apart by the time `Not` saw it.
+Verified empirically (not just reasoned about) before fixing: `Not(Gt(...))`,
+`Not(In(...))`, and `Not(Like(...))` against a missing value all matched
+the un-negated SQL query's *complement* incorrectly.
+
+Fix: the recursion was split into a new `_evaluate_tri` (returns `True`/
+`False`/`None`-for-`UNKNOWN`, matching SQL's three-valued logic exactly,
+including `AND`/`OR`'s dominance rules -- a definite `False` always wins an
+`AND` over an `UNKNOWN` sibling, a definite `True` always wins an `OR`
+the same way) and the public `evaluate_where` (unchanged signature/
+contract), which now just collapses to a real `bool` once, at the very
+end, the same way a SQL `WHERE` clause treats `UNKNOWN` as excluded.
+`query.py`/`query_lang.py` needed no changes -- SQL already had this right.
+
+Covered by `test_evaluator.py`'s three-valued-logic section, including a
+dedicated test that runs the same `where` AST through the real SQLite
+compiler and through `evaluate_where` against equivalent data and asserts
+they agree -- the regression guard for this exact class of bug.
+
 ## Possibilities
 
 ### `len()` / array-length comparisons
@@ -163,14 +189,20 @@ edge cases written as tests *before* either dialect is wired up.
 ### `not`
 
 The remaining boolean-structure gap now that `or` is done (see "Done"
-below). Expected to be small: `query.py`'s `Not` class and `evaluator.py`'s
-`Not` branch already exist and are already tested (same as `Or` was before
-`or` support landed) -- the work is almost entirely in `query_lang.py`,
+below). `query.py`'s `Not` class and `evaluator.py`'s `Not` branch already
+exist and are already tested -- the remaining work is in `query_lang.py`,
 teaching `_translate_bool_or_leaf` to also recognize `ast.UnaryOp` with
 `ast.Not` and produce a `{"not": node}` wire shape, plus a matching case in
-`_node_from_json`. No new SQL, no dialect work, no NULL-semantics decisions
--- the same reason `or` turned out to be smaller than originally estimated
-here.
+`_node_from_json`. No new SQL, no dialect work.
+
+A NULL-semantics prerequisite that *did* exist here has already been fixed
+(see "Done" below, `_evaluate_tri`): `evaluate_where` used to collapse a
+missing value to a definite `False` at each leaf, so `Not` wrapping one
+flipped it to `True` where SQL's `NOT UNKNOWN` (still `UNKNOWN`, not `True`)
+would exclude the row -- a real, verified divergence between the SQL and
+evaluator execution paths, latent in already-shipped code, not something
+`not` support itself would have introduced. With that fixed, adding `not`
+to the parser is now just the mechanical piece above.
 
 ### Other gaps (not yet scoped to this level of detail)
 
