@@ -57,13 +57,17 @@ def db():
         "surname TEXT, birth_ref_index INTEGER, death_ref_index INTEGER, "
         "json_data TEXT)"
     )
-    conn.execute("CREATE TABLE family (handle TEXT, father_handle TEXT, mother_handle TEXT)")
+    conn.execute(
+        "CREATE TABLE family (handle TEXT, father_handle TEXT, mother_handle TEXT, "
+        "json_data TEXT)"
+    )
     conn.execute(
         "CREATE TABLE event (handle TEXT, place TEXT, description TEXT, json_data TEXT)"
     )
     conn.execute("CREATE TABLE place (handle TEXT, title TEXT)")
+    conn.execute("CREATE TABLE note (handle TEXT, format INTEGER)")
 
-    def person(handle, gender, given_name, surname, birth_ref=0, death_ref=1):
+    def person(handle, gender, given_name, surname, birth_ref=0, death_ref=1, note_list=()):
         conn.execute(
             "INSERT INTO person VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
@@ -78,7 +82,8 @@ def db():
                         "event_ref_list": [
                             {"ref": f"{handle}-birth"},
                             {"ref": f"{handle}-death"},
-                        ]
+                        ],
+                        "note_list": list(note_list),
                     }
                 ),
             ),
@@ -91,8 +96,10 @@ def db():
         )
 
     # Father: John Smith, born 1940 in Chicago (sortval 2429661), died 1990
-    # in Boston (sortval 2447893) -- an accident, per the death record.
-    person("dad1", gender=1, given_name="John", surname="Smith")
+    # in Boston (sortval 2447893) -- an accident, per the death record. Has
+    # one note attached, used by the exists(notes) examples below.
+    conn.execute("INSERT INTO note VALUES ('dad1-note-1', 0)")
+    person("dad1", gender=1, given_name="John", surname="Smith", note_list=["dad1-note-1"])
     event("dad1-birth", 2429661, place="chicago")
     event("dad1-death", 2447893, place="boston", description="Died in a car accident.")
 
@@ -125,8 +132,14 @@ def db():
     event("grandma1-birth", 2396028, place="philadelphia")
     event("grandma1-death", 2415021, place="chicago")
 
-    conn.execute("INSERT INTO family VALUES ('fam1', 'dad1', 'mom1')")
-    conn.execute("INSERT INTO family VALUES ('fam2', 'granddad1', 'grandma1')")
+    # fam1 has one recorded child (kid1, Robert) -- used by the exists(children)
+    # examples below. fam2 has no json_data / recorded children at all, used
+    # to prove exists(children) correctly excludes it rather than erroring.
+    conn.execute(
+        "INSERT INTO family VALUES ('fam1', 'dad1', 'mom1', ?)",
+        (json.dumps({"child_ref_list": [{"ref": "kid1"}]}),),
+    )
+    conn.execute("INSERT INTO family VALUES ('fam2', 'granddad1', 'grandma1', NULL)")
 
     conn.execute("INSERT INTO place VALUES ('chicago', 'Chicago, Cook, Illinois, USA')")
     conn.execute("INSERT INTO place VALUES ('new-york', 'New York, New York, USA')")
@@ -409,6 +422,53 @@ def test_parents_died_in_same_place(db):
     # a single field-vs-field comparison.
     result = run(db, "Family", "father.death.place.title == mother.death.place.title")
     assert result == [("fam2",)]
+
+
+# --- one-to-many relationships (exists) ---------------------------------------
+
+
+def test_exists_children_with_condition(db):
+    # fam1's one recorded child is kid1 (Robert Smith) -- fam2 has none
+    # recorded at all.
+    result = run(db, "Family", "exists(children, given_name == 'Steve')")
+    assert result == []
+    result = run(db, "Family", "exists(children, given_name == 'Robert')")
+    assert result == [("fam1",)]
+
+
+def test_not_exists_children_with_condition(db):
+    result = run(db, "Family", "not exists(children, given_name == 'Steve')")
+    assert result == [("fam1",), ("fam2",)]
+
+
+def test_exists_children_no_condition(db):
+    # "any recorded child at all" -- matches fam1 (kid1), not fam2 (no
+    # json_data / no children recorded at all -- not an error, just no rows
+    # for json_each to iterate).
+    result = run(db, "Family", "exists(children)")
+    assert result == [("fam1",)]
+
+
+def test_not_exists_children_no_condition(db):
+    result = run(db, "Family", "not exists(children)")
+    assert result == [("fam2",)]
+
+
+def test_exists_notes(db):
+    # dad1 has one note attached; everyone else has an empty note_list.
+    result = run(db, "Person", "exists(notes)")
+    assert result == [("dad1",)]
+
+
+def test_not_exists_notes(db):
+    result = run(db, "Person", "not exists(notes)")
+    assert result == [
+        ("granddad1",),
+        ("grandma1",),
+        ("kid1",),
+        ("mom1",),
+        ("other1",),
+    ]
 
 
 # --- constants on other types (Citation.CONF_HIGH) ---------------------------

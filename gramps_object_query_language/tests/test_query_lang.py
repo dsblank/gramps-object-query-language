@@ -33,6 +33,7 @@ from gramps_object_query_language.query import (
     FAMILY,
     And,
     Eq,
+    Exists,
     Gte,
     JsonPath,
     Lt,
@@ -815,6 +816,126 @@ def test_field_vs_field_lhs_and_rhs_paths_combined_with_and():
     }
 
 
+# --- exists(...) (one-to-many membership) -------------------------------------
+
+
+def test_exists_produces_exists_node_with_condition():
+    result = parse_expr("family", "exists(children, given_name == 'Steve')")
+    assert result == [
+        {
+            "exists": {
+                "relationship": "children",
+                "where": [{"column": "given_name", "op": "eq", "value": "Steve"}],
+            }
+        }
+    ]
+
+
+def test_exists_without_condition_omits_where_key():
+    result = parse_expr("family", "exists(children)")
+    assert result == [{"exists": {"relationship": "children"}}]
+
+
+def test_exists_condition_can_chain_relationships():
+    # The condition is parsed against the *target* type (Person), so it can
+    # cross Person's own relationships (birth -> Event -> Place), the same
+    # as any ordinary where_expr against Person directly.
+    result = parse_expr("family", "exists(children, birth.place.title == 'Chicago')")
+    assert result == [
+        {
+            "exists": {
+                "relationship": "children",
+                "where": [
+                    {
+                        "column": {"json_path": ["birth", "place", "title"]},
+                        "op": "eq",
+                        "value": "Chicago",
+                    }
+                ],
+            }
+        }
+    ]
+
+
+def test_exists_condition_can_use_and_or_not():
+    result = parse_expr(
+        "family", "exists(children, given_name == 'Steve' and gender == 1)"
+    )
+    assert result == [
+        {
+            "exists": {
+                "relationship": "children",
+                "where": [
+                    {"column": "given_name", "op": "eq", "value": "Steve"},
+                    {"column": "gender", "op": "eq", "value": 1},
+                ],
+            }
+        }
+    ]
+
+
+def test_not_exists():
+    result = parse_expr("person", "not exists(notes)")
+    assert result == [{"not": {"exists": {"relationship": "notes"}}}]
+
+
+def test_exists_composes_with_and():
+    result = parse_expr(
+        "family", "exists(children, given_name == 'Steve') and father.surname == 'Smith'"
+    )
+    assert result == [
+        {
+            "exists": {
+                "relationship": "children",
+                "where": [{"column": "given_name", "op": "eq", "value": "Steve"}],
+            }
+        },
+        {"column": {"json_path": ["father", "surname"]}, "op": "eq", "value": "Smith"},
+    ]
+
+
+def test_exists_unknown_relationship_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "exists(bogus, gender == 1)")
+
+
+def test_exists_relationship_not_registered_on_this_type_rejected():
+    # "children" is only registered on Family, not Person.
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "exists(children, gender == 1)")
+
+
+def test_exists_wrong_arity_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("family", "exists()")
+    with pytest.raises(QueryLangError):
+        parse_expr("family", "exists(children, a == 1, b == 2)")
+
+
+def test_exists_first_argument_must_be_bare_name():
+    with pytest.raises(QueryLangError):
+        parse_expr("family", "exists('children', given_name == 'Steve')")
+
+
+def test_exists_wrapped_in_or():
+    result = parse_expr(
+        "family", "exists(children, given_name == 'Steve') or father.surname == 'Smith'"
+    )
+    assert result == [
+        {
+            "or": [
+                {
+                    "exists": {
+                        "relationship": "children",
+                        "where": [{"column": "given_name", "op": "eq", "value": "Steve"}],
+                    }
+                },
+                {"column": {"json_path": ["father", "surname"]}, "op": "eq", "value": "Smith"},
+            ]
+        }
+    ]
+
+
 # --- compile_expr / compile_expr_for_spec (expr string -> query.py AST) ------
 
 
@@ -890,6 +1011,61 @@ def test_compile_expr_not_wraps_and():
     assert isinstance(where, Not)
     assert isinstance(where.expr, And)
     assert where.expr.exprs == (Eq("gender", 1), Eq("surname", "Smith"))
+
+
+def test_compile_expr_exists_becomes_exists_node():
+    _, where = compile_expr("family", "exists(children, given_name == 'Steve')")
+    assert isinstance(where, Exists)
+    assert where.collection.name == "children"
+    assert where.condition == Eq("given_name", "Steve")
+
+
+def test_compile_expr_exists_without_condition():
+    _, where = compile_expr("family", "exists(children)")
+    assert isinstance(where, Exists)
+    assert where.condition is None
+
+
+def test_compile_expr_not_exists():
+    _, where = compile_expr("person", "not exists(notes)")
+    assert isinstance(where, Not)
+    assert isinstance(where.expr, Exists)
+    assert where.expr.condition is None
+
+
+def test_compile_expr_exists_condition_with_and_becomes_and_node():
+    _, where = compile_expr(
+        "family", "exists(children, given_name == 'Steve' and gender == 1)"
+    )
+    assert isinstance(where, Exists)
+    assert isinstance(where.condition, And)
+    assert where.condition.exprs == (Eq("given_name", "Steve"), Eq("gender", 1))
+
+
+def test_compile_expr_exists_end_to_end_sqlite_execution():
+    import json
+    import sqlite3
+
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE family (handle TEXT, json_data TEXT)")
+    conn.execute("CREATE TABLE person (handle TEXT, given_name TEXT)")
+    conn.execute("INSERT INTO person VALUES ('steve', 'Steve')")
+    conn.execute("INSERT INTO person VALUES ('bob', 'Bob')")
+    conn.execute(
+        "INSERT INTO family VALUES ('fam-with-steve', ?)",
+        (json.dumps({"child_ref_list": [{"ref": "steve"}]}),),
+    )
+    conn.execute(
+        "INSERT INTO family VALUES ('fam-without-steve', ?)",
+        (json.dumps({"child_ref_list": [{"ref": "bob"}]}),),
+    )
+
+    spec, where = compile_expr("family", "exists(children, given_name == 'Steve')")
+    sql, params = compile_query(spec, Query(select=["handle"], where=where), dialect=Dialect.SQLITE)
+    rows = conn.execute(sql, params).fetchall()
+    assert rows == [("fam-with-steve",)]
 
 
 def test_compile_expr_end_to_end_sqlite_execution():

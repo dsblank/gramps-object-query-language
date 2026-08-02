@@ -272,6 +272,75 @@ _RELATIONSHIPS: dict[str, dict[str, Tuple[ObjectTypeSpec, ColumnRef]]] = {
 }
 
 
+@dataclass(frozen=True)
+class Collection:
+    """A one-to-many relationship -- a list of handles (or handle-bearing ref
+    objects) reached from the current row, e.g. a `Family`'s children.
+
+    Unlike `RelatedObject`, never appears as a dotted-path segment (`children.
+    surname` would be ambiguous -- which child?) -- only as `Exists`'s target,
+    looked up via `resolve_collection`, a separate namespace from
+    `_RELATIONSHIPS` on purpose.
+
+    `list_path`: where the list of related items lives in the current row's
+        `json_data` (always a single top-level key today, e.g.
+        `child_ref_list`, `note_list`).
+    `ref_field`: the sub-key that holds each item's handle, for a list of ref
+        objects (`"ref"`, for `ChildRef`/`EventRef`/... entries) -- `None`
+        for a list that's already plain handle strings (`note_list`,
+        `tag_list`).
+    """
+
+    name: str
+    target: ObjectTypeSpec
+    list_path: JsonPath
+    ref_field: Optional[str]
+
+
+# Registry of one-to-many collection roots, keyed by the *current* table --
+# mirrors `_RELATIONSHIPS`'s shape, but for `EXISTS`-style membership tests
+# (see `Exists`) rather than a single correlated scalar subquery. `children`
+# proves the ref-object-list shape (`.ref` extraction); `notes` proves the
+# flat-handle-list shape (no sub-field) -- the two shapes every other
+# candidate collection (event_ref_list, citation_list, media_list, tag_list,
+# person_ref_list, ...) falls into.
+_COLLECTIONS: dict[str, dict[str, Collection]] = {
+    FAMILY.table: {
+        "children": Collection("children", PERSON, JsonPath(("child_ref_list",)), "ref"),
+    },
+    PERSON.table: {
+        "notes": Collection("notes", NOTE, JsonPath(("note_list",)), None),
+    },
+}
+
+
+def _check_no_collection_relationship_name_collisions() -> None:
+    for table, collections in _COLLECTIONS.items():
+        overlap = set(collections) & set(_RELATIONSHIPS.get(table, {}))
+        if overlap:
+            raise QueryError(
+                f"name collides between a relationship and a collection on "
+                f"{table!r}: {sorted(overlap)}"
+            )
+
+
+_check_no_collection_relationship_name_collisions()
+
+
+def resolve_collection(spec: ObjectTypeSpec, name: str) -> Collection:
+    """Look up a `Collection` by name on `spec`'s table -- `exists(...)`'s
+    first argument, resolved the same way `resolve_column_path` resolves a
+    `_RELATIONSHIPS` name, just from the separate `_COLLECTIONS` namespace.
+    """
+    collections = _COLLECTIONS.get(spec.table, {})
+    if name not in collections:
+        raise QueryError(
+            f"unknown collection {name!r} on {spec.table!r} "
+            f"(known: {', '.join(sorted(collections)) or 'none'})"
+        )
+    return collections[name]
+
+
 def resolve_column_path(
     spec: ObjectTypeSpec, segments: Sequence[Union[str, int]]
 ) -> ColumnRef:
@@ -812,6 +881,120 @@ class Not:
 
     def __repr__(self) -> str:
         return f"Not({self.expr!r})"
+
+
+# --- EXISTS (one-to-many membership) -----------------------------------------
+
+
+def _collection_source_sqlite(collection: Collection, outer_table: str) -> Tuple[str, str, list]:
+    """`(from_fragment, handle_expr, params)` for iterating `collection` on
+    SQLite, via `json_each` as a table-valued function.
+
+    `json_each`'s own `value` column already holds a plain string for a
+    flat-handle-list element (`note_list`) -- no extraction needed -- and the
+    serialized JSON text of the element for a ref-object one (`child_ref_list`),
+    which `json_extract` then reads `ref_field` out of directly, the same way
+    it would against a real `json_data` column.
+    """
+    (key,) = collection.list_path.segments
+    source = f"json_each({outer_table}.json_data, ?) AS je"
+    if collection.ref_field:
+        handle_expr = f"json_extract(je.value, '$.{collection.ref_field}')"
+    else:
+        handle_expr = "je.value"
+    return source, handle_expr, [f"$.{key}"]
+
+
+def _collection_source_postgresql(collection: Collection, outer_table: str) -> Tuple[str, str, list]:
+    """`(from_fragment, handle_expr, params)` for iterating `collection` on
+    PostgreSQL.
+
+    A ref-object list uses `jsonb_array_elements` (keeps each element as
+    `jsonb`, so `->> ref_field` can pull the handle back out); a flat-handle
+    list uses `jsonb_array_elements_text` instead -- `->>` has no meaning
+    against a bare jsonb scalar, but `_text` already unwraps each element to
+    plain SQL text directly.
+    """
+    (key,) = collection.list_path.segments
+    if collection.ref_field:
+        source = f"jsonb_array_elements({outer_table}.json_data::jsonb -> '{key}') AS je(value)"
+        handle_expr = f"je.value ->> '{collection.ref_field}'"
+    else:
+        source = f"jsonb_array_elements_text({outer_table}.json_data::jsonb -> '{key}') AS je(value)"
+        handle_expr = "je.value"
+    return source, handle_expr, []
+
+
+class Exists:
+    """`EXISTS (SELECT 1 FROM <target> JOIN <list> ... WHERE ...)` -- a
+    one-to-many membership test over a `Collection` (see there), optionally
+    narrowed by a `condition` compiled against the collection's target type.
+
+    Not a correlated *scalar* subquery like `RelatedObject` -- `handle_ref`
+    there names a single related row; here there can be any number, so the
+    subquery iterates the JSON array (`json_each`/`jsonb_array_elements`)
+    joined against the target table by handle, and asks only whether at
+    least one such row -- matching `condition`, if given -- exists.
+
+    `condition=None` means "at least one related row at all," regardless of
+    its fields (`exists(children)`).
+
+    SQL's `EXISTS`/`NOT EXISTS` are never `UNKNOWN` the way an ordinary
+    comparison against a missing value is -- a row that doesn't satisfy the
+    inner `WHERE` just isn't returned by the subquery, it doesn't propagate a
+    `NULL` outward. `evaluator.py` mirrors this: `Exists` always resolves to
+    a definite `True`/`False`, never `None`, so `not exists(...)` needs no
+    three-valued-logic special case at all.
+    """
+
+    def __init__(self, collection: Collection, condition: Optional[Any] = None):
+        self.collection = collection
+        self.condition = condition
+
+    def compile(
+        self,
+        spec: ObjectTypeSpec,
+        dialect: Optional[Dialect] = None,
+        treeid: Optional[int] = None,
+    ) -> Tuple[str, list]:
+        if dialect is None:
+            raise QueryError(
+                f"a dialect is required to compile exists({self.collection.name!r}, ...), "
+                "but none was given"
+            )
+        target = self.collection.target
+        target_table = target.table
+        outer_table = spec.table
+
+        if dialect == Dialect.SQLITE:
+            source, handle_expr, source_params = _collection_source_sqlite(
+                self.collection, outer_table
+            )
+        elif dialect == Dialect.POSTGRESQL:
+            source, handle_expr, source_params = _collection_source_postgresql(
+                self.collection, outer_table
+            )
+        else:
+            raise QueryError(f"unsupported dialect: {dialect!r}")
+
+        where_parts = [f"{target_table}.handle = {handle_expr}"]
+        params = list(source_params)
+        if self.condition is not None:
+            cond_sql, cond_params = self.condition.compile(target, dialect, treeid)
+            where_parts.append(f"({cond_sql})")
+            params.extend(cond_params)
+        if treeid is not None:
+            where_parts.append(f"{target_table}.treeid = ?")
+            params.append(treeid)
+
+        sql = (
+            f"EXISTS (SELECT 1 FROM {target_table}, {source} "
+            f"WHERE {' AND '.join(where_parts)})"
+        )
+        return sql, params
+
+    def __repr__(self) -> str:
+        return f"Exists({self.collection.name!r}, {self.condition!r})"
 
 
 # --- ORDER BY ----------------------------------------------------------------

@@ -34,10 +34,12 @@ from gramps.gen.db.utils import make_database
 from gramps.gen.dbstate import DbState
 from gramps.gen.lib import (
     Attribute,
+    ChildRef,
     Event,
     EventType,
     Family,
     Name,
+    Note,
     Person,
     Place,
     PlaceName,
@@ -58,12 +60,14 @@ from gramps_object_query_language.query import (
     And,
     Contains,
     Eq,
+    Exists,
     Gt,
     In,
     Like,
     Ne,
     Not,
     Or,
+    resolve_collection,
     resolve_column_path,
 )
 
@@ -110,10 +114,15 @@ def db_handles():
         birth_private.set_privacy(True)
         handles["birth_private"] = db.add_event(birth_private, trans)
 
+        note = Note()
+        note.set("A note about Karl.")
+        handles["note"] = db.add_note(note, trans)
+
         father = Person()
         father.set_primary_name(_name("Karl", "Anderson"))
         father.set_gender(Person.MALE)
         father.set_birth_ref(_event_ref(handles["birth_father"]))
+        father.add_note(handles["note"])
         handles["father"] = db.add_person(father, trans)
 
         mother = Person()
@@ -139,10 +148,24 @@ def db_handles():
         secret_attr.add_attribute(attr)
         handles["secret_attr_person"] = db.add_person(secret_attr, trans)
 
+        child_steve = Person()
+        child_steve.set_primary_name(_name("Steve", "Anderson"))
+        handles["child_steve"] = db.add_person(child_steve, trans)
+
+        child_anna = Person()
+        child_anna.set_primary_name(_name("Anna", "Anderson"))
+        handles["child_anna"] = db.add_person(child_anna, trans)
+
         family = Family()
         family.set_father_handle(handles["father"])
         family.set_mother_handle(handles["mother"])
+        for child_handle in (handles["child_steve"], handles["child_anna"]):
+            child_ref = ChildRef()
+            child_ref.set_reference_handle(child_handle)
+            family.add_child_ref(child_ref)
         handles["family"] = db.add_family(family, trans)
+
+        handles["childless_family"] = db.add_family(Family(), trans)
 
     yield db, handles
 
@@ -363,6 +386,102 @@ def test_evaluate_where_and_of_true_and_unknown_excludes_both_ways(db_handles):
     condition = And(Eq("surname", "Anderson"), Gt(death_gramps_id, "E0000"))
     assert evaluate_where(db, father, condition, PERSON) is False
     assert evaluate_where(db, father, Not(condition), PERSON) is False
+
+
+# --- Exists (one-to-many membership) -----------------------------------------
+
+
+def test_evaluate_where_exists_matches_when_condition_satisfied(db_handles):
+    db, handles = db_handles
+    family = db.get_family_from_handle(handles["family"])
+    children = resolve_collection(FAMILY, "children")
+    condition = Eq("given_name", "Steve")
+    assert evaluate_where(db, family, Exists(children, condition), FAMILY) is True
+
+
+def test_evaluate_where_exists_excludes_when_no_child_matches(db_handles):
+    db, handles = db_handles
+    family = db.get_family_from_handle(handles["family"])
+    children = resolve_collection(FAMILY, "children")
+    condition = Eq("given_name", "Zelda")
+    assert evaluate_where(db, family, Exists(children, condition), FAMILY) is False
+
+
+def test_evaluate_where_exists_no_condition_is_any_child_at_all(db_handles):
+    db, handles = db_handles
+    family = db.get_family_from_handle(handles["family"])
+    childless_family = db.get_family_from_handle(handles["childless_family"])
+    children = resolve_collection(FAMILY, "children")
+    assert evaluate_where(db, family, Exists(children), FAMILY) is True
+    assert evaluate_where(db, childless_family, Exists(children), FAMILY) is False
+
+
+def test_evaluate_where_not_exists(db_handles):
+    # Exists always resolves to a definite True/False -- not exists(...) is
+    # ordinary boolean negation, no three-valued-logic wrinkle (unlike Not
+    # wrapping an ordinary comparison against a missing value, see above).
+    db, handles = db_handles
+    family = db.get_family_from_handle(handles["family"])
+    childless_family = db.get_family_from_handle(handles["childless_family"])
+    children = resolve_collection(FAMILY, "children")
+    assert evaluate_where(db, family, Not(Exists(children)), FAMILY) is False
+    assert evaluate_where(db, childless_family, Not(Exists(children)), FAMILY) is True
+
+
+def test_evaluate_where_exists_flat_handle_list(db_handles):
+    # notes: a flat handle list (no ref_field extraction), unlike children's
+    # ref-object list -- proves both Collection shapes work in the evaluator.
+    db, handles = db_handles
+    father = db.get_person_from_handle(handles["father"])
+    mother = db.get_person_from_handle(handles["mother"])
+    notes = resolve_collection(PERSON, "notes")
+    assert evaluate_where(db, father, Exists(notes), PERSON) is True
+    assert evaluate_where(db, mother, Exists(notes), PERSON) is False
+
+
+def test_evaluate_where_exists_condition_can_chain_relationships(db_handles):
+    # The condition compiles against the collection's target type (Person),
+    # so it can cross Person's own relationships too.
+    db, handles = db_handles
+    family = db.get_family_from_handle(handles["family"])
+    children = resolve_collection(FAMILY, "children")
+    ref = resolve_column_path(PERSON, ["birth", "gramps_id"])
+    condition = Eq(ref, "does-not-exist")
+    assert evaluate_where(db, family, Exists(children, condition), FAMILY) is False
+
+
+def test_sql_and_evaluator_agree_on_exists(db_handles):
+    """Runs the same Exists AST through the real compiled SQLite query
+    (against the fixture's own underlying Gramps SQLite backend, which uses
+    the same table/json_data shape query.py targets) and through
+    evaluate_where, and checks they agree -- the same style of regression
+    guard as test_sql_and_evaluator_agree_on_not_with_missing_values below,
+    for the new Exists node instead of Not/And/Or.
+    """
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+
+    db, handles = db_handles
+    children = resolve_collection(FAMILY, "children")
+    wheres = [
+        Exists(children, Eq("given_name", "Steve")),
+        Exists(children, Eq("given_name", "Zelda")),
+        Not(Exists(children, Eq("given_name", "Steve"))),
+        Exists(children),
+    ]
+    families = {
+        "family": db.get_family_from_handle(handles["family"]),
+        "childless_family": db.get_family_from_handle(handles["childless_family"]),
+    }
+    for where in wheres:
+        sql, params = compile_query(
+            FAMILY, Query(select=["handle"], where=where), dialect=Dialect.SQLITE
+        )
+        db.dbapi.execute(sql, params)
+        sql_matches = {row[0] for row in db.dbapi.fetchall()}
+        for key, family in families.items():
+            expected = handles[key] in sql_matches
+            actual = evaluate_where(db, family, where, FAMILY)
+            assert actual == expected, f"{where!r} on {key!r}: SQL={expected} eval={actual}"
 
 
 # --- SQL vs evaluator agreement (the regression guard for the above) ---------

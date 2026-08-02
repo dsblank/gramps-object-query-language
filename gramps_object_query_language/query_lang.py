@@ -131,6 +131,7 @@ from .query import (
     ColumnRef,
     Contains,
     Eq,
+    Exists,
     Gt,
     Gte,
     In,
@@ -141,6 +142,8 @@ from .query import (
     Not,
     ObjectTypeSpec,
     Or,
+    QueryError,
+    resolve_collection,
     resolve_column_path,
 )
 
@@ -442,18 +445,51 @@ def _translate_like_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:
     return {"column": column, "op": "like", "value": pattern}
 
 
+def _translate_exists_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:
+    """Translate `exists(relationship[, condition])` into
+    `{"exists": {"relationship": ..., "where": [...]}}` -- `where` omitted
+    entirely when no condition is given (`exists(children)`, "at least one
+    related row at all").
+
+    `relationship`'s target type comes from `query.py`'s `_COLLECTIONS`
+    registry (via `resolve_collection`), the same way a `_RELATIONSHIPS`
+    name's target drives `resolve_column_path` -- `condition`, if given, is
+    itself a full `where_expr` boolean expression, just parsed against that
+    target type instead of `spec`, via the same `_translate_top_level` this
+    module already uses for the top-level expression.
+    """
+    if not 1 <= len(node.args) <= 2 or node.keywords:
+        raise QueryLangError(
+            "exists(relationship[, condition]) takes 1 or 2 positional arguments"
+        )
+    name_node = node.args[0]
+    if not isinstance(name_node, ast.Name):
+        raise QueryLangError(
+            f"exists(...)'s first argument must be a bare relationship name: "
+            f"{ast.dump(name_node)}"
+        )
+    try:
+        collection = resolve_collection(spec, name_node.id)
+    except QueryError as error:
+        raise QueryLangError(str(error)) from error
+    payload: dict = {"relationship": name_node.id}
+    if len(node.args) == 2:
+        payload["where"] = _translate_top_level(node.args[1], collection.target)
+    return {"exists": payload}
+
+
 def _translate_comparison_like_node(node: ast.AST, spec: ObjectTypeSpec) -> dict:
-    """A single leaf: either a `Compare` or a whitelisted `like(...)` call."""
+    """A single leaf: a `Compare`, or a whitelisted `like(...)`/`exists(...)` call."""
     if isinstance(node, ast.Compare):
         return _translate_compare(node, spec)
-    if (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "like"
-    ):
-        return _translate_like_call(node, spec)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        if node.func.id == "like":
+            return _translate_like_call(node, spec)
+        if node.func.id == "exists":
+            return _translate_exists_call(node, spec)
     raise QueryLangError(
-        f"expected a comparison (a == b, a in [...], like(a, 'pat')), got: {ast.dump(node)}"
+        f"expected a comparison (a == b, a in [...], like(a, 'pat'), "
+        f"exists(rel, cond)), got: {ast.dump(node)}"
     )
 
 
@@ -585,12 +621,22 @@ def _condition_from_json(condition: dict, spec: ObjectTypeSpec) -> Any:
     return _OP_CLASSES[op](column, value)
 
 
+def _where_list_to_ast(conditions: List[dict], spec: ObjectTypeSpec) -> Any:
+    """A `parse_expr`-shaped list of top-level conditions (implicitly AND'd),
+    translated to a single `query.py` boolean expression -- shared by
+    `compile_expr_for_spec` and `_node_from_json`'s `"exists"` case, whose
+    `where` payload is exactly this same shape, just against the collection's
+    target type instead of the outer spec.
+    """
+    asts = [_node_from_json(condition, spec) for condition in conditions]
+    return asts[0] if len(asts) == 1 else And(*asts)
+
+
 def _node_from_json(node: dict, spec: ObjectTypeSpec) -> Any:
     """One `parse_expr`-shaped node -- a leaf condition, or an `{"and"/"or":
-    [...]}`/`{"not": node}` combinator produced by `or`/`not` support --
-    translated to a `query.py` boolean expression (`Eq`/`Lt`/`In`/... for a
-    leaf, `And`/`Or`/`Not` for a combinator), recursing into each child the
-    same way.
+    [...]}`/`{"not": node}`/`{"exists": {...}}` combinator -- translated to a
+    `query.py` boolean expression (`Eq`/`Lt`/`In`/... for a leaf, `And`/`Or`/
+    `Not`/`Exists` for a combinator), recursing into each child the same way.
     """
     if "and" in node:
         return And(*(_node_from_json(child, spec) for child in node["and"]))
@@ -598,6 +644,15 @@ def _node_from_json(node: dict, spec: ObjectTypeSpec) -> Any:
         return Or(*(_node_from_json(child, spec) for child in node["or"]))
     if "not" in node:
         return Not(_node_from_json(node["not"], spec))
+    if "exists" in node:
+        payload = node["exists"]
+        collection = resolve_collection(spec, payload["relationship"])
+        condition = (
+            _where_list_to_ast(payload["where"], collection.target)
+            if "where" in payload
+            else None
+        )
+        return Exists(collection, condition)
     return _condition_from_json(node, spec)
 
 
@@ -608,8 +663,7 @@ def compile_expr_for_spec(spec: ObjectTypeSpec, expr: str) -> Any:
     `spec` -- see `parse_expr_for_spec`.
     """
     conditions = parse_expr_for_spec(spec, expr)
-    asts = [_node_from_json(condition, spec) for condition in conditions]
-    return asts[0] if len(asts) == 1 else And(*asts)
+    return _where_list_to_ast(conditions, spec)
 
 
 def compile_expr(namespace: str, expr: str) -> Tuple[ObjectTypeSpec, Any]:

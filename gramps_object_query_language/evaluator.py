@@ -50,10 +50,12 @@ from gramps.gen.lib import json_utils
 
 from .query import (
     And,
+    Collection,
     ColumnIndex,
     ColumnRef,
     Comparison,
     Contains,
+    Exists,
     In,
     JsonPath,
     Not,
@@ -202,6 +204,19 @@ def resolve_column_ref(db: Any, obj: Any, ref: ColumnRef, spec: ObjectTypeSpec) 
     return get_flat_column(obj, ref, spec)
 
 
+def _collection_handles(obj: Any, collection: Collection) -> list:
+    """The list of related handles for `collection` on `obj` -- a plain
+    handle string per element (`notes`), or each element's `ref_field`
+    pulled out (`children`'s `ChildRef.ref`) -- mirrors `query.py`'s
+    `_collection_source_sqlite`/`_collection_source_postgresql` exactly, just
+    walking the real in-memory list instead of rendering SQL to iterate it.
+    """
+    items = get_json_path(obj, collection.list_path) or []
+    if collection.ref_field:
+        return [item.get(collection.ref_field) for item in items if item]
+    return [item for item in items if item]
+
+
 def _like_to_regex(pattern: str) -> re.Pattern:
     """Translate a SQL `LIKE` pattern (`%`/`_` wildcards) to a regex.
 
@@ -295,6 +310,24 @@ def _evaluate_tri(db: Any, obj: Any, expr: Any, spec: ObjectTypeSpec) -> Optiona
     if isinstance(expr, Not):
         result = _evaluate_tri(db, obj, expr.expr, spec)
         return None if result is None else not result
+    if isinstance(expr, Exists):
+        # Always a definite True/False, never UNKNOWN -- matching SQL's own
+        # EXISTS/NOT EXISTS, which never propagates NULL from a subquery
+        # row that fails its WHERE, it's simply not counted. Unlike every
+        # other branch here, there's no missing-value case to collapse to
+        # None for.
+        collection = expr.collection
+        getter = getattr(db, GETTER_BY_TABLE[collection.target.table])
+        for handle in _collection_handles(obj, collection):
+            try:
+                related = getter(handle)
+            except HandleError:
+                continue
+            if expr.condition is None or evaluate_where(
+                db, related, expr.condition, collection.target
+            ):
+                return True
+        return False
     if isinstance(expr, In):
         value = resolve_column_ref(db, obj, expr.column, spec)
         if value is None:

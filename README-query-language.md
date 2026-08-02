@@ -304,6 +304,38 @@ to ask "how many last names does this person have," but checking whether a
 particular position in the list is filled in works just as well for "two or
 more."
 
+### Goal: Find families that have a child named Steve
+
+```
+Family "exists(children, given_name == 'Steve')"
+```
+
+`exists(children, ...)` matches a family if *any* of its children satisfies
+the condition -- unlike `father`/`mother`, which each always reach exactly
+one person, a family can have any number of children, so this needs its own
+"does at least one of them match" check rather than an ordinary field
+reference.
+
+### Goal: Find families with no children recorded at all
+
+```
+Family "not exists(children)"
+```
+
+Leaving out the condition (`exists(children)` alone) just asks "does this
+family have any recorded child at all" -- `not` in front flips that to "no
+children recorded."
+
+### Goal: Find people who don't have any notes attached to their record
+
+```
+Person "not exists(notes)"
+```
+
+The same idea, starting from `Person` instead: `notes` reaches every note
+attached to a person's record, and `not exists(notes)` matches whenever
+there aren't any.
+
 ## Things this can't do (yet)
 
 - Anything beyond the patterns shown above -- this is a small, fixed set of

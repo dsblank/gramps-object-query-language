@@ -198,6 +198,53 @@ string literal on the left, never a field-vs-field form either
 (`other_field in field` is rejected, not interpreted as "does field
 contain other_field's value").
 
+## One-to-many relationships: `exists(...)`
+
+Every relationship in the table above is one-to-one -- a family has exactly
+*one* father, a person has exactly *one* birth event. Some relationships are
+naturally one-to-many instead -- a family has any number of children, a
+person can have any number of notes -- and those need a different construct:
+`exists(name, condition)`, a whitelisted function-call form (like
+`like(...)`), not an ordinary path:
+
+```python
+Family "exists(children, given_name == 'Steve')"
+Family "not exists(children, given_name == 'Steve')"
+Family "exists(children)"
+```
+
+`children`/`notes` are **collection** names -- registered separately from the
+relationship table above, and never usable as a dotted-path segment
+(`children.surname` would be ambiguous: which child?), only as `exists`'s
+first argument. Two are registered today:
+
+| On a...  | ...`name` | reaches | via |
+|----------|-----------|---------|-----|
+| `Family` | `children` -> `Person` | each entry's own record | `child_ref_list` |
+| `Person` | `notes` -> `Note` | each entry's own record | `note_list` |
+
+`condition` is a second, ordinary `where_expr` -- anything legal as a
+top-level expression is legal here too (`and`/`or`/`not`, chained
+relationships, even a nested `exists`) -- just evaluated against the
+collection's target type (`Person`, for `children`) instead of the outer one.
+It can be left out entirely (`exists(children)`), meaning "at least one
+related row at all," with no further condition on it.
+
+Under the hood, `exists(...)` compiles to a real `EXISTS (...)` subquery that
+iterates the JSON array (`json_each` on SQLite, `jsonb_array_elements`/
+`jsonb_array_elements_text` on PostgreSQL) joined against the target table by
+handle -- not a correlated *scalar* subquery the way every relationship above
+is, since there can be any number of matching rows, not just one.
+
+One consequence worth knowing: unlike an ordinary comparison, `exists(...)`
+never produces SQL's `UNKNOWN` -- a family with no children at all simply
+has zero matching rows in the subquery, the same as a family whose children
+don't happen to match `condition`, so `exists(...)` there is a definite
+`False` either way (never `None`/"missing"). That means `not exists(...)`
+is always plain negation, with none of the "a missing value under `not`
+stays excluded, not included" three-valued-logic subtlety described above
+for ordinary comparisons.
+
 ## Genealogy examples
 
 One example of each of the five registered relationship links, plus a few
@@ -258,6 +305,30 @@ Person "birth.place.title == death.place.title"
 
 ```python
 Family "father.death.place.title == mother.death.place.title"
+```
+
+**`exists(children, ...)`** -- a family with at least one child matching a
+condition, and its negation:
+
+```python
+Family "exists(children, given_name == 'Steve')"
+Family "not exists(children, given_name == 'Steve')"
+```
+
+**`exists(children)`** -- a family with any recorded child at all, condition
+omitted:
+
+```python
+Family "exists(children)"
+```
+
+**`exists(notes)`** -- starting from `Person` instead of `Family`, and over a
+flat handle list (`note_list`) rather than a list of ref objects
+(`child_ref_list`) -- the two collection shapes registered today, both
+spelled the same way from `where_expr`:
+
+```python
+Person "not exists(notes)"
 ```
 
 ## Constants

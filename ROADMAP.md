@@ -23,18 +23,23 @@ does today.
   (docs/where_expr.md)
 
 **Relationships**
-- Only five relationship links are registered at all: `Person` -> `birth`/
-  `death` (-> `Event`), `Family` -> `father`/`mother` (-> `Person`), `Event`
-  -> `place` (-> `Place`). Anything else -- a family's children, a person's
-  other (non-birth/death) events, notes, citations, sources, media, tags,
-  attributes -- has no relationship path at all, only whatever's reachable
-  as a JSON path within one record's own `json_data`.
-- Every relationship is **one-to-one** (a correlated subquery with
-  `LIMIT 1`). There's no way to ask a one-to-many question at all -- "a
-  family with *any* child born before 1900," "a person with *any* citation
-  below a confidence threshold" -- the compiler has no `EXISTS`/`ANY`
-  construct, only "the one related row reached via this fixed handle
-  reference."
+- Only five one-to-one relationship links are registered: `Person` ->
+  `birth`/`death` (-> `Event`), `Family` -> `father`/`mother` (-> `Person`),
+  `Event` -> `place` (-> `Place`). Anything else one-to-one -- a person's
+  other (non-birth/death) events, a citation's source, ... -- has no
+  relationship path at all yet, only whatever's reachable as a JSON path
+  within one record's own `json_data`.
+- Two one-to-many **collections** are registered, queryable via
+  `exists(name, condition)` (see `docs/where_expr.md`'s "One-to-many
+  relationships" section): `Family` -> `children` (-> `Person`, via
+  `child_ref_list`) and `Person` -> `notes` (-> `Note`, via `note_list`).
+  Everything else one-to-many -- a family's/person's other event refs,
+  citations, sources, media, tags, associations (`person_ref_list`) -- has
+  no collection registered yet; see "More relationships" under Possibilities
+  below. There's also no `count()`/`len()` over a collection yet (`exists`
+  only answers "at least one"), and no way for an `exists(...)` condition to
+  reference the *outer* row (e.g. "a child with the same surname as the
+  father") -- both flagged as follow-ups, not solved here.
 
 **Values and functions**
 - Only two whitelisted function-call forms exist: `like(field, 'pattern')`
@@ -122,6 +127,57 @@ changes. `not` binds tighter than `and`, which binds tighter than `or`,
 matching Python's own precedence (`ast.parse` resolves this before the
 translator ever sees the tree, same as it already did for `and`/`or`).
 
+### `exists(...)` -- one-to-many relationships (v1: `Family.children`, `Person.notes`)
+
+Implemented, scoped to exactly the two collections described in "Current
+limitations" above -- the recommended v1 from this section's earlier
+scoping pass (see git history), chosen to prove both `Collection` shapes a
+future registration might need:
+
+- **`children`** (`Family` -> `Person`, via `child_ref_list`) -- a list of
+  *ref objects*, each needing its `.ref` sub-key extracted for the handle.
+- **`notes`** (`Person` -> `Note`, via `note_list`) -- a list of *plain
+  handle strings*, no sub-key extraction needed.
+
+`exists(relationship[, condition])` is a new whitelisted call form in
+`query_lang.py` (alongside `like(...)`), producing a
+`{"exists": {"relationship": ..., "where": [...]}}` wire node -- `where`
+omitted entirely when `condition` is, meaning "at least one related row at
+all." `condition` is parsed as an ordinary `where_expr` against the
+collection's *target* type (reusing `_translate_top_level` recursively), so
+it can chain further relationships, use `and`/`or`/`not`, or even nest
+another `exists(...)`.
+
+`query.py` gained `Collection` (the registry entry: target type, JSON list
+path, and the optional ref sub-key) and `Exists` (the AST node), kept in a
+separate `_COLLECTIONS` registry from `_RELATIONSHIPS` on purpose -- a
+collection name is never valid as a dotted-path segment (`children.surname`
+would be ambiguous, which child?), only as `exists`'s first argument; a
+name collision between the two registries on the same table raises at
+import time. `Exists.compile()` renders a real `EXISTS (...)` subquery, not
+a correlated *scalar* one like `RelatedObject` -- it iterates the JSON array
+via `json_each` (SQLite) or `jsonb_array_elements`/`jsonb_array_elements_text`
+(PostgreSQL, the `_text` variant for a flat-handle list, since `->>` has no
+meaning against a bare jsonb scalar) joined against the target table by
+handle.
+
+`evaluator.py` mirrors this with a matching `Exists` branch in
+`_evaluate_tri`, walking the real in-memory list and fetching each related
+object through `db` (proxy-safe, same as every other relationship hop).
+**Simpler than every other branch there**: SQL's `EXISTS`/`NOT EXISTS` never
+produces `UNKNOWN` the way an ordinary comparison against a missing value
+does -- a row that fails the inner condition (or a family with zero
+children at all) just isn't counted, it doesn't propagate a `NULL` outward
+-- so `Exists` always resolves to a definite `True`/`False`, and `not
+exists(...)` needs no three-valued-logic special case at all, unlike `Not`
+wrapping an ordinary comparison.
+
+Verified via a SQL-vs-evaluator agreement test (same style as
+`evaluate_where`'s `Not`/missing-value regression guard), run against the
+fixture's real underlying Gramps SQLite backend rather than a hand-built
+mock table, since that's the one case where the same `json_data`/`handle`
+schema `query.py` targets already exists for free.
+
 ## Possibilities
 
 ### `len()` / array-length comparisons
@@ -202,12 +258,27 @@ edge cases written as tests *before* either dialect is wired up.
 Each maps to a limitation above; none has had the same close look as
 `len()` yet:
 
-- **More relationships** (children, non-birth/death events, notes,
-  citations, sources, media, tags) -- mechanically similar to the existing
-  five (a `_RELATIONSHIPS` registry entry each), *if* they stay one-to-one.
-  A family's children, or "any citation below confidence X," are one-to-many
-  and need real `EXISTS`-style semantics the correlated-subquery-with-`LIMIT
-  1` design doesn't have today -- a bigger, separate piece of work.
+- **More relationships**:
+  - One-to-one candidates (non-birth/death events, a citation's source, ...)
+    -- mechanically similar to the existing five, a `_RELATIONSHIPS` registry
+    entry each.
+  - One-to-many candidates beyond `children`/`notes` (event refs beyond
+    birth/death, citations, sources, media, tags, `person_ref_list`
+    associations) -- now that `exists(...)`/`Collection` exist (see Done
+    above), each of these is "one `_COLLECTIONS` registry entry," the same
+    low cost the one-to-one candidates already have -- no new machinery
+    needed, just registering more (ref-object-list vs. flat-handle-list, the
+    two shapes already proven).
+  - `any(...)` and `count(...)`/`len(...)` over a `Collection` -- `any` may
+    turn out to be redundant with `exists` (same semantics, a possible
+    alternate spelling for a condition embedded in the call rather than
+    passed as a second argument); `count`/`len` would reuse `_COLLECTIONS`
+    as-is, swapping `Exists`'s `EXISTS (...)` SQL shape for a scalar
+    `(SELECT COUNT(*) FROM ...)` operand instead -- neither designed yet.
+  - `exists(...)` condition referencing the *outer* row (e.g. "a child with
+    the same surname as the father") -- not supported; would need the
+    condition's column resolution to see two rows (target *and* outer) at
+    once, which nothing here does today.
 - **LIKE case-sensitivity parity across dialects** -- smallest fix here:
   render `ILIKE` on PostgreSQL for `like(...)`/substring-`in`, or apply a
   case-insensitive collation. Needs a test that actually runs both dialects

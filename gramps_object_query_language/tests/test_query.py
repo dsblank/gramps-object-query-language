@@ -25,13 +25,16 @@ from gramps_object_query_language.query import (
     EVENT,
     FAMILY,
     MEDIA,
+    NOTE,
     PERSON,
     PLACE,
     And,
+    Collection,
     ColumnIndex,
     Contains,
     Dialect,
     Eq,
+    Exists,
     Gt,
     Gte,
     In,
@@ -49,6 +52,7 @@ from gramps_object_query_language.query import (
     after_columns,
     compile_count_query,
     compile_query,
+    resolve_collection,
     resolve_column_path,
 )
 
@@ -1102,3 +1106,216 @@ def test_and_or_require_at_least_one_expr():
         And()
     with pytest.raises(QueryError):
         Or()
+
+
+# --- Collection / Exists (one-to-many membership) -----------------------------
+
+
+def test_resolve_collection_children_shape():
+    # A ref-object list (ChildRef.ref) -- the shape needing .ref extraction.
+    children = resolve_collection(FAMILY, "children")
+    assert isinstance(children, Collection)
+    assert children.name == "children"
+    assert children.target is PERSON
+    assert children.list_path == JsonPath(("child_ref_list",))
+    assert children.ref_field == "ref"
+
+
+def test_resolve_collection_notes_shape():
+    # A flat handle list -- no ref_field extraction needed.
+    notes = resolve_collection(PERSON, "notes")
+    assert notes.target is NOTE
+    assert notes.list_path == JsonPath(("note_list",))
+    assert notes.ref_field is None
+
+
+def test_resolve_collection_unknown_raises():
+    with pytest.raises(QueryError):
+        resolve_collection(PERSON, "children")  # only registered on FAMILY
+    with pytest.raises(QueryError):
+        resolve_collection(FAMILY, "bogus")
+
+
+def test_exists_requires_dialect():
+    children = resolve_collection(FAMILY, "children")
+    with pytest.raises(QueryError):
+        compile_query(FAMILY, Query(where=Exists(children)))
+
+
+def test_exists_sqlite_shape_with_condition():
+    children = resolve_collection(FAMILY, "children")
+    sql, params = compile_query(
+        FAMILY,
+        Query(select=["handle"], where=Exists(children, Eq("given_name", "Steve"))),
+        dialect=Dialect.SQLITE,
+    )
+    assert "EXISTS (SELECT 1 FROM person, json_each(family.json_data, ?) AS je" in sql
+    assert "person.handle = json_extract(je.value, '$.ref')" in sql
+    assert "given_name IS NOT DISTINCT FROM ?" in sql
+    assert params == ["$.child_ref_list", "Steve", 50]
+
+
+def test_exists_sqlite_shape_no_condition():
+    # exists(children) with no condition -- "at least one child at all".
+    children = resolve_collection(FAMILY, "children")
+    sql, params = compile_query(
+        FAMILY, Query(select=["handle"], where=Exists(children)), dialect=Dialect.SQLITE
+    )
+    assert "EXISTS (SELECT 1 FROM person, json_each(family.json_data, ?) AS je" in sql
+    assert "person.handle = json_extract(je.value, '$.ref'))" in sql
+    assert params == ["$.child_ref_list", 50]
+
+
+def test_exists_postgresql_shape_ref_object_list():
+    children = resolve_collection(FAMILY, "children")
+    sql, params = compile_query(
+        FAMILY,
+        Query(select=["handle"], where=Exists(children, Eq("given_name", "Steve"))),
+        dialect=Dialect.POSTGRESQL,
+    )
+    assert (
+        "jsonb_array_elements(family.json_data::jsonb -> 'child_ref_list') AS je(value)" in sql
+    )
+    assert "person.handle = je.value ->> 'ref'" in sql
+    assert params == ["Steve", 50]
+
+
+def test_exists_flat_handle_list_sqlite_shape():
+    # notes: je.value is already the handle -- no json_extract needed, unlike
+    # the ref-object shape above.
+    notes = resolve_collection(PERSON, "notes")
+    sql, params = compile_query(
+        PERSON, Query(select=["handle"], where=Exists(notes)), dialect=Dialect.SQLITE
+    )
+    assert "json_each(person.json_data, ?) AS je" in sql
+    assert "note.handle = je.value" in sql
+    assert "json_extract(je.value" not in sql
+    assert params == ["$.note_list", 50]
+
+
+def test_exists_flat_handle_list_postgresql_shape():
+    notes = resolve_collection(PERSON, "notes")
+    sql, params = compile_query(
+        PERSON, Query(select=["handle"], where=Exists(notes)), dialect=Dialect.POSTGRESQL
+    )
+    assert (
+        "jsonb_array_elements_text(person.json_data::jsonb -> 'note_list') AS je(value)" in sql
+    )
+    assert "note.handle = je.value" in sql
+    assert params == [50]
+
+
+def test_exists_treeid_scoping():
+    children = resolve_collection(FAMILY, "children")
+    sql, params = compile_query(
+        FAMILY,
+        Query(select=["handle"], where=Exists(children, Eq("given_name", "Steve"))),
+        dialect=Dialect.SQLITE,
+        treeid=7,
+    )
+    assert "person.treeid = ?" in sql
+    # the EXISTS subquery's own treeid clause, plus the outer query's own.
+    assert sql.count("treeid = ?") == 2
+    assert params == ["$.child_ref_list", "Steve", 7, 7, 50]
+
+
+def test_not_exists_compiles():
+    children = resolve_collection(FAMILY, "children")
+    sql, params = compile_query(
+        FAMILY, Query(select=["handle"], where=Not(Exists(children))), dialect=Dialect.SQLITE
+    )
+    assert "NOT (EXISTS" in sql
+
+
+def test_exists_composes_with_and():
+    children = resolve_collection(FAMILY, "children")
+    sql, params = compile_query(
+        FAMILY,
+        Query(
+            select=["handle"],
+            where=And(Exists(children, Eq("given_name", "Steve")), Eq("gramps_id", "F001")),
+        ),
+        dialect=Dialect.SQLITE,
+    )
+    assert "EXISTS" in sql
+    assert "AND" in sql
+
+
+def test_exists_end_to_end_sqlite_execution_ref_object_list():
+    import json
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE family (handle TEXT, json_data TEXT)")
+    conn.execute("CREATE TABLE person (handle TEXT, given_name TEXT)")
+    conn.execute("INSERT INTO person VALUES ('steve', 'Steve')")
+    conn.execute("INSERT INTO person VALUES ('bob', 'Bob')")
+    conn.execute(
+        "INSERT INTO family VALUES ('fam-with-steve', ?)",
+        (json.dumps({"child_ref_list": [{"ref": "steve"}]}),),
+    )
+    conn.execute(
+        "INSERT INTO family VALUES ('fam-without-steve', ?)",
+        (json.dumps({"child_ref_list": [{"ref": "bob"}]}),),
+    )
+    conn.execute(
+        "INSERT INTO family VALUES ('fam-no-children', ?)",
+        (json.dumps({"child_ref_list": []}),),
+    )
+
+    children = resolve_collection(FAMILY, "children")
+    sql, params = compile_query(
+        FAMILY,
+        Query(select=["handle"], where=Exists(children, Eq("given_name", "Steve"))),
+        dialect=Dialect.SQLITE,
+    )
+    rows = conn.execute(sql, params).fetchall()
+    assert rows == [("fam-with-steve",)]
+
+
+def test_exists_no_condition_end_to_end_sqlite_execution():
+    import json
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE family (handle TEXT, json_data TEXT)")
+    conn.execute("CREATE TABLE person (handle TEXT)")
+    conn.execute("INSERT INTO person VALUES ('kid1')")
+    conn.execute(
+        "INSERT INTO family VALUES ('has-child', ?)",
+        (json.dumps({"child_ref_list": [{"ref": "kid1"}]}),),
+    )
+    conn.execute(
+        "INSERT INTO family VALUES ('no-children', ?)", (json.dumps({"child_ref_list": []}),)
+    )
+
+    children = resolve_collection(FAMILY, "children")
+    sql, params = compile_query(
+        FAMILY, Query(select=["handle"], where=Exists(children)), dialect=Dialect.SQLITE
+    )
+    assert conn.execute(sql, params).fetchall() == [("has-child",)]
+
+    sql, params = compile_query(
+        FAMILY, Query(select=["handle"], where=Not(Exists(children))), dialect=Dialect.SQLITE
+    )
+    assert conn.execute(sql, params).fetchall() == [("no-children",)]
+
+
+def test_exists_flat_handle_list_end_to_end_sqlite_execution():
+    import json
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE person (handle TEXT, json_data TEXT)")
+    conn.execute("CREATE TABLE note (handle TEXT, format INTEGER)")
+    conn.execute("INSERT INTO note VALUES ('note1', 0)")
+    conn.execute(
+        "INSERT INTO person VALUES ('has-note', ?)", (json.dumps({"note_list": ["note1"]}),)
+    )
+    conn.execute("INSERT INTO person VALUES ('no-note', ?)", (json.dumps({"note_list": []}),))
+
+    notes = resolve_collection(PERSON, "notes")
+    sql, params = compile_query(
+        PERSON, Query(select=["handle"], where=Exists(notes)), dialect=Dialect.SQLITE
+    )
+    assert conn.execute(sql, params).fetchall() == [("has-note",)]
