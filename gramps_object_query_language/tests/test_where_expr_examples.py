@@ -356,3 +356,33 @@ def test_citation_confidence_constant():
 
     result = run(conn, "Citation", "confidence >= Citation.CONF_HIGH")
     assert result == [("c1",)]
+
+
+# --- indexing into a JSON list (multiple surnames) ---------------------------
+
+
+def test_multiple_surnames():
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE person (handle TEXT, given_name TEXT, json_data TEXT)"
+    )
+
+    def person(handle, given_name, surnames):
+        conn.execute(
+            "INSERT INTO person VALUES (?, ?, ?)",
+            (
+                handle,
+                given_name,
+                json.dumps(
+                    {"primary_name": {"surname_list": [{"surname": s} for s in surnames]}}
+                ),
+            ),
+        )
+
+    # Maria has both her maiden name and her married name recorded; John has
+    # just the one surname -- surname_list[1] only exists for Maria.
+    person("maria1", "Maria", ["Garcia", "Lopez"])
+    person("john1", "John", ["Smith"])
+
+    result = run(conn, "Person", "primary_name.surname_list[1].surname != None")
+    assert result == [("maria1",)]

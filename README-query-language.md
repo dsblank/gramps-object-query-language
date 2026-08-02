@@ -221,6 +221,19 @@ Citation "confidence >= Citation.CONF_HIGH"
 (from lowest to highest: `CONF_VERY_LOW`, `CONF_LOW`, `CONF_NORMAL`,
 `CONF_HIGH`, `CONF_VERY_HIGH`).
 
+### Goal: Find people who have more than one last name recorded
+
+```
+Person "primary_name.surname_list[1].surname != None"
+```
+
+Gramps lets a person have several last names at once (a maiden name and a
+married name, say) -- `surname_list[0]` is always the first one, and this
+checks whether a *second* one (`[1]`) exists at all. There's no direct way
+to ask "how many last names does this person have," but checking whether a
+particular position in the list is filled in works just as well for "two or
+more."
+
 ## Things this can't do (yet)
 
 - **"or"** -- there's no way today to say "match this condition *or* that
