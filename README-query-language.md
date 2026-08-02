@@ -33,6 +33,7 @@ A few symbols you'll see over and over:
 | `>`, `>=` | is greater than / is greater than or equal to (later, bigger) |
 | `and`  | both things must be true |
 | `or`  | at least one of the two things must be true |
+| `not`  | flips true/false -- matches when the thing *isn't* true |
 | `in [ ... ]` | matches any one of a list of values |
 | `'text' in field` | matches if `field` contains `'text'` anywhere in it |
 | `like(field, 'pattern')` | matches a text pattern, where `%` stands for "anything" |
@@ -99,6 +100,22 @@ Without the parentheses, `gender == Person.MALE and surname == 'Smith' or
 given_name == 'Mary'` still reads the *same* way -- `and` grouping happens
 first regardless -- but writing the parentheses out makes the intent clear
 to a future reader (including yourself).
+
+### Goal: Find everyone whose last name *isn't* Smith
+
+```
+Person "not (surname == 'Smith')"
+```
+
+`not` flips a condition -- it matches whenever the thing inside it *isn't*
+true. It works on a single condition, or a whole parenthesized group:
+
+```
+Person "not (gender == Person.MALE and surname == 'Smith')"
+```
+
+That finds everyone who *isn't* a male Smith -- women, and Smiths of any
+other gender, and everyone whose last name isn't Smith at all.
 
 ### Goal: Find everyone whose first name starts with "J"
 
@@ -264,7 +281,6 @@ more."
 
 ## Things this can't do (yet)
 
-- **"not"** -- there's no way to negate a whole condition.
 - Anything beyond the patterns shown above -- this is a small, fixed set of
   building blocks, not a full programming language, so anything outside it
   is rejected with an error rather than guessed at.

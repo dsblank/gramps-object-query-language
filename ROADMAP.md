@@ -10,9 +10,8 @@ does today.
 ## Current limitations
 
 **Boolean structure**
-- No `not` -- a whole condition can't be negated. (README-query-language.md,
-  docs/where_expr.md) `and`/`or` are both supported, and can be mixed and
-  nested (`(a and b) or c`), following Python's own precedence.
+- `and`/`or`/`not` are all supported, and can be mixed and nested
+  (`not (a and b) or c`), following Python's own precedence and grouping.
 - No chained comparisons (`1 < gender < 3`) -- write `gender > 1 and gender < 3`
   instead. (docs/where_expr.md)
 - No `is`, `is not`, `not in`. (docs/where_expr.md)
@@ -111,6 +110,18 @@ dedicated test that runs the same `where` AST through the real SQLite
 compiler and through `evaluate_where` against equivalent data and asserts
 they agree -- the regression guard for this exact class of bug.
 
+### `not`
+
+Implemented, once the `Not`/missing-value divergence above was fixed --
+`query.py`'s `Not` class and `evaluator.py`'s `Not` branch already existed,
+fully working and tested; the only remaining work was `query_lang.py`'s
+parser, mirroring `or`'s addition almost exactly: `_translate_bool_or_leaf`
+gained a case for `ast.UnaryOp`/`ast.Not` producing a `{"not": node}` wire
+node, and `_node_from_json` a matching `Not(...)` case. No SQL or dialect
+changes. `not` binds tighter than `and`, which binds tighter than `or`,
+matching Python's own precedence (`ast.parse` resolves this before the
+translator ever sees the tree, same as it already did for `and`/`or`).
+
 ## Possibilities
 
 ### `len()` / array-length comparisons
@@ -185,24 +196,6 @@ obviously-correct default:**
 side only; missing path treated as `0` (matches user intuition -- "no list
 recorded" reads as "zero", not "unknown"); non-array-value and NULL-vs-zero
 edge cases written as tests *before* either dialect is wired up.
-
-### `not`
-
-The remaining boolean-structure gap now that `or` is done (see "Done"
-below). `query.py`'s `Not` class and `evaluator.py`'s `Not` branch already
-exist and are already tested -- the remaining work is in `query_lang.py`,
-teaching `_translate_bool_or_leaf` to also recognize `ast.UnaryOp` with
-`ast.Not` and produce a `{"not": node}` wire shape, plus a matching case in
-`_node_from_json`. No new SQL, no dialect work.
-
-A NULL-semantics prerequisite that *did* exist here has already been fixed
-(see "Done" below, `_evaluate_tri`): `evaluate_where` used to collapse a
-missing value to a definite `False` at each leaf, so `Not` wrapping one
-flipped it to `True` where SQL's `NOT UNKNOWN` (still `UNKNOWN`, not `True`)
-would exclude the row -- a real, verified divergence between the SQL and
-evaluator execution paths, latent in already-shipped code, not something
-`not` support itself would have introduced. With that fixed, adding `not`
-to the parser is now just the mechanical piece above.
 
 ### Other gaps (not yet scoped to this level of detail)
 

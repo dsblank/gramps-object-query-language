@@ -228,6 +228,48 @@ def test_and_binds_tighter_than_or_end_to_end(db):
     assert result == [("dad1",), ("granddad1",), ("grandma1",), ("kid1",)]
 
 
+# --- negation (not) ------------------------------------------------------------
+
+
+def test_not_operator(db):
+    # Everyone except the Smiths -- Mary Doyle (grandma1) and Alice Jones
+    # (other1).
+    result = run(db, "Person", "not (surname == 'Smith')")
+    assert result == [("grandma1",), ("other1",)]
+
+
+def test_not_wraps_and_readme_example(db):
+    # README-query-language.md's cookbook example: everyone who *isn't* a
+    # male Smith -- excludes dad1, granddad1, and kid1 (the male Smiths),
+    # keeps mom1 (a female Smith), grandma1 (not a Smith), and other1 (not
+    # a Smith).
+    result = run(
+        db, "Person", "not (gender == Person.MALE and surname == 'Smith')"
+    )
+    assert result == [("grandma1",), ("mom1",), ("other1",)]
+
+
+def test_not_and_or_combined(db):
+    # "not male, or a Doyle" -- excludes every male Smith/grandfather,
+    # keeps every woman plus anyone (of any gender) named Doyle. Matches:
+    # mom1 (Jane, female), grandma1 (Mary, female and a Doyle), other1
+    # (Alice, female).
+    result = run(db, "Person", "not (gender == Person.MALE) or surname == 'Doyle'")
+    assert result == [("grandma1",), ("mom1",), ("other1",)]
+
+
+def test_not_of_ordering_comparison_excludes_missing_value_too(db):
+    # kid1 has no recorded death (still living) -- both "died before 2100"
+    # and its negation must leave kid1 out, the same way SQL's three-valued
+    # logic treats a missing value as UNKNOWN under NOT, not as a match by
+    # default. (See evaluate_where's matching behavior in test_evaluator.py
+    # -- this is the SQL side of the same guarantee.)
+    positive = run(db, "Person", "death.date.sortval < Date('Jan 1, 2100')")
+    negated = run(db, "Person", "not (death.date.sortval < Date('Jan 1, 2100'))")
+    assert ("kid1",) not in positive
+    assert ("kid1",) not in negated
+
+
 # --- relationship traversal (Person -> Event) --------------------------------
 
 

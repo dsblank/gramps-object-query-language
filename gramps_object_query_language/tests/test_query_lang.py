@@ -36,6 +36,7 @@ from gramps_object_query_language.query import (
     Gte,
     JsonPath,
     Lt,
+    Not,
     Or,
     RelatedObject,
 )
@@ -317,12 +318,69 @@ def test_or_wraps_like_and_contains():
     ]
 
 
+# --- negation (not) -----------------------------------------------------------
+
+
+def test_not_produces_not_node():
+    result = parse_expr("person", "not (gender == 1)")
+    assert result == [{"not": {"column": "gender", "op": "eq", "value": 1}}]
+
+
+def test_not_binds_without_parens_same_as_with():
+    # "not" is a unary operator applying to the single comparison right
+    # after it, same as real Python -- the parens above are optional.
+    assert parse_expr("person", "not gender == 1") == parse_expr(
+        "person", "not (gender == 1)"
+    )
+
+
+def test_not_binds_tighter_than_and():
+    # "not a and b" is "(not a) and b", not "not (a and b)" -- "not" binds
+    # tighter than "and", same as real Python.
+    result = parse_expr("person", "not gender == 1 and surname == 'Smith'")
+    assert result == [
+        {"not": {"column": "gender", "op": "eq", "value": 1}},
+        {"column": "surname", "op": "eq", "value": "Smith"},
+    ]
+
+
+def test_not_wraps_parenthesized_and():
+    result = parse_expr("person", "not (gender == 1 and surname == 'Smith')")
+    assert result == [
+        {
+            "not": {
+                "and": [
+                    {"column": "gender", "op": "eq", "value": 1},
+                    {"column": "surname", "op": "eq", "value": "Smith"},
+                ]
+            }
+        }
+    ]
+
+
+def test_not_composes_with_or():
+    result = parse_expr("person", "not gender == 1 or surname == 'Smith'")
+    assert result == [
+        {
+            "or": [
+                {"not": {"column": "gender", "op": "eq", "value": 1}},
+                {"column": "surname", "op": "eq", "value": "Smith"},
+            ]
+        }
+    ]
+
+
+def test_double_negation():
+    result = parse_expr("person", "not not gender == 1")
+    assert result == [{"not": {"not": {"column": "gender", "op": "eq", "value": 1}}}]
+
+
+def test_not_wraps_like_and_contains():
+    result = parse_expr("person", "not like(given_name, 'J%')")
+    assert result == [{"not": {"column": "given_name", "op": "like", "value": "J%"}}]
+
+
 # --- explicitly rejected: things with no wire-format equivalent yet -------------
-
-
-def test_not_rejected():
-    with pytest.raises(QueryLangError):
-        parse_expr("person", "not (gender == 1)")
 
 
 def test_not_in_rejected():
@@ -765,6 +823,22 @@ def test_compile_expr_mixed_and_or_nests_correctly():
     assert where.exprs[1] == Eq("surname", "Smith")
     assert isinstance(where.exprs[0], Or)
     assert where.exprs[0].exprs == (Eq("gender", 1), Eq("gender", 2))
+
+
+def test_compile_expr_not_becomes_not():
+    # Not (query.py) doesn't define __eq__, so compare its wrapped .expr
+    # directly, the same way test_compile_expr_or_becomes_or compares
+    # Or's .exprs rather than the combinator object itself.
+    _, where = compile_expr("person", "not (surname == 'Smith')")
+    assert isinstance(where, Not)
+    assert where.expr == Eq("surname", "Smith")
+
+
+def test_compile_expr_not_wraps_and():
+    _, where = compile_expr("person", "not (gender == 1 and surname == 'Smith')")
+    assert isinstance(where, Not)
+    assert isinstance(where.expr, And)
+    assert where.expr.exprs == (Eq("gender", 1), Eq("surname", "Smith"))
 
 
 def test_compile_expr_end_to_end_sqlite_execution():
