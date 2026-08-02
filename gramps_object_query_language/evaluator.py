@@ -1,5 +1,5 @@
 #
-# Gramps Web API - A RESTful API for the Gramps genealogy program
+# gramps-object-query-language - Object query language and SQL compiler for Gramps data
 #
 # Copyright (C) 2026      Douglas Blank
 #
