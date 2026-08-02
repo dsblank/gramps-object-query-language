@@ -383,17 +383,104 @@ def test_not_wraps_like_and_contains():
     assert result == [{"not": {"column": "given_name", "op": "like", "value": "J%"}}]
 
 
+# --- is / is not / not in: pure sugar over already-Done eq/ne/in/not -----------
+
+
+def test_is_same_as_eq():
+    assert parse_expr("person", "gender is None") == parse_expr("person", "gender == None")
+    assert parse_expr("person", "gender is Person.MALE") == parse_expr(
+        "person", "gender == Person.MALE"
+    )
+
+
+def test_is_not_same_as_ne():
+    assert parse_expr("person", "gender is not None") == parse_expr(
+        "person", "gender != None"
+    )
+
+
+def test_not_in_wraps_in_with_not():
+    result = parse_expr("person", "gender not in [1, 2]")
+    assert result == [{"not": {"column": "gender", "op": "in", "value": [1, 2]}}]
+    assert result == parse_expr("person", "not (gender in [1, 2])")
+
+
+def test_not_in_wraps_contains_with_not():
+    result = parse_expr("person", "'Jan' not in given_name")
+    assert result == [{"not": {"column": "given_name", "op": "contains", "value": "Jan"}}]
+    assert result == parse_expr("person", "not ('Jan' in given_name)")
+
+
+def test_not_in_still_rejects_non_list_non_path_rhs():
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "gender not in (1, 2)")  # tuple, not list
+
+
+def test_is_composes_with_not_and_and():
+    result = parse_expr("person", "not (gender is None) and surname == 'Smith'")
+    assert result == [
+        {"not": {"column": "gender", "op": "eq", "value": None}},
+        {"column": "surname", "op": "eq", "value": "Smith"},
+    ]
+
+
+# --- operand ordering: a literal/value may sit on either side ------------------
+
+
+def test_value_on_left_flips_operator():
+    assert parse_expr("person", "5 < gender") == [{"column": "gender", "op": "gt", "value": 5}]
+    assert parse_expr("person", "5 <= gender") == [
+        {"column": "gender", "op": "gte", "value": 5}
+    ]
+    assert parse_expr("person", "5 > gender") == [{"column": "gender", "op": "lt", "value": 5}]
+    assert parse_expr("person", "5 >= gender") == [
+        {"column": "gender", "op": "lte", "value": 5}
+    ]
+
+
+def test_value_on_left_eq_ne_stay_symmetric():
+    assert parse_expr("person", "5 == gender") == parse_expr("person", "gender == 5")
+    assert parse_expr("person", "5 != gender") == parse_expr("person", "gender != 5")
+
+
+def test_value_on_left_with_date_call():
+    result = parse_expr("person", "Date('Jan 1, 1968') < mother.birth.sortval")
+    assert result == [
+        {
+            "column": {"json_path": ["mother", "birth", "sortval"]},
+            "op": "gt",
+            "value": 2439857,
+        }
+    ]
+    assert result == parse_expr("person", "mother.birth.sortval > Date('Jan 1, 1968')")
+
+
+def test_value_on_left_with_reversed_constant():
+    assert parse_expr("person", "Person.MALE == gender") == parse_expr(
+        "person", "gender == Person.MALE"
+    )
+
+
+def test_value_vs_value_rejected():
+    # Neither side references a field at all -- nothing to filter on.
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "5 < 3")
+
+
+def test_count_still_left_hand_side_only_after_operand_ordering():
+    # count(...)'s v1 scope (left-hand-side only, against a literal) is
+    # deliberately untouched by operand-order support -- "value < count(...)"
+    # doesn't flip into a supported shape, it's still rejected.
+    with pytest.raises(QueryLangError):
+        parse_expr("family", "2 < count(children)")
+
+
+def test_count_vs_field_still_rejected_either_order():
+    with pytest.raises(QueryLangError):
+        parse_expr("family", "count(children) > mother.surname")
+
+
 # --- explicitly rejected: things with no wire-format equivalent yet -------------
-
-
-def test_not_in_rejected():
-    with pytest.raises(QueryLangError):
-        parse_expr("person", "gender not in [1, 2]")
-
-
-def test_is_rejected():
-    with pytest.raises(QueryLangError):
-        parse_expr("person", "gender is None")
 
 
 def test_chained_comparison_rejected():

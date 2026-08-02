@@ -13,8 +13,10 @@ does today.
 - `and`/`or`/`not` are all supported, and can be mixed and nested
   (`not (a and b) or c`), following Python's own precedence and grouping.
 - No chained comparisons (`1 < gender < 3`) -- write `gender > 1 and gender < 3`
-  instead. (docs/where_expr.md)
-- No `is`, `is not`, `not in`. (docs/where_expr.md)
+  instead. (docs/where_expr.md) Splits into two separably-difficulty pieces,
+  not one -- see
+  [Chained comparisons / operand ordering](#chained-comparisons--operand-ordering)
+  below.
 
 **`in` / substring**
 - `'text' in field` (the substring-test shape) requires a string *literal* on
@@ -47,12 +49,19 @@ does today.
 - Only two whitelisted function-call forms exist: `like(field, 'pattern')`
   and `Date('...')`. No arithmetic, string functions (`upper()`, `lower()`,
   concatenation), or general function calls.
-- `ClassName.CONST` constants are wired for exactly three classes today
-  (`Person.{MALE,FEMALE,UNKNOWN,OTHER}`, `Citation.CONF_*`,
-  `Note.{FLOWED,FORMATTED}`) -- the much larger `GrampsType` constant space
-  (`EventType.BIRTH`, `FamilyRelType.MARRIED`, `NameType.*`, ...) isn't
-  wired up, and those types additionally support arbitrary user-defined
-  custom values with no fixed constant to name anyway. (query_lang.py)
+- `ClassName.CONST` constants: **this bullet was stale** -- found and
+  corrected while adding `is`/`is not`/`not in` below. `_CONSTANT_CLASSES`
+  (query_lang.py) already covers the full `GrampsType` constant space
+  (`EventType`, `FamilyRelType`, `NameType`, `PlaceType`, `AttributeType`,
+  `ChildRefType`, `EventRoleType`, `MarkerType`, `NameOriginType`,
+  `NoteType`, `RepositoryType`, `SourceMediaType`, `SrcAttributeType`,
+  `StyledTextTagType`, `UrlType` -- 15 classes total, plus `Person`/
+  `Citation`/`Note`/`Date`), not just the three this bullet used to claim.
+  Verified directly: `event.type.value == EventType.BIRTH` and
+  `family.rel_type.value == FamilyRelType.MARRIED` both parse and compile
+  today. What's still true: those `GrampsType` classes additionally
+  support arbitrary user-defined custom values with no fixed constant to
+  name, which no amount of registry-wiring fixes.
 - `count(...)` answers "how many" for a registered `Collection`
   (`count(children) > 2`, see Done below) -- there's still no `len()` for a
   plain intra-record JSON array not backed by a `Collection`
@@ -265,7 +274,113 @@ reference) needed only a cosmetic SQL-shape-assertion update, not a
 behavior fix -- their target and outer tables were never the same to begin
 with.
 
+### `is` / `is not` / `not in`
+
+Implemented -- item C from the [difficulty survey](#rough-difficulty-survey-of-unsupported-where_expr-shapes)
+below, done first since (once checked directly rather than assumed) it
+turned out to already be ~90% built by composition of pieces that were
+each Done independently: `not (x in y)`, `x == None`, and
+`not (x == None)` all already parsed and compiled correctly *before* this
+change, since `not`/`==`/`in` were all Done and their three-valued-logic
+composition (`Not` over a comparison against a possibly-missing value) was
+already fixed (see `evaluate_where`'s `Not`/missing-value divergence,
+above). `gender is None` and `gender not in [...]` failed only at the very
+first gate (`op_type not in _COMPARE_OPS`, `query_lang.py`), before any
+real logic ran.
+
+`is`/`is not` needed no new wire shape at all -- added directly to
+`_COMPARE_OPS` as `ast.Is: "eq"`/`ast.IsNot: "ne"`, since this language has
+no notion of object identity distinct from value equality (`gender is
+Person.MALE` and `gender == Person.MALE` compile identically). Every
+existing `"eq"`/`"ne"` code path -- field-vs-field, `count(...)`'s
+left-hand-side rejection, both SQL dialects, the evaluator -- handles them
+with zero new branches.
+
+`not in` reuses `in`'s own translation (both shapes: list-membership and
+the substring test) verbatim, then wraps the result in `{"not": ...}` --
+`_translate_compare` (query_lang.py) now computes a `negate` flag from
+`op_type is ast.NotIn` up front, looks up `_COMPARE_OPS[ast.In]` in that
+case, and wraps the leaf it would have returned in `{"not": leaf}` at the
+very end instead of returning early. No `query.py`/`evaluator.py` changes
+needed -- `"not"` wrapping was already fully generic (`_node_from_json`'s
+`"not"` case predates this).
+
+Confirmed the compiled output is byte-identical to what a user could
+already write by hand: `parse_expr("person", "gender not in [1, 2]") ==
+parse_expr("person", "not (gender in [1, 2])")`, and the same for the
+substring form and for `is`/`==`. See `test_query_lang.py`'s "is / is not /
+not in" section.
+
+### Operand ordering (`value OP field`)
+
+Implemented -- item B from the difficulty survey, "piece 2" of the
+[Chained comparisons / operand ordering](#chained-comparisons--operand-ordering)
+possibility below (piece 1, the actual chain rewrite, is still open --
+see that section, now trimmed down to just piece 1).
+
+`_translate_compare` (query_lang.py) no longer assumes `node.left` is
+always the column -- it classifies both sides via `_is_path_node`/a new
+`_is_count_call` helper before deciding how to translate them. Four
+combinations now exist, only one of which is new code:
+- column vs value, column vs column (field-vs-field) -- unchanged, exactly
+  as before.
+- **value vs column** (`Date('Jan 1, 1968') < mother.birth.sortval`) -- the
+  new case. The literal is translated via the ordinary `_translate_value`,
+  the field via `_translate_column`, and the operator flips through a new
+  `_FLIP_OP` table (`lt`<->`gt`, `lte`<->`gte`, `eq`/`ne` unchanged) so the
+  wire shape still renders with the column first
+  (`{"column": ..., "op": ..., "value": ...}`) -- the one shape
+  `query.py`/`evaluator.py` already know how to read. No changes needed in
+  either.
+- **value vs value** (`5 < 3`) -- rejected outright with a clear error
+  ("a comparison must have a field path on at least one side"), since
+  it references no field to filter on at all.
+
+`count(...)`'s existing left-hand-side-only v1 scope was deliberately left
+alone, not widened by this change: `_is_count_call` is checked only when
+classifying the *left* operand, so `2 < count(children)` still doesn't
+compile (rejected with the same "must have a field path" error, since a
+bare Call on the right isn't recognized as a path either) -- symmetric with
+`count(...)` never having been recognized on the right before this change.
+`count(...)` vs another field (`count(children) > mother.surname`) is
+still rejected too, regardless of which side each ends up on.
+
+Verified two ways: parser-level equivalence (`parse_expr("5 < gender") ==
+parse_expr("gender > 5")`, and the same for `Date(...)`/reversed
+constants), and real end-to-end SQLite execution
+(`test_where_expr_examples.py`'s `test_operand_order_value_on_left`/
+`test_operand_order_reversed_constant`) confirming the flipped form
+returns the identical result set as writing it the usual way, not just an
+identical wire shape.
+
 ## Possibilities
+
+### Chained comparisons / operand ordering
+
+Two separable pieces originally hid behind the single "no chained
+comparisons" bullet in Current limitations above -- confirmed empirically
+(not just reasoned about) before splitting them apart, since it wasn't
+obvious at first that `5 < gender` (no chaining involved at all) already
+failed for an unrelated reason. **Piece 2 (operand order) has since
+shipped** -- see [Operand ordering](#operand-ordering-value-op-field) under
+Done above. What's left here is piece 1 alone.
+
+**The chain itself**, e.g. `gender > 1 and gender < 3` written as
+`1 < gender < 3` instead. `ast.Compare` collapses `a < b < c` into a single
+node with `ops=[Lt, Lt]`/`comparators=[b, c]`; `_translate_compare`
+(query_lang.py) rejects anything but exactly one op/comparator today
+(`len(node.ops) != 1`). Fix is a straightforward rewrite into an `And` of
+the pairwise legs before falling through to the existing single-comparison
+path.
+
+**Difficulty: 1.** Now genuinely just difficulty 1 with no asterisk --
+operand ordering (the thing that would have complicated a chain with a
+literal on the left of its first leg, e.g.
+`Date('Jan 1, 1968') < mother.birth.sortval < Date('Jan 30, 1968')`) is
+already handled per-leg now that operand ordering shipped, so the chain
+rewrite doesn't need to special-case which side of each leg the literal
+landed on -- each pairwise leg, however it's shaped, already compiles
+correctly on its own.
 
 ### `len()` / array-length comparisons
 
@@ -465,3 +580,125 @@ rendering on top, the one piece neither `count()` nor `len()` needs.
   would need to accept a `JsonPath`/`RelatedObject` the way `where` already
   does, plus decide how keyset comparison and `COLLATE` selection behave
   for a column whose type isn't known until runtime.
+
+### Rough difficulty survey of unsupported `where_expr` shapes
+
+A quick-reference table (informal 1-5 scale, 1 = easy, 5 = hard) gathering
+gaps described elsewhere in this document into one place for planning
+purposes. Only `len()` and `any()` have difficulty ratings arrived at
+through actual layer-by-layer scoping (see their sections above); the rest
+are estimates by analogy to those two and to `count()`'s actual
+implementation cost, not independently measured the same way. (LIKE
+case-sensitivity parity is deliberately not in this table -- it's a
+database/collation concern, not a `where_expr` language gap.)
+
+Each row is lettered so the dependency analysis right below it can refer
+back to individual items. Letters are kept stable as items get implemented
+(rather than renumbered) so old discussion of e.g. "B depends on..." stays
+correct -- **B and C have shipped** (see Done above) and are kept here,
+struck through, so that history stays legible.
+
+| # | Example | Gap | Difficulty |
+|---|---|---|---|
+| A | `1 < gender < 3` (chained, literal on the right of each leg) | no chained comparisons | 1 |
+| ~~B~~ | ~~`Date(...) < mother.birth.sortval` (literal on the left)~~ | **Done** -- see [Operand ordering](#operand-ordering-value-op-field) above | ~~2~~ |
+| ~~C~~ | ~~`gender is None`, `mother is not None`, `tag not in tags`~~ | **Done** -- see `is` / `is not` / `not in` above | ~~1~~ |
+| D | `other_field in field` | substring `in` requires a string literal on the left | 2 |
+| E | a person's non-birth/death event, one-to-one | only 6 `_RELATIONSHIPS` entries registered | 1 |
+| F | `event.type == EventType.MARRIAGE` (or `FamilyRelType.*`, `NameType.*`, ...) | ~~only `Person`/`Citation`/`Note` constants wired~~ -- **stale, already Done**: `_CONSTANT_CLASSES` (query_lang.py) already covers `EventType`/`FamilyRelType`/`NameType`/`PlaceType`/and 10 more `GrampsType` classes, verified directly against a live parse (`event.type.value == EventType.BIRTH` compiles today). This row's original premise no longer holds; kept only as a note to fix the "Values and functions" bullet in Current limitations, not as an open item. | n/a |
+| G | `len(primary_name.surname_list) > 1` | see `len()` section above | 3 |
+| H | `upper(surname) == 'SMITH'`, string concatenation, arithmetic | no general function calls -- only `like()`/`Date()` are whitelisted | 3-4 |
+| I | `any(primary_name.surname_list, surname == 'Doyle')` | see `any()` section above | 5 |
+| J | `exists(children, surname == father.surname)` | `exists`/`count` conditions can't see the outer row | 4 |
+| K | `order_by=primary_name.surname_list[0].surname` | `order_by`/keyset pagination only works on flat SQL columns | 3 |
+
+Difficulty here means "distance from today's code," not "priority" -- a low
+number isn't necessarily higher-value, just cheaper to build.
+
+**C shipped at difficulty 1**, one step down from the original difficulty-2
+estimate -- confirmed before implementing (not just reasoned about) that
+`not (gender in [1, 2])`, `not ('Jan' in given_name)`, and
+`not (gender == None)` all already parsed and compiled correctly *before*
+this change, since `not`/`==`/`in` were all Done and their
+three-valued-logic composition was already fixed (see Done above).
+`gender is None` and `gender not in [...]` failed only at the very first
+gate (`op_type not in _COMPARE_OPS`) before any real logic ran -- so the
+fix really was just wiring three more `ast` op types into that dispatch
+table and reusing the existing `in`/`Not` branches verbatim, no new
+machinery. See `is` / `is not` / `not in` under Done above for the actual
+diff.
+
+**B shipped at its original difficulty-2 estimate** -- see
+[Operand ordering](#operand-ordering-value-op-field) under Done above for
+the actual diff (a new `_is_count_call` helper, a `_FLIP_OP` table, and
+`_translate_compare`'s classification generalized to both sides). Verified
+both at the parser level and end-to-end against real SQLite execution, not
+just wire-shape equivalence.
+
+### Dependencies between the items above
+
+Checked directly against `_translate_compare`'s actual branches rather than
+assumed -- most items are independent, but a few share code paths or make
+each other cheaper:
+
+- **C had no dependency on anything else here** (now moot, since it
+  shipped) -- it was already ~90% built by composition of already-Done
+  pieces (see the note above), so it didn't block, and wasn't blocked by,
+  A/B/D.
+- **D still benefits from B, now that B has shipped.** D's bug
+  (`_translate_value(node.left)` assumes the left side of `in` is always a
+  literal) is the identical *shape* of bug B just fixed for `<`/`>`/etc. --
+  both are "one operand's role is hardcoded by position instead of
+  classified." B's fix didn't introduce a single shared "classify this
+  operand" function, though -- it reused `_is_path_node`/a new
+  `_is_count_call` inline inside `_translate_compare`'s `else` branch, so D
+  doesn't get fixed for free. But the exact same `_is_path_node` helper,
+  now proven correct in production for this exact class of bug, is right
+  there for D's `in`-branch to call on `node.left` too -- still a small,
+  mostly-copy-paste change, difficulty stays close to 1.
+- **B and F turned out to both already be moot, for different reasons.**
+  B has shipped (see Done above). F's premise was already stale before
+  this session touched it -- `_CONSTANT_CLASSES` covers the full
+  `GrampsType` space, verified directly. The "shared code path" observation
+  (both flow through `_is_path_node`/`_CONSTANT_CLASSES`'s constant-vs-path
+  disambiguation) is now just a description of `_translate_compare`'s
+  actual code, not a planning note.
+- **G is the proven template H should copy, not a hard prerequisite.**
+  `count()` (already Done) established the "a column can be a computed
+  value" pattern; G copies it almost verbatim. H (arbitrary functions)
+  should copy the same pattern a third time rather than invent a new one.
+  H doesn't strictly need G to land first -- `count()` alone already
+  proves the pattern -- but G gives H a second worked example to
+  generalize from, lowering H's risk.
+- **G/H would still need to extend B's classification, if their scope ever
+  grows to allow either side.** B's classification
+  (`_is_path_node(node) or _is_count_call(node)`) only recognizes plain
+  paths and `count(...)` specifically -- it has no notion of a future
+  `Length`/arbitrary-function-call computed column at all. If G/H ever
+  want their own computed-column kind recognized on *either* side
+  (`1 < len(x)`), that check needs a new case added, the same way
+  `_is_count_call` was added alongside `_is_path_node` for B. `len()`'s
+  recommended v1 scope (left-hand-side only, against a literal) sidesteps
+  this on purpose, so it isn't a dependency today -- just a seam that
+  reopens if that scope grows later.
+- **I depends on `exists()` (already Done), not on G.** `any()`'s
+  recursive condition-parsing trick (a synthetic empty-column
+  `ObjectTypeSpec` forcing every field reference through `JsonPath`) is
+  exactly what `exists()` already does. `len()` isn't a real prerequisite --
+  nesting `len()` inside an `any()` condition is a plausible nice-to-have,
+  not something I structurally depends on.
+- **E, J, K are independent islands.** E is pure registry entries, sharing
+  no code with anything else here. J extends `exists`/`count`'s
+  already-Done machinery to see two rows at once -- orthogonal to A-I. K
+  lives entirely in `order_by`/keyset pagination, a different subsystem
+  from `where_expr` compilation -- touches neither `_translate_compare`
+  nor `evaluator.py`'s comparison logic at all.
+
+**Net effect on build order (as originally planned, before B/C shipped):**
+B was the one item worth doing early even though its own difficulty (2)
+wasn't special on its own -- it was the only item on this list with
+downstream leverage (cheapens D, and is the seam G/H would need if their
+scope grows). C shipped first instead, since it turned out to be nearly
+free once checked directly -- B followed right after. Of what's left, D is
+now the cheapest next pick given B's classifier pattern is proven in
+production.

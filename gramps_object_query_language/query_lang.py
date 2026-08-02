@@ -47,11 +47,22 @@ supports today:
   does use them gets an `{"or": [...]}`/`{"and": [...]}`/`{"not": node}`
   node in place of a leaf wherever it's needed -- see
   `_translate_top_level`/`_translate_bool_or_leaf`.
-- A comparison is `path OP value` where `OP` is one of
-  `== != < <= > >=` or Python's `in` (`path in [v1, v2, ...]`) -- these are
-  all the same `ast.Compare` node shape, just different `ops`.
-  `path not in [...]`, `is`, `is not` have no wire equivalent and are
-  rejected.
+- A comparison is `OPERAND OP OPERAND` where `OP` is one of
+  `== != < <= > >=`, `is`/`is not`, or Python's `in`/`not in`
+  (`path in [v1, v2, ...]`) -- these are all the same `ast.Compare` node
+  shape, just different `ops`. `is`/`is not` are pure sugar for `==`/`!=`
+  (no notion of object identity here, only value equality) and `not in`
+  is pure sugar for wrapping `in`'s own translation in `{"not": ...}` --
+  none of the three introduce a new wire shape.
+- Either side of `==`/`!=`/`</`/`<=`/`>`/`>=` may be the path and the other
+  the value -- `5 < gender` and `gender > 5` compile to the identical wire
+  node, via `_FLIP_OP` (`lt`<->`gt`, `lte`<->`gte`, `eq`/`ne` unchanged) --
+  the wire shape always renders the path as `"column"`, regardless of which
+  side of the source expression it was written on. `count(...)` stays an
+  exception on purpose: it's only ever recognized when it's *the* left-hand
+  operand, per its own left-hand-side-only v1 scope (see
+  `_translate_column_or_count`) -- `2 < count(children)` doesn't flip into
+  a supported shape, unlike `2 < gender`.
 - `in` has a second shape too: `'substring' in path` (a string literal on
   the left, a path on the right) is a plain substring test (`Contains`),
   disambiguated from `path in [...]` purely by the right-hand node's shape
@@ -263,6 +274,21 @@ def _translate_constant(class_name: str, const_name: str) -> Any:
         ) from None
 
 
+_FLIP_OP: dict[str, str] = {
+    # For "value OP field" (the literal written on the left, e.g.
+    # "Date(...) < mother.birth.sortval") -- the wire shape always puts the
+    # column first, so the operator has to flip to keep the same meaning:
+    # "A < B" becomes "B > A" once B (the field) is what's rendered as
+    # "column". eq/ne are symmetric and flip to themselves.
+    "eq": "eq",
+    "ne": "ne",
+    "lt": "gt",
+    "lte": "gte",
+    "gt": "lt",
+    "gte": "lte",
+}
+
+
 _COMPARE_OPS: dict[type, str] = {
     ast.Eq: "eq",
     ast.NotEq: "ne",
@@ -271,6 +297,14 @@ _COMPARE_OPS: dict[type, str] = {
     ast.Gt: "gt",
     ast.GtE: "gte",
     ast.In: "in",
+    # `is`/`is not` are pure sugar for `==`/`!=` here -- this language has no
+    # notion of object identity distinct from value equality, so `gender is
+    # None` and `gender == None` compile to the exact same wire node. Reusing
+    # "eq"/"ne" verbatim (rather than a dedicated "is"/"is not" wire op) means
+    # every existing "eq"/"ne" code path -- field-vs-field, count(...), the
+    # SQL/evaluator dialects -- already handles them with no new branches.
+    ast.Is: "eq",
+    ast.IsNot: "ne",
 }
 
 
@@ -353,16 +387,25 @@ def _translate_count_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:
     return {"count_of": payload}
 
 
+def _is_count_call(node: ast.AST) -> bool:
+    """Is `node` a `count(...)` call, without translating it? Used to
+    classify a comparison's operand as column-like *before* deciding how to
+    translate it -- see `_translate_compare`'s left/right classification.
+    """
+    return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "count"
+
+
 def _translate_column_or_count(node: ast.AST, spec: ObjectTypeSpec) -> Union[str, dict]:
-    """A comparison's left-hand side: an ordinary path (`_translate_column`),
+    """A comparison's column-like side: an ordinary path (`_translate_column`),
     or a `count(...)` call -- the one place a "column" can be a *computed*
     value rather than a path, verbatim. `count(...)` is deliberately not
     recognized anywhere `_translate_column` itself is called directly (a
-    comparison's right-hand side, `'in'`'s list/substring branches) -- v1
-    scope is left-hand-side-only, against a literal, matching `len()`'s own
-    planned restriction (see ROADMAP.md).
+    plain field on the other side of a comparison, `'in'`'s list/substring
+    branches) -- v1 scope only ever treats `count(...)` as *the* column,
+    never as something compared against another field, matching `len()`'s
+    own planned restriction (see ROADMAP.md).
     """
-    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "count":
+    if _is_count_call(node):
         return _translate_count_call(node, spec)
     return _translate_column(node, spec)
 
@@ -439,12 +482,19 @@ def _translate_compare(node: ast.Compare, spec: ObjectTypeSpec) -> dict:
             f"chained comparisons are not supported, use 'and' instead: {ast.dump(node)}"
         )
     op_type = type(node.ops[0])
-    if op_type not in _COMPARE_OPS:
+    # "not in" reuses "in"'s own translation below verbatim, then wraps the
+    # result in "not" at the very end -- `not (x in y)` already compiles and
+    # evaluates correctly (see Done above: the Not/missing-value three-valued
+    # logic fix), so there's no new semantics to add here, just sugar for a
+    # shape users could already write with explicit parens.
+    negate = op_type is ast.NotIn
+    lookup_type = ast.In if negate else op_type
+    if lookup_type not in _COMPARE_OPS:
         raise QueryLangError(
             f"unsupported comparison operator {op_type.__name__!r} "
-            "(supported: == != < <= > >= in)"
+            "(supported: == != < <= > >= is 'is not' in 'not in')"
         )
-    op = _COMPARE_OPS[op_type]
+    op = _COMPARE_OPS[lookup_type]
     rhs = node.comparators[0]
     if op == "in":
         if isinstance(rhs, ast.List):
@@ -453,8 +503,8 @@ def _translate_compare(node: ast.Compare, spec: ObjectTypeSpec) -> dict:
             value = _translate_list(rhs)
             if not value:
                 raise QueryLangError("'in' requires a non-empty list")
-            return {"column": column, "op": op, "value": value}
-        if _is_path_node(rhs):
+            leaf = {"column": column, "op": "in", "value": value}
+        elif _is_path_node(rhs):
             # "'substring' in field" -- a plain substring test, mirroring
             # what `in` already means for two real Python strings. The
             # field is on the *right* here (unlike every other operator),
@@ -467,29 +517,57 @@ def _translate_compare(node: ast.Compare, spec: ObjectTypeSpec) -> dict:
                     f"on the left, e.g. \"'Jan' in given_name\": {ast.dump(node)}"
                 )
             column = _translate_column(rhs, spec)
-            return {"column": column, "op": "contains", "value": substring}
-        raise QueryLangError(
-            "'in' requires either a list literal ('field in [1, 2]') or a "
-            f"field path on the right ('... in field', a substring test): {ast.dump(node)}"
-        )
-    column = _translate_column_or_count(node.left, spec)
-    if _is_path_node(rhs):
-        if isinstance(column, dict) and "count_of" in column:
-            # count(...) is left-hand-side-only, against a literal (v1 scope,
-            # see ROADMAP.md) -- field-vs-field against a count isn't
-            # supported, so reject explicitly rather than silently building
-            # a value_column that nothing downstream can render.
+            leaf = {"column": column, "op": "contains", "value": substring}
+        else:
             raise QueryLangError(
-                f"count(...) only supports comparison against a literal value, "
-                f"not a field: {ast.dump(node)}"
+                "'in' requires either a list literal ('field in [1, 2]') or a "
+                f"field path on the right ('... in field', a substring test): {ast.dump(node)}"
             )
-        # Field-vs-field: "families where mother.death.date.sortval <
-        # father.death.date.sortval" -- the right-hand side is itself a
-        # path, not a value to bind.
-        value_column = _translate_column(rhs, spec)
-        return {"column": column, "op": op, "value_column": value_column}
-    value = _translate_value(rhs)
-    return {"column": column, "op": op, "value": value}
+    else:
+        left = node.left
+        if _is_path_node(left) or _is_count_call(left):
+            # "field OP value" / "field OP field" -- the shape this function
+            # always assumed until operand-ordering was generalized. `left`
+            # is the column (or `count(...)`); `rhs` is either another field
+            # (`value_column`) or an ordinary value.
+            column = _translate_column_or_count(left, spec)
+            if _is_path_node(rhs):
+                if isinstance(column, dict) and "count_of" in column:
+                    # count(...) is left-hand-side-only, against a literal (v1
+                    # scope, see ROADMAP.md) -- field-vs-field against a count
+                    # isn't supported, so reject explicitly rather than
+                    # silently building a value_column nothing downstream
+                    # can render.
+                    raise QueryLangError(
+                        f"count(...) only supports comparison against a literal value, "
+                        f"not a field: {ast.dump(node)}"
+                    )
+                # Field-vs-field: "families where mother.death.date.sortval <
+                # father.death.date.sortval" -- the right-hand side is itself
+                # a path, not a value to bind.
+                value_column = _translate_column(rhs, spec)
+                leaf = {"column": column, "op": op, "value_column": value_column}
+            else:
+                value = _translate_value(rhs)
+                leaf = {"column": column, "op": op, "value": value}
+        elif _is_path_node(rhs):
+            # "value OP field", e.g. "Date('Jan 1, 1968') < mother.birth.sortval"
+            # -- the literal happened to be written on the left. Flip the
+            # operator so the column still renders on the wire's left, the
+            # one shape query.py/evaluator.py know how to read -- count(...)
+            # is deliberately not accepted here (see
+            # `_translate_column_or_count`'s docstring): only a plain path
+            # qualifies as "the column" on this side, matching count(...)'s
+            # existing left-hand-side-only v1 scope untouched.
+            value = _translate_value(left)
+            column = _translate_column(rhs, spec)
+            leaf = {"column": column, "op": _FLIP_OP[op], "value": value}
+        else:
+            raise QueryLangError(
+                "a comparison must have a field path on at least one side "
+                f"(count(...) is only supported on the left): {ast.dump(node)}"
+            )
+    return {"not": leaf} if negate else leaf
 
 
 def _translate_like_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:

@@ -39,6 +39,20 @@ Person "gender == Person.MALE"
 [Constants](#constants)) -- `gender == Person.MALE` and `gender == 1` compile
 to exactly the same thing.
 
+The field doesn't have to be on the left -- `5 < gender` and `gender > 5`
+compile to the identical query, and likewise for every other operator here
+(`<`/`>` and `<=`/`>=` swap with each other when the field moves sides;
+`==`/`!=` don't need to change):
+
+```python
+Person "Date('Jan 1, 1968') < birth.date.sortval"
+Person "birth.date.sortval > Date('Jan 1, 1968')"
+```
+
+These two lines are the same query. (This doesn't extend to `count(...)`,
+which is only ever recognized as the left-hand operand -- see
+[Counting a collection](#counting-a-collection-count).)
+
 ## Combining conditions with `and`, `or`, and `not`
 
 Multiple comparisons can be joined with `and`:
@@ -134,6 +148,24 @@ you mean. `'substring' in field`, by contrast, always searches for the
 substring literally -- if it happens to contain a `%` or `_`, that
 character is escaped so it's matched literally too, not reinterpreted as
 a wildcard.
+
+## `is`, `is not`, and `not in`
+
+```python
+Person "mother is None"
+Person "mother is not None"
+Person "gender not in [Person.FEMALE, Person.OTHER]"
+Person "'Jan' not in given_name"
+```
+
+`is`/`is not` are exactly `==`/`!=` -- this language has no notion of object
+identity distinct from value equality, so `mother is None` and
+`mother == None` compile to the identical wire node, and read the same as
+`gender is Person.MALE`/`gender == Person.MALE` do. `not in` is `in`
+negated -- both of `in`'s shapes (list membership and substring test) work
+the same on the left of `not in`, since `x not in y` is just `not (x in y)`
+compiled directly, the same composition you could already write by hand
+with an explicit `not (...)`.
 
 ## Fields and relationships
 
@@ -517,9 +549,6 @@ Person "birth.date.dateval[6] == 1970"
 ## What's *not* supported
 
 - Chained comparisons (`1 < gender < 3`) -- write `gender > 1 and gender < 3`.
-- `is`, `is not`, `not in` -- only `==`, `!=`, `<`, `<=`, `>`, `>=`, `in`
-  (both its list-membership and substring-test shapes), and `like(...)`
-  are recognized.
 - `other_field in field` -- the substring-test shape of `in` requires a
   string *literal* on the left, not a second field (see
   [Field-vs-field comparisons](#field-vs-field-comparisons)).

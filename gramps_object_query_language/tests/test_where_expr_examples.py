@@ -217,6 +217,28 @@ def test_contains_operator_readme_example(db):
     assert result == [("mom1",)]
 
 
+def test_operand_order_value_on_left(db):
+    # "value OP field" -- the literal written on the left of the comparison
+    # instead of the right. Compiles and executes identically to writing it
+    # the more usual way around (the operator flips: "Date(...) < field"
+    # becomes "field > Date(...)"). Matches everyone born after 1900:
+    # dad1 (1940), mom1 (1945), kid1 (1968) -- not granddad1/grandma1 (1840s)
+    # or other1 (1900, not strictly after).
+    forward = run(db, "Person", "birth.date.sortval > Date('Jan 1, 1900')")
+    reversed_ = run(db, "Person", "Date('Jan 1, 1900') < birth.date.sortval")
+    assert reversed_ == forward
+    assert forward == [("dad1",), ("kid1",), ("mom1",)]
+
+
+def test_operand_order_reversed_constant(db):
+    # "Person.MALE == gender" -- the constant on the left, same as
+    # "gender == Person.MALE" reversed. eq/ne are symmetric, so no operator
+    # flip is needed here, just the operand classification.
+    assert run(db, "Person", "Person.MALE == gender") == run(
+        db, "Person", "gender == Person.MALE"
+    )
+
+
 # --- disjunction (or) ---------------------------------------------------------
 
 
