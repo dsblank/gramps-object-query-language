@@ -30,16 +30,18 @@ does today.
   relationship path at all yet, only whatever's reachable as a JSON path
   within one record's own `json_data`.
 - Two one-to-many **collections** are registered, queryable via
-  `exists(name, condition)` (see `docs/where_expr.md`'s "One-to-many
-  relationships" section): `Family` -> `children` (-> `Person`, via
-  `child_ref_list`) and `Person` -> `notes` (-> `Note`, via `note_list`).
-  Everything else one-to-many -- a family's/person's other event refs,
-  citations, sources, media, tags, associations (`person_ref_list`) -- has
-  no collection registered yet; see "More relationships" under Possibilities
-  below. There's also no `count()`/`len()` over a collection yet (`exists`
-  only answers "at least one"), and no way for an `exists(...)` condition to
-  reference the *outer* row (e.g. "a child with the same surname as the
-  father") -- both flagged as follow-ups, not solved here.
+  `exists(name, condition)`/`count(name, condition)` (see `docs/where_expr.md`'s
+  "One-to-many relationships"/"Counting a collection" sections): `Family` ->
+  `children` (-> `Person`, via `child_ref_list`) and `Person` -> `notes`
+  (-> `Note`, via `note_list`). Everything else one-to-many -- a family's/
+  person's other event refs, citations, sources, media, tags, associations
+  (`person_ref_list`) -- has no collection registered yet; see "More
+  relationships" under Possibilities below. There's still no `len()` over a
+  plain intra-record JSON array (`primary_name.surname_list`, not a
+  registered `Collection`), no `any(...)` over one either, and no way for an
+  `exists(...)`/`count(...)` condition to reference the *outer* row (e.g. "a
+  child with the same surname as the father") -- all three flagged as
+  follow-ups, not solved here.
 
 **Values and functions**
 - Only two whitelisted function-call forms exist: `like(field, 'pattern')`
@@ -51,9 +53,12 @@ does today.
   (`EventType.BIRTH`, `FamilyRelType.MARRIED`, `NameType.*`, ...) isn't
   wired up, and those types additionally support arbitrary user-defined
   custom values with no fixed constant to name anyway. (query_lang.py)
-- No way to ask "how many" of anything -- no `len()`, no `count()`, no
-  aggregates. See [`len()` / array-length comparisons](#len--array-length-comparisons)
-  below for a scoped-out example of what closing part of this gap would take.
+- `count(...)` answers "how many" for a registered `Collection`
+  (`count(children) > 2`, see Done below) -- there's still no `len()` for a
+  plain intra-record JSON array not backed by a `Collection`
+  (`primary_name.surname_list`), and no other aggregates. See
+  [`len()` / array-length comparisons](#len--array-length-comparisons) below
+  for a scoped-out example of what closing that part of the gap would take.
 
 **Sorting / pagination**
 - `order_by` and keyset pagination (`after`) only work against flat SQL
@@ -178,6 +183,44 @@ fixture's real underlying Gramps SQLite backend rather than a hand-built
 mock table, since that's the one case where the same `json_data`/`handle`
 schema `query.py` targets already exists for free.
 
+### `count(...)` -- Collection cardinality
+
+Implemented, following this section's own earlier scoping pass almost
+exactly (see git history) -- the cheapest of the `count`/`len`/`any`
+follow-ups, since it reuses `exists(...)`'s own `Collection`/SQL machinery
+rather than adding new machinery of its own.
+
+`query.py`'s `Exists.compile()` was refactored to extract a shared
+`_collection_subquery_body(collection, outer_table, condition, dialect,
+treeid)` helper (the `<target_table>, <source> WHERE ...` fragment both
+need); a new `CollectionCount` dataclass wraps it as
+`(SELECT COUNT(*) FROM ...)` instead of `Exists`'s
+`EXISTS (SELECT 1 FROM ...)`. Unlike `Exists` (its own top-level boolean AST
+node, since a bare `exists(...)` *is* the condition), `CollectionCount` is
+just another `ColumnRef` -- `count(children) > 2` compiles to an ordinary
+`Gt(CollectionCount(children, None), 2)`, so it plugs into every existing
+`Comparison`/`In` class (and `evaluator.py`'s matching `resolve_column_ref`
+branch) with no new AST node, no `_evaluate_tri` case, and no new
+three-valued-logic wrinkle to reason about at all.
+
+`query_lang.py`'s `count(relationship[, condition])` is recognized only on a
+comparison's *left-hand side* (`_translate_column_or_count`, dispatched from
+`_translate_compare` in place of the ordinary `_translate_column` call) --
+producing `{"count_of": {"relationship": ..., "where": [...]}}`, parallel to
+`{"json_path": [...]}`. Enforced explicitly, matching the v1 scope
+recommendation: a bare `count(children)` with no comparison is rejected (not
+a boolean leaf), and `count(...)` compared against another field
+(`count(children) == mother.surname`) is rejected too, with its own error
+message rather than silently building a nonsensical `value_column` --
+`count(...)` on the *right*-hand side needed no special-casing at all, since
+a bare `Call` node there was already rejected as "not a valid literal" by
+the existing value-translation code, pre-`count()`.
+
+`count(...)`'s missing-collection case turned out simpler than `len()`'s
+planned one: `COUNT(*)` over zero matching rows is just `0` in SQL, no
+`NULL`/`COALESCE` handling needed at all, unlike `json_array_length`'s
+NULL-on-missing-path behavior `len()` will have to work around.
+
 ## Possibilities
 
 ### `len()` / array-length comparisons
@@ -187,6 +230,14 @@ today only answerable indirectly, by indexing a fixed position
 (`primary_name.surname_list[1].surname != None`, see
 README-query-language.md's cookbook) rather than asking for a count
 directly.
+
+**Note (written after `count()` shipped, see Done above):** the "column can
+be a computed value" plumbing this section originally worried about most is
+now a proven pattern, not a design risk -- `count()`'s
+`_translate_column_or_count`/`CollectionCount` did exactly this for
+`ColumnRef`, so `len()`'s parser/`query.py` work below can copy that shape
+directly rather than inventing it. The layer-by-layer breakdown and open
+semantic questions below are otherwise unchanged from the original pass.
 
 **Difficulty:** medium. **Invasiveness:** touches every layer (parser, both
 SQL dialects, the non-SQL evaluator, docs, tests), but each touch is small.
@@ -252,59 +303,6 @@ obviously-correct default:**
 side only; missing path treated as `0` (matches user intuition -- "no list
 recorded" reads as "zero", not "unknown"); non-array-value and NULL-vs-zero
 edge cases written as tests *before* either dialect is wired up.
-
-### `count(...)` -- Collection cardinality
-
-Motivated by: "families with more than 2 children," "people with at least 3
-low-confidence citations" -- `exists(...)` can only ask "at least one,"
-never "how many."
-
-**Difficulty:** small. **Invasiveness:** touches `query_lang.py`, `query.py`,
-`evaluator.py`, docs, tests -- but almost entirely by *reusing* `exists(...)`'s
-own `Collection`/`_COLLECTIONS` machinery and SQL shape rather than adding a
-new one. The cheapest of the three items on this page.
-
-**What it would take, layer by layer:**
-
-1. **`query.py`** -- refactor `Exists.compile()` to extract a shared
-   `_collection_subquery_body(collection, outer_table, condition, dialect,
-   treeid)` helper (the `FROM <target>, <source> WHERE ...` fragment both
-   need), then add a `CollectionCount` `ColumnRef` variant that wraps it as
-   `(SELECT COUNT(*) FROM ... WHERE ...)` instead of `Exists`'s
-   `EXISTS (SELECT 1 FROM ... WHERE ...)`. Unlike `Exists` (its own top-level
-   boolean AST node, since a bare `exists(...)` *is* the condition),
-   `CollectionCount` is a *value* -- `count(children) > 2` is just an
-   ordinary `Gt(CollectionCount(...), 2)`, no new `Comparison` subclass
-   needed at all.
-2. **`query_lang.py`** -- `count(relationship[, condition])` recognized in
-   `_translate_column` (not `_translate_comparison_like_node` --  it
-   produces a value, not a leaf condition), wire shape
-   `{"column": {"count_of": {"relationship": ..., "where": [...]}}}`,
-   parallel to today's `{"json_path": [...]}` shape. The optional `condition`
-   argument parses exactly like `exists`'s does (recursively, against the
-   collection's target type) -- identical mechanism, already proven working.
-3. **`evaluator.py`** -- a `CollectionCount` branch in `resolve_column_ref`:
-   `len([h for h in _collection_handles(obj, collection) if condition is
-   None or evaluate_where(db, getter(h), condition, target)])`.
-4. **Docs + tests** -- the same four files as every prior addition.
-
-**Risk / open decisions:**
-
-- **Missing collection entirely** (no `child_ref_list` key at all) --
-  `COUNT(*)` over zero matching rows is just `0` in SQL, no `NULL` involved
-  at all -- strictly simpler than `len()`'s `json_array_length`-returns-`NULL`
-  problem below, no `COALESCE` needed.
-- **Bare `count(children)` with no comparison** -- rejected, same restriction
-  `len()` needs: only legal as an operand inside a comparison, not a
-  standalone boolean leaf.
-- **`count(...)` vs. `count(...)`, or on the right-hand side of a
-  comparison** -- recommend deferring, mirroring `len()`'s "left side only,
-  against a literal" v1 scope below.
-
-**Recommended scope for a v1:** `count(relationship[, condition]) <op> <int
-literal>`, left-hand side only, reusing `exists(...)`'s existing
-`Collection` registry as-is -- `count(children) > 2`/`count(notes) == 0`
-work on day one with zero new registrations.
 
 ### `any(...)` -- intra-record JSON array membership
 
@@ -391,17 +389,19 @@ element (no flat-column fast path, no nested `any`/`exists` inside the
 element for v1); list-of-scalars arrays explicitly unsupported and rejected
 with a clear error rather than silently matching nothing.
 
-### Suggested implementation order for `count`/`len`/`any`
+### Suggested implementation order for `len`/`any` (revised after `count()`)
 
-`count()` first -- cheapest, reuses `exists(...)`'s `Collection`/SQL shape
-entirely, no new column-resolution mechanism. `len()` next -- already fully
-scoped above, needed regardless, and is the item that first introduces the
-"a column can be a *computed* value, not just a path" plumbing through
-`_translate_column`/`ColumnRef`/`_render_column`. `any()` last, since it
-needs that same "computed column" plumbing from `len()` *and* its own new
-no-target-table `EXISTS`-over-JSON-array rendering on top -- the most
-expensive item, best attempted once the other two have proven the shared
-groundwork works.
+Originally planned as `count -> len -> any`, on the theory that `len()`
+would be the item that first introduces the "a column can be a *computed*
+value, not just a path" plumbing through `_translate_column`/`ColumnRef`/
+`_render_column`. That plumbing turned out to arrive with `count()` itself
+instead (`_translate_column_or_count`, `CollectionCount` as a `ColumnRef`
+variant, both described under Done above) -- so `len()` is now the *easier*
+item of the two remaining, since it can copy that exact pattern
+(`_translate_column_or_len`, a `Length`/`ArrayLength` `ColumnRef` variant)
+rather than inventing it from scratch. `any()` still goes last: it needs
+that same pattern *and* its own new no-target-table `EXISTS`-over-JSON-array
+rendering on top, the one piece neither `count()` nor `len()` needs.
 
 ### Other gaps (not yet scoped to this level of detail)
 

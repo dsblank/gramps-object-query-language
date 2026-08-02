@@ -30,6 +30,7 @@ from gramps_object_query_language.query import (
     PLACE,
     And,
     Collection,
+    CollectionCount,
     ColumnIndex,
     Contains,
     Dialect,
@@ -1319,3 +1320,133 @@ def test_exists_flat_handle_list_end_to_end_sqlite_execution():
         PERSON, Query(select=["handle"], where=Exists(notes)), dialect=Dialect.SQLITE
     )
     assert conn.execute(sql, params).fetchall() == [("has-note",)]
+
+
+# --- CollectionCount / count(...) (Collection cardinality) --------------------
+
+
+def test_collection_count_requires_dialect():
+    children = resolve_collection(FAMILY, "children")
+    with pytest.raises(QueryError):
+        compile_query(FAMILY, Query(where=Gt(CollectionCount(children), 2)))
+
+
+def test_collection_count_sqlite_shape_with_condition():
+    children = resolve_collection(FAMILY, "children")
+    sql, params = compile_query(
+        FAMILY,
+        Query(select=["handle"], where=Gt(CollectionCount(children, Eq("gender", 1)), 1)),
+        dialect=Dialect.SQLITE,
+    )
+    assert "(SELECT COUNT(*) FROM person, json_each(family.json_data, ?) AS je" in sql
+    assert "person.handle = json_extract(je.value, '$.ref')" in sql
+    assert "gender IS NOT DISTINCT FROM ?" in sql
+    assert ") > ?" in sql
+    assert params == ["$.child_ref_list", 1, 1, 50]
+
+
+def test_collection_count_sqlite_shape_no_condition():
+    children = resolve_collection(FAMILY, "children")
+    sql, params = compile_query(
+        FAMILY,
+        Query(select=["handle"], where=Gt(CollectionCount(children), 2)),
+        dialect=Dialect.SQLITE,
+    )
+    assert "(SELECT COUNT(*) FROM person, json_each(family.json_data, ?) AS je" in sql
+    assert "person.handle = json_extract(je.value, '$.ref'))" in sql
+    assert params == ["$.child_ref_list", 2, 50]
+
+
+def test_collection_count_postgresql_shape():
+    children = resolve_collection(FAMILY, "children")
+    sql, params = compile_query(
+        FAMILY,
+        Query(select=["handle"], where=Gt(CollectionCount(children), 2)),
+        dialect=Dialect.POSTGRESQL,
+    )
+    assert (
+        "(SELECT COUNT(*) FROM person, jsonb_array_elements(family.json_data::jsonb -> "
+        "'child_ref_list') AS je(value) WHERE person.handle = je.value ->> 'ref')" in sql
+    )
+    assert params == [2, 50]
+
+
+def test_collection_count_flat_handle_list_sqlite_shape():
+    notes = resolve_collection(PERSON, "notes")
+    sql, params = compile_query(
+        PERSON, Query(select=["handle"], where=Gt(CollectionCount(notes), 0)), dialect=Dialect.SQLITE
+    )
+    assert "note.handle = je.value" in sql
+    assert "json_extract(je.value" not in sql
+    assert params == ["$.note_list", 0, 50]
+
+
+def test_collection_count_treeid_scoping():
+    children = resolve_collection(FAMILY, "children")
+    sql, params = compile_query(
+        FAMILY,
+        Query(select=["handle"], where=Gt(CollectionCount(children, Eq("gender", 1)), 1)),
+        dialect=Dialect.SQLITE,
+        treeid=7,
+    )
+    assert "person.treeid = ?" in sql
+    assert sql.count("treeid = ?") == 2
+    assert params == ["$.child_ref_list", 1, 7, 1, 7, 50]
+
+
+def test_collection_count_composes_with_and():
+    children = resolve_collection(FAMILY, "children")
+    sql, params = compile_query(
+        FAMILY,
+        Query(
+            select=["handle"],
+            where=And(Gt(CollectionCount(children), 2), Eq("gramps_id", "F001")),
+        ),
+        dialect=Dialect.SQLITE,
+    )
+    assert "SELECT COUNT(*)" in sql
+    assert "AND" in sql
+
+
+def test_collection_count_in_operator():
+    children = resolve_collection(FAMILY, "children")
+    sql, params = compile_query(
+        FAMILY,
+        Query(select=["handle"], where=In(CollectionCount(children), [1, 2, 3])),
+        dialect=Dialect.SQLITE,
+    )
+    assert "IN (?, ?, ?)" in sql
+    assert params == ["$.child_ref_list", 1, 2, 3, 50]
+
+
+def test_collection_count_end_to_end_sqlite_execution():
+    import json
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE family (handle TEXT, json_data TEXT)")
+    conn.execute("CREATE TABLE person (handle TEXT, gender INTEGER)")
+    conn.execute("INSERT INTO person VALUES ('steve', 1)")
+    conn.execute("INSERT INTO person VALUES ('anna', 0)")
+    conn.execute("INSERT INTO person VALUES ('bob', 1)")
+    conn.execute(
+        "INSERT INTO family VALUES ('fam-3kids', ?)",
+        (json.dumps({"child_ref_list": [{"ref": "steve"}, {"ref": "anna"}, {"ref": "bob"}]}),),
+    )
+    conn.execute(
+        "INSERT INTO family VALUES ('fam-1kid', ?)",
+        (json.dumps({"child_ref_list": [{"ref": "anna"}]}),),
+    )
+
+    children = resolve_collection(FAMILY, "children")
+    sql, params = compile_query(
+        FAMILY, Query(select=["handle"], where=Gt(CollectionCount(children), 2)), dialect=Dialect.SQLITE
+    )
+    assert conn.execute(sql, params).fetchall() == [("fam-3kids",)]
+
+    sql, params = compile_query(
+        FAMILY,
+        Query(select=["handle"], where=Gt(CollectionCount(children, Eq("gender", 1)), 1)),
+        dialect=Dialect.SQLITE,
+    )
+    assert conn.execute(sql, params).fetchall() == [("fam-3kids",)]

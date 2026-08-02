@@ -297,6 +297,26 @@ class Collection:
     ref_field: Optional[str]
 
 
+@dataclass(frozen=True)
+class CollectionCount:
+    """How many rows in a `Collection` match an optional `condition` -- the
+    value-returning counterpart to `Exists` (a boolean). `count(children) > 2`
+    compiles to an ordinary `Gt(CollectionCount(children, None), 2)` -- no new
+    `Comparison` subclass needed, unlike `Exists`, which has to be its own
+    top-level boolean AST node since a bare `exists(...)` *is* the condition.
+
+    `condition=None` means "count every related row" -- `count(children)`,
+    not narrowed by any field of the children themselves.
+
+    Shares `Exists`'s subquery body (`_collection_subquery_body`) verbatim,
+    just wrapped as `(SELECT COUNT(*) FROM ...)` instead of
+    `EXISTS (SELECT 1 FROM ...)` -- see `_render_collection_count`.
+    """
+
+    collection: Collection
+    condition: Optional[Any] = None
+
+
 # Registry of one-to-many collection roots, keyed by the *current* table --
 # mirrors `_RELATIONSHIPS`'s shape, but for `EXISTS`-style membership tests
 # (see `Exists`) rather than a single correlated scalar subquery. `children`
@@ -385,7 +405,7 @@ def resolve_column_path(
 # (see `RelatedObject`/`resolve_column_path`) -- `field: ColumnRef` on
 # `RelatedObject` makes this recursive, so a chain like `birth.place.title`
 # is itself a valid `ColumnRef`.
-ColumnRef = Union[str, JsonPath, RelatedObject]
+ColumnRef = Union[str, JsonPath, RelatedObject, CollectionCount]
 SelectRef = ColumnRef
 
 
@@ -639,6 +659,8 @@ def _render_column(
         return _render_related_object(column, spec.table, dialect, treeid, value)
     if isinstance(column, JsonPath):
         return _render_json_path(column, _require_dialect(dialect, column), value)
+    if isinstance(column, CollectionCount):
+        return _render_collection_count(column, spec.table, dialect, treeid)
     _check_column(column, spec.columns)
     return _quote_column(column), []
 
@@ -925,6 +947,65 @@ def _collection_source_postgresql(collection: Collection, outer_table: str) -> T
     return source, handle_expr, []
 
 
+def _collection_subquery_body(
+    collection: Collection,
+    outer_table: str,
+    condition: Optional[Any],
+    dialect: Dialect,
+    treeid: Optional[int],
+) -> Tuple[str, list]:
+    """`<target_table>, <source> WHERE <handle correlation>[ AND (<condition>)]
+    [ AND <target_table>.treeid = ?]` -- the subquery body shared by `Exists`
+    (`EXISTS (SELECT 1 FROM <body>)`) and `CollectionCount`
+    (`(SELECT COUNT(*) FROM <body>)`) alike; only the wrapper differs.
+    """
+    target = collection.target
+    target_table = target.table
+
+    if dialect == Dialect.SQLITE:
+        source, handle_expr, source_params = _collection_source_sqlite(collection, outer_table)
+    elif dialect == Dialect.POSTGRESQL:
+        source, handle_expr, source_params = _collection_source_postgresql(
+            collection, outer_table
+        )
+    else:
+        raise QueryError(f"unsupported dialect: {dialect!r}")
+
+    where_parts = [f"{target_table}.handle = {handle_expr}"]
+    params = list(source_params)
+    if condition is not None:
+        cond_sql, cond_params = condition.compile(target, dialect, treeid)
+        where_parts.append(f"({cond_sql})")
+        params.extend(cond_params)
+    if treeid is not None:
+        where_parts.append(f"{target_table}.treeid = ?")
+        params.append(treeid)
+
+    body = f"{target_table}, {source} WHERE {' AND '.join(where_parts)}"
+    return body, params
+
+
+def _render_collection_count(
+    count: "CollectionCount",
+    outer_table: str,
+    dialect: Optional[Dialect],
+    treeid: Optional[int],
+) -> Tuple[str, list]:
+    """`(SELECT COUNT(*) FROM <body>)` -- `CollectionCount`'s rendering,
+    dispatched from `_render_column` the same way `RelatedObject`/`JsonPath`
+    dispatch to their own renderers.
+    """
+    if dialect is None:
+        raise QueryError(
+            f"a dialect is required to compile count({count.collection.name!r}, ...), "
+            "but none was given"
+        )
+    body, params = _collection_subquery_body(
+        count.collection, outer_table, count.condition, dialect, treeid
+    )
+    return f"(SELECT COUNT(*) FROM {body})", params
+
+
 class Exists:
     """`EXISTS (SELECT 1 FROM <target> JOIN <list> ... WHERE ...)` -- a
     one-to-many membership test over a `Collection` (see there), optionally
@@ -962,36 +1043,10 @@ class Exists:
                 f"a dialect is required to compile exists({self.collection.name!r}, ...), "
                 "but none was given"
             )
-        target = self.collection.target
-        target_table = target.table
-        outer_table = spec.table
-
-        if dialect == Dialect.SQLITE:
-            source, handle_expr, source_params = _collection_source_sqlite(
-                self.collection, outer_table
-            )
-        elif dialect == Dialect.POSTGRESQL:
-            source, handle_expr, source_params = _collection_source_postgresql(
-                self.collection, outer_table
-            )
-        else:
-            raise QueryError(f"unsupported dialect: {dialect!r}")
-
-        where_parts = [f"{target_table}.handle = {handle_expr}"]
-        params = list(source_params)
-        if self.condition is not None:
-            cond_sql, cond_params = self.condition.compile(target, dialect, treeid)
-            where_parts.append(f"({cond_sql})")
-            params.extend(cond_params)
-        if treeid is not None:
-            where_parts.append(f"{target_table}.treeid = ?")
-            params.append(treeid)
-
-        sql = (
-            f"EXISTS (SELECT 1 FROM {target_table}, {source} "
-            f"WHERE {' AND '.join(where_parts)})"
+        body, params = _collection_subquery_body(
+            self.collection, spec.table, self.condition, dialect, treeid
         )
-        return sql, params
+        return f"EXISTS (SELECT 1 FROM {body})", params
 
     def __repr__(self) -> str:
         return f"Exists({self.collection.name!r}, {self.condition!r})"

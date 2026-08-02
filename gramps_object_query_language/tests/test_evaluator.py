@@ -58,6 +58,7 @@ from gramps_object_query_language.query import (
     PERSON,
     PLACE,
     And,
+    CollectionCount,
     Contains,
     Eq,
     Exists,
@@ -150,10 +151,12 @@ def db_handles():
 
         child_steve = Person()
         child_steve.set_primary_name(_name("Steve", "Anderson"))
+        child_steve.set_gender(Person.MALE)
         handles["child_steve"] = db.add_person(child_steve, trans)
 
         child_anna = Person()
         child_anna.set_primary_name(_name("Anna", "Anderson"))
+        child_anna.set_gender(Person.FEMALE)
         handles["child_anna"] = db.add_person(child_anna, trans)
 
         family = Family()
@@ -467,6 +470,76 @@ def test_sql_and_evaluator_agree_on_exists(db_handles):
         Exists(children, Eq("given_name", "Zelda")),
         Not(Exists(children, Eq("given_name", "Steve"))),
         Exists(children),
+    ]
+    families = {
+        "family": db.get_family_from_handle(handles["family"]),
+        "childless_family": db.get_family_from_handle(handles["childless_family"]),
+    }
+    for where in wheres:
+        sql, params = compile_query(
+            FAMILY, Query(select=["handle"], where=where), dialect=Dialect.SQLITE
+        )
+        db.dbapi.execute(sql, params)
+        sql_matches = {row[0] for row in db.dbapi.fetchall()}
+        for key, family in families.items():
+            expected = handles[key] in sql_matches
+            actual = evaluate_where(db, family, where, FAMILY)
+            assert actual == expected, f"{where!r} on {key!r}: SQL={expected} eval={actual}"
+
+
+# --- CollectionCount / count(...) (Collection cardinality) --------------------
+
+
+def test_evaluate_where_count_matches_number_of_children(db_handles):
+    db, handles = db_handles
+    family = db.get_family_from_handle(handles["family"])
+    children = resolve_collection(FAMILY, "children")
+    assert evaluate_where(db, family, Gt(CollectionCount(children), 1), FAMILY) is True
+    assert evaluate_where(db, family, Gt(CollectionCount(children), 2), FAMILY) is False
+
+
+def test_evaluate_where_count_zero_for_childless_family(db_handles):
+    db, handles = db_handles
+    childless_family = db.get_family_from_handle(handles["childless_family"])
+    children = resolve_collection(FAMILY, "children")
+    assert evaluate_where(db, childless_family, Gt(CollectionCount(children), 0), FAMILY) is False
+    assert evaluate_where(db, childless_family, Eq(CollectionCount(children), 0), FAMILY) is True
+
+
+def test_evaluate_where_count_with_condition(db_handles):
+    # family has one male child (Steve) and one female child (Anna).
+    db, handles = db_handles
+    family = db.get_family_from_handle(handles["family"])
+    children = resolve_collection(FAMILY, "children")
+    male_children = CollectionCount(children, Eq("gender", Person.MALE))
+    assert evaluate_where(db, family, Eq(male_children, 1), FAMILY) is True
+    assert evaluate_where(db, family, Eq(male_children, 2), FAMILY) is False
+
+
+def test_evaluate_where_count_flat_handle_list(db_handles):
+    db, handles = db_handles
+    father = db.get_person_from_handle(handles["father"])
+    mother = db.get_person_from_handle(handles["mother"])
+    notes = resolve_collection(PERSON, "notes")
+    assert evaluate_where(db, father, Eq(CollectionCount(notes), 1), PERSON) is True
+    assert evaluate_where(db, mother, Eq(CollectionCount(notes), 0), PERSON) is True
+
+
+def test_sql_and_evaluator_agree_on_count(db_handles):
+    """Same style of regression guard as the Exists/Not agreement tests --
+    runs the same CollectionCount-based `where` AST through the fixture's
+    real underlying Gramps SQLite backend and through `evaluate_where`, and
+    checks they agree.
+    """
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+
+    db, handles = db_handles
+    children = resolve_collection(FAMILY, "children")
+    wheres = [
+        Gt(CollectionCount(children), 1),
+        Gt(CollectionCount(children), 2),
+        Eq(CollectionCount(children, Eq("gender", Person.MALE)), 1),
+        In(CollectionCount(children), [0, 1]),
     ]
     families = {
         "family": db.get_family_from_handle(handles["family"]),

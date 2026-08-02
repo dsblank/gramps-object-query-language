@@ -128,6 +128,7 @@ from .query import (
     SOURCE,
     TAG,
     And,
+    CollectionCount,
     ColumnRef,
     Contains,
     Eq,
@@ -319,6 +320,53 @@ def _translate_column(node: ast.AST, spec: ObjectTypeSpec) -> Union[str, dict]:
     return {"json_path": segments}
 
 
+def _translate_count_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:
+    """Translate `count(relationship[, condition])` into
+    `{"count_of": {"relationship": ..., "where": [...]}}` -- the *value*-
+    producing counterpart to `exists(...)`'s leaf-producing
+    `_translate_exists_call`. Appears as a comparison's column
+    (`count(children) > 2`), never as a leaf on its own -- a bare
+    `count(children)` with no comparison isn't a boolean, so it's rejected
+    the same way a bare path (`gender`, with no `== ...`) already is.
+
+    `relationship`/`condition` resolve exactly like `exists(...)`'s do --
+    same `resolve_collection` lookup, same recursive `_translate_top_level`
+    against the collection's target type for the optional condition.
+    """
+    if not 1 <= len(node.args) <= 2 or node.keywords:
+        raise QueryLangError(
+            "count(relationship[, condition]) takes 1 or 2 positional arguments"
+        )
+    name_node = node.args[0]
+    if not isinstance(name_node, ast.Name):
+        raise QueryLangError(
+            f"count(...)'s first argument must be a bare relationship name: "
+            f"{ast.dump(name_node)}"
+        )
+    try:
+        collection = resolve_collection(spec, name_node.id)
+    except QueryError as error:
+        raise QueryLangError(str(error)) from error
+    payload: dict = {"relationship": name_node.id}
+    if len(node.args) == 2:
+        payload["where"] = _translate_top_level(node.args[1], collection.target)
+    return {"count_of": payload}
+
+
+def _translate_column_or_count(node: ast.AST, spec: ObjectTypeSpec) -> Union[str, dict]:
+    """A comparison's left-hand side: an ordinary path (`_translate_column`),
+    or a `count(...)` call -- the one place a "column" can be a *computed*
+    value rather than a path, verbatim. `count(...)` is deliberately not
+    recognized anywhere `_translate_column` itself is called directly (a
+    comparison's right-hand side, `'in'`'s list/substring branches) -- v1
+    scope is left-hand-side-only, against a literal, matching `len()`'s own
+    planned restriction (see ROADMAP.md).
+    """
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "count":
+        return _translate_count_call(node, spec)
+    return _translate_column(node, spec)
+
+
 def _translate_date_call(node: ast.Call) -> int:
     """Translate `Date('Jan 1, 1968')` into its `.sortval` (a comparable
     Julian day number), via Gramps' own date parser -- not a custom one.
@@ -401,7 +449,7 @@ def _translate_compare(node: ast.Compare, spec: ObjectTypeSpec) -> dict:
     if op == "in":
         if isinstance(rhs, ast.List):
             # "field in [v1, v2, ...]" -- list membership.
-            column = _translate_column(node.left, spec)
+            column = _translate_column_or_count(node.left, spec)
             value = _translate_list(rhs)
             if not value:
                 raise QueryLangError("'in' requires a non-empty list")
@@ -424,8 +472,17 @@ def _translate_compare(node: ast.Compare, spec: ObjectTypeSpec) -> dict:
             "'in' requires either a list literal ('field in [1, 2]') or a "
             f"field path on the right ('... in field', a substring test): {ast.dump(node)}"
         )
-    column = _translate_column(node.left, spec)
+    column = _translate_column_or_count(node.left, spec)
     if _is_path_node(rhs):
+        if isinstance(column, dict) and "count_of" in column:
+            # count(...) is left-hand-side-only, against a literal (v1 scope,
+            # see ROADMAP.md) -- field-vs-field against a count isn't
+            # supported, so reject explicitly rather than silently building
+            # a value_column that nothing downstream can render.
+            raise QueryLangError(
+                f"count(...) only supports comparison against a literal value, "
+                f"not a field: {ast.dump(node)}"
+            )
         # Field-vs-field: "families where mother.death.date.sortval <
         # father.death.date.sortval" -- the right-hand side is itself a
         # path, not a value to bind.
@@ -590,15 +647,29 @@ _OP_CLASSES: dict[str, type] = {
 
 
 def _json_column_to_ref(column: Union[str, dict], spec: ObjectTypeSpec) -> ColumnRef:
-    """A wire-format column reference (plain string or `{"json_path": [...]}`),
-    resolved to a `ColumnRef` -- via `resolve_column_path`, so a path crossing
-    a relationship (`{"json_path": ["birth", "date", "sortval"]}`) becomes a
-    `RelatedObject` the same way it would coming from `object_query.py`, not a
-    literal `JsonPath(("birth", "date", "sortval"))` that would (harmlessly,
-    but incorrectly) look for a `birth` key inside `json_data` instead.
+    """A wire-format column reference (plain string, `{"json_path": [...]}`,
+    or `{"count_of": {...}}`), resolved to a `ColumnRef` -- via
+    `resolve_column_path`, so a path crossing a relationship
+    (`{"json_path": ["birth", "date", "sortval"]}`) becomes a `RelatedObject`
+    the same way it would coming from `object_query.py`, not a literal
+    `JsonPath(("birth", "date", "sortval"))` that would (harmlessly, but
+    incorrectly) look for a `birth` key inside `json_data` instead.
+    `{"count_of": {"relationship": ..., "where": [...]}}` resolves to a
+    `CollectionCount` the same way `_node_from_json`'s `"exists"` case
+    resolves to an `Exists` -- same `resolve_collection` lookup, same
+    recursive `_where_list_to_ast` for the optional condition.
     """
     if isinstance(column, str):
         return column
+    if "count_of" in column:
+        payload = column["count_of"]
+        collection = resolve_collection(spec, payload["relationship"])
+        condition = (
+            _where_list_to_ast(payload["where"], collection.target)
+            if "where" in payload
+            else None
+        )
+        return CollectionCount(collection, condition)
     return resolve_column_path(spec, column["json_path"])
 
 

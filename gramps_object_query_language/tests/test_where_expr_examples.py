@@ -471,6 +471,61 @@ def test_not_exists_notes(db):
     ]
 
 
+def test_count_children(db):
+    # fam1 has exactly one recorded child (kid1); fam2 has none at all.
+    result = run(db, "Family", "count(children) > 0")
+    assert result == [("fam1",)]
+    result = run(db, "Family", "count(children) == 0")
+    assert result == [("fam2",)]
+
+
+def test_count_children_with_condition(db):
+    result = run(db, "Family", "count(children, given_name == 'Robert') == 1")
+    assert result == [("fam1",)]
+    result = run(db, "Family", "count(children, given_name == 'Steve') == 1")
+    assert result == []
+
+
+def test_count_children_more_than_two_readme_example():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE family (handle TEXT, json_data TEXT)")
+    conn.execute("CREATE TABLE person (handle TEXT, gender INTEGER)")
+    conn.execute("INSERT INTO person VALUES ('steve', 1)")
+    conn.execute("INSERT INTO person VALUES ('anna', 0)")
+    conn.execute("INSERT INTO person VALUES ('bob', 1)")
+    conn.execute(
+        "INSERT INTO family VALUES ('big-family', ?)",
+        (json.dumps({"child_ref_list": [{"ref": "steve"}, {"ref": "anna"}, {"ref": "bob"}]}),),
+    )
+    conn.execute(
+        "INSERT INTO family VALUES ('small-family', ?)",
+        (json.dumps({"child_ref_list": [{"ref": "anna"}]}),),
+    )
+
+    result = run(conn, "Family", "count(children) > 2")
+    assert result == [("big-family",)]
+
+
+def test_count_children_gender_condition_readme_example():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE family (handle TEXT, json_data TEXT)")
+    conn.execute("CREATE TABLE person (handle TEXT, gender INTEGER)")
+    conn.execute("INSERT INTO person VALUES ('steve', 1)")
+    conn.execute("INSERT INTO person VALUES ('bob', 1)")
+    conn.execute("INSERT INTO person VALUES ('anna', 0)")
+    conn.execute(
+        "INSERT INTO family VALUES ('two-sons', ?)",
+        (json.dumps({"child_ref_list": [{"ref": "steve"}, {"ref": "bob"}]}),),
+    )
+    conn.execute(
+        "INSERT INTO family VALUES ('one-son-one-daughter', ?)",
+        (json.dumps({"child_ref_list": [{"ref": "steve"}, {"ref": "anna"}]}),),
+    )
+
+    result = run(conn, "Family", "count(children, gender == Person.MALE) > 1")
+    assert result == [("two-sons",)]
+
+
 # --- constants on other types (Citation.CONF_HIGH) ---------------------------
 
 

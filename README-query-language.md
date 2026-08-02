@@ -336,6 +336,25 @@ The same idea, starting from `Person` instead: `notes` reaches every note
 attached to a person's record, and `not exists(notes)` matches whenever
 there aren't any.
 
+### Goal: Find families with more than two children
+
+```
+Family "count(children) > 2"
+```
+
+`count(children)` counts how many children a family has recorded --
+`exists(children, ...)` can only tell you whether *at least one* child
+matches something, `count(...)` tells you *how many*.
+
+### Goal: Find families with more than one son
+
+```
+Family "count(children, gender == Person.MALE) > 1"
+```
+
+Adding a condition (the same kind of condition `exists(...)` takes) counts
+only the children who match it -- here, only the sons.
+
 ## Things this can't do (yet)
 
 - Anything beyond the patterns shown above -- this is a small, fixed set of

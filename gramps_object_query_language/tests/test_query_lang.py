@@ -32,8 +32,10 @@ from gramps_object_query_language.query import (
     PERSON,
     FAMILY,
     And,
+    CollectionCount,
     Eq,
     Exists,
+    Gt,
     Gte,
     JsonPath,
     Lt,
@@ -936,6 +938,112 @@ def test_exists_wrapped_in_or():
     ]
 
 
+# --- count(...) (Collection cardinality) ---------------------------------------
+
+
+def test_count_produces_count_of_column_with_no_condition():
+    result = parse_expr("family", "count(children) > 2")
+    assert result == [
+        {"column": {"count_of": {"relationship": "children"}}, "op": "gt", "value": 2}
+    ]
+
+
+def test_count_with_condition():
+    result = parse_expr("family", "count(children, gender == 1) >= 1")
+    assert result == [
+        {
+            "column": {
+                "count_of": {
+                    "relationship": "children",
+                    "where": [{"column": "gender", "op": "eq", "value": 1}],
+                }
+            },
+            "op": "gte",
+            "value": 1,
+        }
+    ]
+
+
+def test_count_condition_can_chain_relationships():
+    result = parse_expr("family", "count(children, birth.place.title == 'Chicago') > 0")
+    assert result == [
+        {
+            "column": {
+                "count_of": {
+                    "relationship": "children",
+                    "where": [
+                        {
+                            "column": {"json_path": ["birth", "place", "title"]},
+                            "op": "eq",
+                            "value": "Chicago",
+                        }
+                    ],
+                }
+            },
+            "op": "gt",
+            "value": 0,
+        }
+    ]
+
+
+def test_count_supports_in_operator():
+    result = parse_expr("family", "count(children) in [1, 2, 3]")
+    assert result == [
+        {"column": {"count_of": {"relationship": "children"}}, "op": "in", "value": [1, 2, 3]}
+    ]
+
+
+def test_count_composes_with_and():
+    result = parse_expr(
+        "family", "count(children) > 1 and father.surname == 'Smith'"
+    )
+    assert result == [
+        {"column": {"count_of": {"relationship": "children"}}, "op": "gt", "value": 1},
+        {"column": {"json_path": ["father", "surname"]}, "op": "eq", "value": "Smith"},
+    ]
+
+
+def test_count_unknown_relationship_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("family", "count(bogus) > 1")
+
+
+def test_count_relationship_not_registered_on_this_type_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "count(children) > 1")
+
+
+def test_count_wrong_arity_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("family", "count() > 1")
+    with pytest.raises(QueryLangError):
+        parse_expr("family", "count(children, a == 1, b == 2) > 1")
+
+
+def test_count_first_argument_must_be_bare_name():
+    with pytest.raises(QueryLangError):
+        parse_expr("family", "count('children') > 1")
+
+
+def test_count_bare_call_rejected():
+    # count(children) alone, with no comparison, isn't a leaf -- same as a
+    # bare path (gender, with no "== ...") being rejected.
+    with pytest.raises(QueryLangError):
+        parse_expr("family", "count(children)")
+
+
+def test_count_field_vs_field_rejected():
+    # v1 scope: count(...) only supports comparison against a literal, not
+    # another field.
+    with pytest.raises(QueryLangError):
+        parse_expr("family", "count(children) == mother.surname")
+
+
+def test_count_on_right_hand_side_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("family", "1 < count(children)")
+
+
 # --- compile_expr / compile_expr_for_spec (expr string -> query.py AST) ------
 
 
@@ -1066,6 +1174,48 @@ def test_compile_expr_exists_end_to_end_sqlite_execution():
     sql, params = compile_query(spec, Query(select=["handle"], where=where), dialect=Dialect.SQLITE)
     rows = conn.execute(sql, params).fetchall()
     assert rows == [("fam-with-steve",)]
+
+
+def test_compile_expr_count_becomes_collection_count():
+    _, where = compile_expr("family", "count(children) > 2")
+    assert isinstance(where, Gt)
+    assert isinstance(where.column, CollectionCount)
+    assert where.column.collection.name == "children"
+    assert where.column.condition is None
+    assert where.value == 2
+
+
+def test_compile_expr_count_with_condition():
+    _, where = compile_expr("family", "count(children, gender == 1) >= 1")
+    assert isinstance(where.column, CollectionCount)
+    assert where.column.condition == Eq("gender", 1)
+
+
+def test_compile_expr_count_end_to_end_sqlite_execution():
+    import json
+    import sqlite3
+
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE family (handle TEXT, json_data TEXT)")
+    conn.execute("CREATE TABLE person (handle TEXT)")
+    conn.execute("INSERT INTO person VALUES ('steve')")
+    conn.execute("INSERT INTO person VALUES ('anna')")
+    conn.execute("INSERT INTO person VALUES ('bob')")
+    conn.execute(
+        "INSERT INTO family VALUES ('fam-3kids', ?)",
+        (json.dumps({"child_ref_list": [{"ref": "steve"}, {"ref": "anna"}, {"ref": "bob"}]}),),
+    )
+    conn.execute(
+        "INSERT INTO family VALUES ('fam-1kid', ?)",
+        (json.dumps({"child_ref_list": [{"ref": "anna"}]}),),
+    )
+
+    spec, where = compile_expr("family", "count(children) > 2")
+    sql, params = compile_query(spec, Query(select=["handle"], where=where), dialect=Dialect.SQLITE)
+    rows = conn.execute(sql, params).fetchall()
+    assert rows == [("fam-3kids",)]
 
 
 def test_compile_expr_end_to_end_sqlite_execution():

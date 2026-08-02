@@ -245,6 +245,40 @@ is always plain negation, with none of the "a missing value under `not`
 stays excluded, not included" three-valued-logic subtlety described above
 for ordinary comparisons.
 
+## Counting a collection: `count(...)`
+
+`exists(...)` only answers "at least one" -- `count(name, condition)` asks
+"how many," over the same registered collections:
+
+```python
+Family "count(children) > 2"
+Family "count(children, gender == Person.MALE) >= 1"
+```
+
+Unlike `exists(...)`, `count(...)` isn't itself a condition -- it produces a
+*number*, so it has to appear as the left-hand side of an ordinary
+comparison (`count(children) > 2`, not a bare `count(children)`) the same
+way a field reference does. `condition` is optional, exactly as with
+`exists`, and parses the same way (a full nested `where_expr` against the
+collection's target type); leaving it out (`count(children)`) counts every
+related row, unfiltered.
+
+```python
+Family "count(children) in [0, 1]"
+```
+
+`count(...)` is deliberately narrower than a plain field: it's only
+recognized on a comparison's left-hand side, never on the right and never
+compared against another field or another `count(...)` (`count(a) ==
+count(b)` isn't supported) -- the same restriction `len()`'s own array-length
+form is planned to have (see `ROADMAP.md`), kept consistent between the two.
+
+Under the hood, `count(...)` reuses `exists(...)`'s own subquery shape
+verbatim, just wrapped as `(SELECT COUNT(*) FROM ...)` instead of
+`EXISTS (SELECT 1 FROM ...)` -- a missing collection (no children recorded
+at all) is `0`, not `NULL`, the same way `COUNT(*)` over zero matching rows
+always is in SQL.
+
 ## Genealogy examples
 
 One example of each of the five registered relationship links, plus a few
@@ -329,6 +363,14 @@ spelled the same way from `where_expr`:
 
 ```python
 Person "not exists(notes)"
+```
+
+**`count(children, ...)`** -- how many children match a condition (or none,
+to count every child):
+
+```python
+Family "count(children) > 0"
+Family "count(children, given_name == 'Robert') == 1"
 ```
 
 ## Constants

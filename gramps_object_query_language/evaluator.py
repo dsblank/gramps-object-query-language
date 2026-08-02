@@ -51,6 +51,7 @@ from gramps.gen.lib import json_utils
 from .query import (
     And,
     Collection,
+    CollectionCount,
     ColumnIndex,
     ColumnRef,
     Comparison,
@@ -201,6 +202,8 @@ def resolve_column_ref(db: Any, obj: Any, ref: ColumnRef, spec: ObjectTypeSpec) 
         return resolve_column_ref(db, related_obj, ref.field, ref.target)
     if isinstance(ref, JsonPath):
         return get_json_path(obj, ref)
+    if isinstance(ref, CollectionCount):
+        return _collection_count(db, obj, ref)
     return get_flat_column(obj, ref, spec)
 
 
@@ -215,6 +218,27 @@ def _collection_handles(obj: Any, collection: Collection) -> list:
     if collection.ref_field:
         return [item.get(collection.ref_field) for item in items if item]
     return [item for item in items if item]
+
+
+def _collection_count(db: Any, obj: Any, count: CollectionCount) -> int:
+    """How many related rows in `count.collection` match `count.condition`
+    (every related row at all, if `condition` is `None`) -- the evaluator
+    counterpart to `query.py`'s `CollectionCount` SQL rendering. Unlike
+    `Exists`'s short-circuit on the first match, this has to walk every
+    related row, matching `COUNT(*)`'s own semantics.
+    """
+    getter = getattr(db, GETTER_BY_TABLE[count.collection.target.table])
+    matched = 0
+    for handle in _collection_handles(obj, count.collection):
+        try:
+            related = getter(handle)
+        except HandleError:
+            continue
+        if count.condition is None or evaluate_where(
+            db, related, count.condition, count.collection.target
+        ):
+            matched += 1
+    return matched
 
 
 def _like_to_regex(pattern: str) -> re.Pattern:
