@@ -53,6 +53,7 @@ from .query import (
     ColumnIndex,
     ColumnRef,
     Comparison,
+    Contains,
     In,
     JsonPath,
     Not,
@@ -264,6 +265,16 @@ def evaluate_where(db: Any, obj: Any, expr: Any, spec: ObjectTypeSpec) -> bool:
     if isinstance(expr, In):
         value = resolve_column_ref(db, obj, expr.column, spec)
         return value in expr.values
+    if isinstance(expr, Contains):
+        # A plain substring test -- unlike `Like`'s SQL-pattern matching
+        # (`_like_to_regex`), `expr.value` here is a literal substring with
+        # no wildcard characters to reinterpret, so a direct (case-insensitive,
+        # matching SQLite's default `LIKE` behavior) Python `in` check is both
+        # correct and simpler than routing through the LIKE/regex machinery.
+        value = resolve_column_ref(db, obj, expr.column, spec)
+        if value is None:
+            return False
+        return expr.value.lower() in str(value).lower()
     if isinstance(expr, Comparison):
         left = resolve_column_ref(db, obj, expr.column, spec)
         if isinstance(expr.value, (JsonPath, RelatedObject)):

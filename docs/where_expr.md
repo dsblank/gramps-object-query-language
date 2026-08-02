@@ -51,17 +51,40 @@ Person "gender == Person.MALE and surname == 'Smith'"
 rejected -- as are chained comparisons like `1 < gender < 3` (write
 `gender > 1 and gender < 3` instead).
 
-## `in` and `like`
+## `in`, contains, and `like`
 
 ```python
 Person "given_name in ['John', 'Jane']"
+Person "'Jan' in given_name"
 Person "like(given_name, 'J%')"
 ```
 
-`in` takes a non-empty list literal. `like(field, 'pattern')` is a
-whitelisted function-call form standing in for SQL's `LIKE` (`%` matches any
-run of characters, `_` matches exactly one) -- it isn't a Python operator,
-so it can't be spelled `field like 'pattern'`.
+`in` has two shapes, told apart by what's on its right:
+
+- `field in [v1, v2, ...]` -- list membership; the list must be a
+  non-empty literal.
+- `'substring' in field` -- a plain substring test (no wildcards): does
+  `field`'s value contain the literal string on the left? This mirrors
+  what `in` already means for two real Python strings (`'Jan' in 'Jane'`
+  is `True` in plain Python too), just extended to a field reference on
+  the right instead of a second literal. The left side must be a string
+  literal -- `other_field in field` (both sides paths) isn't supported.
+
+Note the reversed order compared to every other operator here: `field`
+sits on the *left* for `==`, `<`, `in [...]`, and `like(...)`, but on the
+*right* for the substring form of `in` -- because that's the order real
+Python uses for substring tests.
+
+`like(field, 'pattern')` is a whitelisted function-call form standing in
+for SQL's `LIKE` (`%` matches any run of characters, `_` matches exactly
+one) -- it isn't a Python operator, so it can't be spelled
+`field like 'pattern'`. Unlike `'substring' in field`, `like(...)`'s
+pattern is used as-authored: wildcards in it are real wildcards, and it's
+your job to write `'%accident%'` rather than `'accident'` if that's what
+you mean. `'substring' in field`, by contrast, always searches for the
+substring literally -- if it happens to contain a `%` or `_`, that
+character is escaped so it's matched literally too, not reinterpreted as
+a wildcard.
 
 ## Fields and relationships
 
@@ -120,8 +143,11 @@ before the father" -- both sides cross a relationship (`Family` -> `Person`
 -> `Event`) and are compared directly, with no literal value involved at
 all.
 
-`in` always expects a list literal on the right, never a field-vs-field
-form.
+`field in [...]` always expects a list literal on the right, never a
+field-vs-field form -- and the substring form of `in` always expects a
+string literal on the left, never a field-vs-field form either
+(`other_field in field` is rejected, not interpreted as "does field
+contain other_field's value").
 
 ## Genealogy examples
 
@@ -141,7 +167,11 @@ its date; any of the event's fields are reachable the same way:
 
 ```python
 Person "like(death.description, '%accident%')"
+Person "'accident' in death.description"
 ```
+
+(The two are equivalent here -- `'accident' in death.description` is just
+the substring-test spelling of the same query.)
 
 **`Family -> father -> Person`** / **`Family -> mother -> Person`** -- a
 family's parents:
@@ -211,8 +241,12 @@ Person "birth.date.sortval >= Date('Jan 1, 1968')"
 
 - `or`, `not` -- no representation in the current query format yet.
 - Chained comparisons (`1 < gender < 3`) -- write `gender > 1 and gender < 3`.
-- `is`, `is not`, `not in` -- only `==`, `!=`, `<`, `<=`, `>`, `>=`, `in`,
-  and `like(...)` are recognized.
+- `is`, `is not`, `not in` -- only `==`, `!=`, `<`, `<=`, `>`, `>=`, `in`
+  (both its list-membership and substring-test shapes), and `like(...)`
+  are recognized.
+- `other_field in field` -- the substring-test shape of `in` requires a
+  string *literal* on the left, not a second field (see
+  [Field-vs-field comparisons](#field-vs-field-comparisons)).
 - Arbitrary function calls, lambdas, comprehensions, f-strings, imports --
   the parser whitelists node *shapes*, so anything it doesn't explicitly
   recognize is rejected, not silently ignored.

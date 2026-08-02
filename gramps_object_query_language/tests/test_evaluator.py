@@ -56,6 +56,7 @@ from gramps_object_query_language.query import (
     PERSON,
     PLACE,
     And,
+    Contains,
     Eq,
     Gt,
     In,
@@ -249,6 +250,17 @@ def test_evaluate_where_like(db_handles):
     father = db.get_person_from_handle(handles["father"])
     assert evaluate_where(db, father, Like("surname", "And%"), PERSON) is True
     assert evaluate_where(db, father, Like("surname", "Zzz%"), PERSON) is False
+
+
+def test_evaluate_where_contains(db_handles):
+    db, handles = db_handles
+    father = db.get_person_from_handle(handles["father"])
+    # Plain substring test, not a LIKE pattern -- no wildcard characters
+    # involved, and matches case-insensitively (mirroring SQLite's default
+    # LIKE behavior, same as `Like` above).
+    assert evaluate_where(db, father, Contains("surname", "nder"), PERSON) is True
+    assert evaluate_where(db, father, Contains("surname", "NDER"), PERSON) is True
+    assert evaluate_where(db, father, Contains("surname", "zzz"), PERSON) is False
 
 
 def test_evaluate_where_in(db_handles):

@@ -29,6 +29,7 @@ from gramps_object_query_language.query import (
     PLACE,
     And,
     ColumnIndex,
+    Contains,
     Dialect,
     Eq,
     Gt,
@@ -799,6 +800,27 @@ def test_ordering_and_like_and_in_ops_unaffected_by_null_safe_rewrite():
 
     sql, _ = compile_query(PERSON, Query(select=["handle"], where=In("gender", [1, 2])))
     assert "gender IN (?, ?)" in sql
+
+
+def test_contains_wraps_value_in_wildcards_and_binds_as_param():
+    sql, params = compile_query(PERSON, Query(select=["handle"], where=Contains("surname", "mit")))
+    assert "surname LIKE ? ESCAPE '\\'" in sql
+    assert params[0] == "%mit%"
+
+
+def test_contains_escapes_like_metacharacters_in_value():
+    # A literal `%`/`_` in the substring being searched for must match
+    # literally, not be reinterpreted as a LIKE wildcard -- the whole point
+    # of the ESCAPE clause over `Like`'s raw, user-authored pattern.
+    sql, params = compile_query(
+        PERSON, Query(select=["handle"], where=Contains("surname", "100%_off\\"))
+    )
+    assert params[0] == "%100\\%\\_off\\\\%"
+    assert "ESCAPE '\\'" in sql
+
+
+def test_contains_repr_shows_raw_substring_not_escaped_pattern():
+    assert repr(Contains("surname", "100%")) == "Contains('surname', '100%')"
 
 
 def test_null_safe_equality_end_to_end_sqlite_execution():

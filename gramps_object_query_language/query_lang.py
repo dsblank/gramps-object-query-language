@@ -46,6 +46,10 @@ supports today:
   all the same `ast.Compare` node shape, just different `ops`.
   `path not in [...]`, `is`, `is not` have no wire equivalent and are
   rejected.
+- `in` has a second shape too: `'substring' in path` (a string literal on
+  the left, a path on the right) is a plain substring test (`Contains`),
+  disambiguated from `path in [...]` purely by the right-hand node's shape
+  (`ast.List` vs. a path) -- the same `ast.Compare`/`ast.In` node either way.
 - `like(path, 'pattern%')` is a whitelisted function-call form, for the one
   operator (`Like`) that isn't a Python operator.
 - A path is a bare identifier optionally followed by `.attr` / `[index]`
@@ -95,6 +99,7 @@ from .query import (
     TAG,
     And,
     ColumnRef,
+    Contains,
     Eq,
     Gt,
     Gte,
@@ -315,13 +320,34 @@ def _translate_compare(node: ast.Compare, spec: ObjectTypeSpec) -> dict:
             "(supported: == != < <= > >= in)"
         )
     op = _COMPARE_OPS[op_type]
-    column = _translate_column(node.left, spec)
     rhs = node.comparators[0]
     if op == "in":
-        value = _translate_list(rhs)
-        if not value:
-            raise QueryLangError("'in' requires a non-empty list")
-        return {"column": column, "op": op, "value": value}
+        if isinstance(rhs, ast.List):
+            # "field in [v1, v2, ...]" -- list membership.
+            column = _translate_column(node.left, spec)
+            value = _translate_list(rhs)
+            if not value:
+                raise QueryLangError("'in' requires a non-empty list")
+            return {"column": column, "op": op, "value": value}
+        if _is_path_node(rhs):
+            # "'substring' in field" -- a plain substring test, mirroring
+            # what `in` already means for two real Python strings. The
+            # field is on the *right* here (unlike every other operator),
+            # since that's what makes `'Jan' in given_name` read the same
+            # as it would in real Python.
+            substring = _translate_value(node.left)
+            if not isinstance(substring, str):
+                raise QueryLangError(
+                    "'... in path' (substring test) requires a string literal "
+                    f"on the left, e.g. \"'Jan' in given_name\": {ast.dump(node)}"
+                )
+            column = _translate_column(rhs, spec)
+            return {"column": column, "op": "contains", "value": substring}
+        raise QueryLangError(
+            "'in' requires either a list literal ('field in [1, 2]') or a "
+            f"field path on the right ('... in field', a substring test): {ast.dump(node)}"
+        )
+    column = _translate_column(node.left, spec)
     if _is_path_node(rhs):
         # Field-vs-field: "families where mother.death.date.sortval <
         # father.death.date.sortval" -- the right-hand side is itself a
@@ -441,13 +467,15 @@ def _json_column_to_ref(column: Union[str, dict], spec: ObjectTypeSpec) -> Colum
 
 def _condition_from_json(condition: dict, spec: ObjectTypeSpec) -> Any:
     """One `parse_expr`-shaped condition dict, translated to a `query.py`
-    comparison object (`Eq`, `Lt`, `In`, `Like`, ...)."""
+    comparison object (`Eq`, `Lt`, `In`, `Like`, `Contains`, ...)."""
     column = _json_column_to_ref(condition["column"], spec)
     op = condition["op"]
     if op == "in":
         return In(column, condition["value"])
     if op == "like":
         return Like(column, condition["value"])
+    if op == "contains":
+        return Contains(column, condition["value"])
     if "value_column" in condition:
         # Field-vs-field, e.g. "mother.death.date.sortval < father.death.date.sortval".
         value = _json_column_to_ref(condition["value_column"], spec)

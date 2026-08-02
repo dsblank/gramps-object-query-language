@@ -190,6 +190,20 @@ def test_like_operator(db):
     assert result == [("dad1",), ("mom1",)]
 
 
+def test_contains_operator(db):
+    # "'sub' in field" is a plain substring test -- 'Jan' matches "Jane"
+    # (mom1) with no wildcard characters written out, unlike `like()`.
+    result = run(db, "Person", "'Jan' in given_name")
+    assert result == [("mom1",)]
+
+
+def test_contains_operator_readme_example(db):
+    # README-query-language.md's cookbook example, spelled with a different
+    # substring than the doc above but matching the same person.
+    result = run(db, "Person", "'an' in given_name")
+    assert result == [("mom1",)]
+
+
 # --- relationship traversal (Person -> Event) --------------------------------
 
 
@@ -225,6 +239,13 @@ def test_death_description_like(db):
     # the event's own fields are reachable the same way, e.g. a free-text
     # description of how someone died.
     result = run(db, "Person", "like(death.description, '%accident%')")
+    assert result == [("dad1",)]
+
+
+def test_death_description_contains(db):
+    # The same query as test_death_description_like, spelled as a plain
+    # substring test instead of a hand-written LIKE pattern.
+    result = run(db, "Person", "'accident' in death.description")
     assert result == [("dad1",)]
 
 

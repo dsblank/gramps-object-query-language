@@ -33,6 +33,7 @@ A few symbols you'll see over and over:
 | `>`, `>=` | is greater than / is greater than or equal to (later, bigger) |
 | `and`  | both things must be true |
 | `in [ ... ]` | matches any one of a list of values |
+| `'text' in field` | matches if `field` contains `'text'` anywhere in it |
 | `like(field, 'pattern')` | matches a text pattern, where `%` stands for "anything" |
 
 Text values go in single quotes (`'Smith'`); numbers don't (`1968`).
@@ -81,6 +82,18 @@ The `%` means "anything can follow" -- so this matches John, Jane, James,
 Julia, and so on. (Use `like(field, '%son')` to match names *ending* in
 "son" instead.)
 
+### Goal: Find everyone whose name contains "an" anywhere in it
+
+```
+Person "'an' in given_name"
+```
+
+Unlike `like(...)`, you don't need to add any `%` signs -- `'an' in
+given_name` already means "anywhere in the name," and matches Jane,
+Alexander, Susan, and so on. If the text you're searching for happens to
+contain a `%` or `_` itself (say, a note that literally says "50% off"),
+it's still matched as plain text, not treated as a special pattern.
+
 ### Goal: Find everyone born on or after January 1, 1968
 
 ```
@@ -105,10 +118,13 @@ left out, without needing a special "is alive" check.
 
 ```
 Person "like(death.description, '%accident%')"
+Person "'accident' in death.description"
 ```
 
 `death` reaches the whole death record, not just its date -- any detail
 recorded there, like a description of what happened, can be searched too.
+Both lines above find the same people; the second is just the plainer way
+to write "contains" without needing to add the `%` signs yourself.
 
 ### Goal: Find everyone born in Chicago
 

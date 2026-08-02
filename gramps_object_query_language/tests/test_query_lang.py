@@ -138,6 +138,34 @@ def test_in_operator_rejects_non_list_rhs():
         parse_expr("person", "gender in (1, 2)")  # tuple, not list
 
 
+def test_contains_operator():
+    result = parse_expr("person", "'Jan' in given_name")
+    assert result == [{"column": "given_name", "op": "contains", "value": "Jan"}]
+
+
+def test_contains_operator_on_json_path():
+    result = parse_expr("person", "'accident' in death.description")
+    assert result == [
+        {
+            "column": {"json_path": ["death", "description"]},
+            "op": "contains",
+            "value": "accident",
+        }
+    ]
+
+
+def test_contains_operator_rejects_non_string_literal_lhs():
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "5 in given_name")
+
+
+def test_contains_operator_rejects_field_on_both_sides():
+    # Field-vs-field isn't supported for "contains" -- only a literal
+    # substring on the left.
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "given_name in surname")
+
+
 def test_like_call():
     result = parse_expr("person", "like(primary_name.first_name, 'Jo%')")
     assert result == [

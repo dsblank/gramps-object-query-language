@@ -688,6 +688,32 @@ class Like(Comparison):
     op = "LIKE"
 
 
+class Contains(Comparison):
+    """WHERE column LIKE '%<value>%' ESCAPE '\\' -- a plain substring test
+    (`'Jan' in given_name`), as opposed to `Like`'s user-authored SQL pattern
+    with real `%`/`_` wildcards. `value` is the literal substring being
+    searched for -- any `%`, `_`, or `\\` it contains is escaped here so it
+    matches literally instead of being reinterpreted as a wildcard.
+    """
+
+    op = "LIKE"
+
+    def compile(
+        self,
+        spec: ObjectTypeSpec,
+        dialect: Optional[Dialect] = None,
+        treeid: Optional[int] = None,
+    ) -> Tuple[str, list]:
+        escaped = (
+            self.value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        pattern = f"%{escaped}%"
+        column_sql, column_params = _render_column(
+            self.column, spec, dialect, value=pattern, treeid=treeid
+        )
+        return f"{column_sql} LIKE ? ESCAPE '\\'", column_params + [pattern]
+
+
 class In:
     """WHERE column IN (values...)."""
 
