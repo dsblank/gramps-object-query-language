@@ -77,7 +77,7 @@ supports today:
 from __future__ import annotations
 
 import ast
-from typing import Any, List, Union
+from typing import Any, List, Tuple, Union
 
 from gramps.gen.datehandler import parser as _date_parser
 from gramps.gen.lib import Citation, Note, Person
@@ -93,7 +93,18 @@ from .query import (
     REPOSITORY,
     SOURCE,
     TAG,
+    And,
+    ColumnRef,
+    Eq,
+    Gt,
+    Gte,
+    In,
+    Like,
+    Lt,
+    Lte,
+    Ne,
     ObjectTypeSpec,
+    resolve_column_path,
 )
 
 # Namespace -> ObjectTypeSpec. Both the lowercase form and the actual Gramps
@@ -393,3 +404,80 @@ def parse_expr(namespace: str, expr: str) -> List[dict]:
     """
     spec = resolve_namespace(namespace)
     return parse_expr_for_spec(spec, expr)
+
+
+# --- expr -> query.py AST ----------------------------------------------------
+#
+# `parse_expr`/`parse_expr_for_spec` stop at the JSON wire shape, since that's
+# all `object_query.py`'s `where_expr` request field ever needs. A caller that
+# wants to actually *run* a where-expression string (this module's tests, the
+# docs, or any standalone/library use with a real `db` connection) needs that
+# JSON turned into `query.py`'s `Eq`/`And`/`RelatedObject`-based AST instead --
+# `compile_expr`/`compile_expr_for_spec` are that bridge, built entirely out of
+# `query.py`'s own exported pieces (no new AST shape of its own).
+
+_OP_CLASSES: dict[str, type] = {
+    "eq": Eq,
+    "ne": Ne,
+    "lt": Lt,
+    "lte": Lte,
+    "gt": Gt,
+    "gte": Gte,
+}
+
+
+def _json_column_to_ref(column: Union[str, dict], spec: ObjectTypeSpec) -> ColumnRef:
+    """A wire-format column reference (plain string or `{"json_path": [...]}`),
+    resolved to a `ColumnRef` -- via `resolve_column_path`, so a path crossing
+    a relationship (`{"json_path": ["birth", "date", "sortval"]}`) becomes a
+    `RelatedObject` the same way it would coming from `object_query.py`, not a
+    literal `JsonPath(("birth", "date", "sortval"))` that would (harmlessly,
+    but incorrectly) look for a `birth` key inside `json_data` instead.
+    """
+    if isinstance(column, str):
+        return column
+    return resolve_column_path(spec, column["json_path"])
+
+
+def _condition_from_json(condition: dict, spec: ObjectTypeSpec) -> Any:
+    """One `parse_expr`-shaped condition dict, translated to a `query.py`
+    comparison object (`Eq`, `Lt`, `In`, `Like`, ...)."""
+    column = _json_column_to_ref(condition["column"], spec)
+    op = condition["op"]
+    if op == "in":
+        return In(column, condition["value"])
+    if op == "like":
+        return Like(column, condition["value"])
+    if "value_column" in condition:
+        # Field-vs-field, e.g. "mother.death.date.sortval < father.death.date.sortval".
+        value = _json_column_to_ref(condition["value_column"], spec)
+    else:
+        value = condition["value"]
+    return _OP_CLASSES[op](column, value)
+
+
+def compile_expr_for_spec(spec: ObjectTypeSpec, expr: str) -> Any:
+    """Parse and translate a where-expression string into a `query.py` `where`
+    AST (a single comparison, or an `And` of them), ready for `compile_query`/
+    `compile_count_query`. For callers that already have `spec` -- see
+    `parse_expr_for_spec`.
+    """
+    conditions = parse_expr_for_spec(spec, expr)
+    asts = [_condition_from_json(condition, spec) for condition in conditions]
+    return asts[0] if len(asts) == 1 else And(*asts)
+
+
+def compile_expr(namespace: str, expr: str) -> Tuple[ObjectTypeSpec, Any]:
+    """Parse and translate a where-expression string into `(spec, where)`,
+    ready to pass straight to `compile_query(spec, Query(where=where), ...)`.
+
+    >>> spec, where = compile_expr("person", "gender == 1")
+    >>> where
+    Eq('gender', 1)
+
+    Field-vs-field paths on both sides of a comparison work the same way
+    `object_query.py` resolves them -- e.g. `"mother.death.date.sortval <
+    father.death.date.sortval"` becomes `Lt(RelatedObject(...), RelatedObject(...))`.
+    """
+    spec = resolve_namespace(namespace)
+    return spec, compile_expr_for_spec(spec, expr)

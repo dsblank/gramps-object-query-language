@@ -23,10 +23,21 @@ import pytest
 
 from gramps_object_query_language.query_lang import (
     QueryLangError,
+    compile_expr,
+    compile_expr_for_spec,
     parse_expr,
     resolve_namespace,
 )
-from gramps_object_query_language.query import PERSON, FAMILY
+from gramps_object_query_language.query import (
+    PERSON,
+    FAMILY,
+    And,
+    Eq,
+    Gte,
+    JsonPath,
+    Lt,
+    RelatedObject,
+)
 
 
 # --- namespace resolution -----------------------------------------------------
@@ -585,3 +596,62 @@ def test_field_vs_field_lhs_and_rhs_paths_combined_with_and():
         "op": "eq",
         "value": 1,
     }
+
+
+# --- compile_expr / compile_expr_for_spec (expr string -> query.py AST) ------
+
+
+def test_compile_expr_plain_column():
+    spec, where = compile_expr("person", "gender == Person.MALE")
+    assert spec is PERSON
+    assert where == Eq("gender", 1)
+
+
+def test_compile_expr_for_spec_matches_compile_expr():
+    spec, where = compile_expr("person", "gender == 1")
+    assert compile_expr_for_spec(PERSON, "gender == 1") == where
+
+
+def test_compile_expr_json_path_not_a_relationship():
+    _, where = compile_expr("person", "primary_name.surname_list[0].surname == 'Smith'")
+    assert where == Eq(
+        JsonPath(("primary_name", "surname_list", 0, "surname")), "Smith"
+    )
+
+
+def test_compile_expr_relationship_path_becomes_related_object():
+    _, where = compile_expr("person", "birth.date.sortval >= 2439857")
+    assert isinstance(where, Gte)
+    assert isinstance(where.column, RelatedObject)
+    assert where.column.name == "birth"
+
+
+def test_compile_expr_field_vs_field_relationship_paths():
+    _, where = compile_expr(
+        "family", "mother.death.date.sortval < father.death.date.sortval"
+    )
+    assert isinstance(where, Lt)
+    assert isinstance(where.column, RelatedObject) and where.column.name == "mother"
+    assert isinstance(where.value, RelatedObject) and where.value.name == "father"
+
+
+def test_compile_expr_multiple_conditions_become_and():
+    _, where = compile_expr("person", "gender == Person.MALE and surname == 'Smith'")
+    assert isinstance(where, And)
+    assert where.exprs == (Eq("gender", 1), Eq("surname", "Smith"))
+
+
+def test_compile_expr_end_to_end_sqlite_execution():
+    import sqlite3
+
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE person (handle TEXT, gender INTEGER, surname TEXT)")
+    conn.execute("INSERT INTO person VALUES ('p1', 1, 'Smith')")
+    conn.execute("INSERT INTO person VALUES ('p2', 2, 'Smith')")
+
+    spec, where = compile_expr("person", "gender == Person.MALE")
+    sql, params = compile_query(spec, Query(select=["handle"], where=where), dialect=Dialect.SQLITE)
+    rows = conn.execute(sql, params).fetchall()
+    assert rows == [("p1",)]
