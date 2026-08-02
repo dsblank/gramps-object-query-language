@@ -35,14 +35,17 @@ from gramps.gen.dbstate import DbState
 from gramps.gen.lib import (
     Attribute,
     ChildRef,
+    Citation,
     Event,
     EventType,
     Family,
     Name,
     Note,
     Person,
+    PersonRef,
     Place,
     PlaceName,
+    Source,
     Surname,
 )
 from gramps.gen.proxy import PrivateProxyDb
@@ -54,6 +57,7 @@ from gramps_object_query_language.evaluator import (
     resolve_column_ref,
 )
 from gramps_object_query_language.query import (
+    CITATION,
     FAMILY,
     PERSON,
     PLACE,
@@ -655,3 +659,66 @@ def test_proxy_where_oracle_cannot_confirm_masked_value(db_handles, proxy):
 
     assert evaluate_where(proxy, proxied_person, Eq(ref, "SECRET-ATTR-VALUE"), PERSON) is False
     assert evaluate_where(proxy, proxied_person, Eq(ref, "totally-wrong-guess"), PERSON) is False
+
+
+# --- Expanded Collection registry / Citation.source -----------------------
+#
+# The full registry is verified exhaustively (against resolve_collection
+# directly) in test_query.py -- these confirm the evaluator side, which
+# needed no per-collection code of its own (resolve_column_ref/_evaluate_tri
+# are already fully generic), still resolves a newly-registered collection
+# correctly, and in particular that the self-referencing one
+# (Person.associations -> Person) works without the SQL-side table-name
+# aliasing concern -- pure Python object fetches have no such collision.
+
+
+@pytest.fixture(scope="module")
+def assoc_db_handles():
+    dbman = CLIDbManager(DbState())
+    dirpath, db_name = dbman.create_new_db_cli("_test_evaluator_assoc", dbid="sqlite")
+    db = make_database("sqlite")
+    db.load(dirpath)
+
+    handles = {}
+    with DbTxn("setup", db) as trans:
+        bob = Person()
+        bob.set_primary_name(_name("Bob", "Jones"))
+        handles["bob"] = db.add_person(bob, trans)
+
+        alice = Person()
+        alice.set_primary_name(_name("Alice", "Smith"))
+        ref = PersonRef()
+        ref.set_reference_handle(handles["bob"])
+        alice.add_person_ref(ref)
+        handles["alice"] = db.add_person(alice, trans)
+
+        source = Source()
+        source.set_title("Census Records")
+        handles["source"] = db.add_source(source, trans)
+
+        citation = Citation()
+        citation.set_reference_handle(handles["source"])
+        handles["citation"] = db.add_citation(citation, trans)
+
+    yield db, handles
+
+    db.close()
+    dbman.remove_database(db_name)
+
+
+def test_evaluate_where_associations_self_reference(assoc_db_handles):
+    db, handles = assoc_db_handles
+    alice = db.get_person_from_handle(handles["alice"])
+    bob = db.get_person_from_handle(handles["bob"])
+    associations = resolve_collection(PERSON, "associations")
+    condition = Eq("given_name", "Bob")
+    assert evaluate_where(db, alice, Exists(associations, condition), PERSON) is True
+    assert evaluate_where(db, bob, Exists(associations, condition), PERSON) is False
+
+
+def test_evaluate_where_citation_source_relationship(assoc_db_handles):
+    db, handles = assoc_db_handles
+    citation = db.get_citation_from_handle(handles["citation"])
+    ref = resolve_column_path(CITATION, ["source", "title"])
+    assert resolve_column_ref(db, citation, ref, CITATION) == "Census Records"
+    assert evaluate_where(db, citation, Eq(ref, "Census Records"), CITATION) is True

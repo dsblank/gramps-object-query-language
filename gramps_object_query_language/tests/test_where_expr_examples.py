@@ -526,6 +526,56 @@ def test_count_children_gender_condition_readme_example():
     assert result == [("two-sons",)]
 
 
+# --- Collections registered on other types, and self-reference ---------------
+
+
+def test_citation_source_relationship_doc_example():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE citation (handle TEXT, source_handle TEXT)")
+    conn.execute("CREATE TABLE source (handle TEXT, title TEXT)")
+    conn.execute("INSERT INTO source VALUES ('src1', 'Census Records')")
+    conn.execute("INSERT INTO source VALUES ('src2', 'Parish Register')")
+    conn.execute("INSERT INTO citation VALUES ('c1', 'src1')")
+    conn.execute("INSERT INTO citation VALUES ('c2', 'src2')")
+
+    result = run(conn, "Citation", "source.title == 'Census Records'")
+    assert result == [("c1",)]
+
+
+def test_exists_citations_confidence_doc_example():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE person (handle TEXT, json_data TEXT)")
+    conn.execute("CREATE TABLE citation (handle TEXT, confidence INTEGER)")
+    conn.execute("INSERT INTO citation VALUES ('c-high', 3)")  # CONF_HIGH
+    conn.execute("INSERT INTO citation VALUES ('c-low', 1)")  # CONF_LOW
+    conn.execute(
+        "INSERT INTO person VALUES ('well-sourced', ?)",
+        (json.dumps({"citation_list": ["c-high"]}),),
+    )
+    conn.execute(
+        "INSERT INTO person VALUES ('poorly-sourced', ?)",
+        (json.dumps({"citation_list": ["c-low"]}),),
+    )
+
+    result = run(conn, "Person", "exists(citations, confidence >= Citation.CONF_HIGH)")
+    assert result == [("well-sourced",)]
+
+
+def test_exists_associations_self_reference_doc_example():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE person (handle TEXT, given_name TEXT, json_data TEXT)")
+    conn.execute(
+        "INSERT INTO person VALUES ('alice', 'Alice', ?)",
+        (json.dumps({"person_ref_list": [{"ref": "bob"}]}),),
+    )
+    conn.execute(
+        "INSERT INTO person VALUES ('bob', 'Bob', ?)", (json.dumps({"person_ref_list": []}),)
+    )
+
+    result = run(conn, "Person", "exists(associations, given_name == 'Bob')")
+    assert result == [("alice",)]
+
+
 # --- constants on other types (Citation.CONF_HIGH) ---------------------------
 
 

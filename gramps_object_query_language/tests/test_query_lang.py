@@ -1232,3 +1232,83 @@ def test_compile_expr_end_to_end_sqlite_execution():
     sql, params = compile_query(spec, Query(select=["handle"], where=where), dialect=Dialect.SQLITE)
     rows = conn.execute(sql, params).fetchall()
     assert rows == [("p1",)]
+
+
+# --- Expanded Collection registry / Citation.source, parser-level smoke tests --
+#
+# The full inventory of registered collections is tested exhaustively in
+# test_query.py (against resolve_collection directly) -- these confirm the
+# parser needs no per-collection knowledge of its own to pick up new
+# registry entries, the same way it already needed none for children/notes.
+
+
+def test_exists_with_newly_registered_collection():
+    result = parse_expr("person", "exists(citations, confidence >= Citation.CONF_HIGH)")
+    assert result == [
+        {
+            "exists": {
+                "relationship": "citations",
+                "where": [{"column": "confidence", "op": "gte", "value": 3}],
+            }
+        }
+    ]
+
+
+def test_count_with_newly_registered_collection():
+    result = parse_expr("family", "count(events) > 0")
+    assert result == [
+        {"column": {"count_of": {"relationship": "events"}}, "op": "gt", "value": 0}
+    ]
+
+
+def test_self_referencing_collection_parses():
+    result = parse_expr("person", "not exists(associations)")
+    assert result == [{"not": {"exists": {"relationship": "associations"}}}]
+
+
+def test_citation_source_relationship_reference():
+    result = parse_expr("citation", "source.title == 'Census Records'")
+    assert result == [
+        {
+            "column": {"json_path": ["source", "title"]},
+            "op": "eq",
+            "value": "Census Records",
+        }
+    ]
+
+
+def test_compile_expr_citation_source_end_to_end_sqlite_execution():
+    import sqlite3
+
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE citation (handle TEXT, source_handle TEXT)")
+    conn.execute("CREATE TABLE source (handle TEXT, title TEXT)")
+    conn.execute("INSERT INTO source VALUES ('src1', 'Census Records')")
+    conn.execute("INSERT INTO citation VALUES ('c1', 'src1')")
+
+    spec, where = compile_expr("citation", "source.title == 'Census Records'")
+    sql, params = compile_query(spec, Query(select=["handle"], where=where), dialect=Dialect.SQLITE)
+    assert conn.execute(sql, params).fetchall() == [("c1",)]
+
+
+def test_compile_expr_self_referencing_collection_end_to_end_sqlite_execution():
+    import json
+    import sqlite3
+
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE person (handle TEXT, given_name TEXT, json_data TEXT)")
+    conn.execute(
+        "INSERT INTO person VALUES ('alice', 'Alice', ?)",
+        (json.dumps({"person_ref_list": [{"ref": "bob"}]}),),
+    )
+    conn.execute(
+        "INSERT INTO person VALUES ('bob', 'Bob', ?)", (json.dumps({"person_ref_list": []}),)
+    )
+
+    spec, where = compile_expr("person", "exists(associations, given_name == 'Bob')")
+    sql, params = compile_query(spec, Query(select=["handle"], where=where), dialect=Dialect.SQLITE)
+    assert conn.execute(sql, params).fetchall() == [("alice",)]

@@ -355,6 +355,34 @@ Family "count(children, gender == Person.MALE) > 1"
 Adding a condition (the same kind of condition `exists(...)` takes) counts
 only the children who match it -- here, only the sons.
 
+### Goal: Find people with a well-sourced record
+
+```
+Person "exists(citations, confidence >= Citation.CONF_HIGH)"
+```
+
+`exists(children, ...)`/`count(children, ...)` aren't the only collections
+recorded per-person -- `notes`, `citations`, `media`, and `tags` are
+available the same way on almost every record type, plus a few more
+specific to each type: a person's `families` (as a spouse), `parent_families`
+(as a child), `associations` (links to other people), and `events` (every
+recorded event, not just birth/death).
+
+### Goal: Find people linked to someone named Bob via an association
+
+```
+Person "exists(associations, given_name == 'Bob')"
+```
+
+### Goal: Find citations for a specific source
+
+```
+Citation "source.title == 'Census Records'"
+```
+
+`source` reaches from a citation to the source it cites -- works just like
+`father`/`mother` reaching from a family to a parent.
+
 ## Things this can't do (yet)
 
 - Anything beyond the patterns shown above -- this is a small, fixed set of

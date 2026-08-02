@@ -22,12 +22,16 @@
 import pytest
 
 from gramps_object_query_language.query import (
+    CITATION,
     EVENT,
     FAMILY,
     MEDIA,
     NOTE,
     PERSON,
     PLACE,
+    REPOSITORY,
+    SOURCE,
+    TAG,
     And,
     Collection,
     CollectionCount,
@@ -1150,8 +1154,8 @@ def test_exists_sqlite_shape_with_condition():
         Query(select=["handle"], where=Exists(children, Eq("given_name", "Steve"))),
         dialect=Dialect.SQLITE,
     )
-    assert "EXISTS (SELECT 1 FROM person, json_each(family.json_data, ?) AS je" in sql
-    assert "person.handle = json_extract(je.value, '$.ref')" in sql
+    assert "EXISTS (SELECT 1 FROM person AS person__target, json_each(family.json_data, ?) AS je" in sql
+    assert "person__target.handle = json_extract(je.value, '$.ref')" in sql
     assert "given_name IS NOT DISTINCT FROM ?" in sql
     assert params == ["$.child_ref_list", "Steve", 50]
 
@@ -1162,8 +1166,8 @@ def test_exists_sqlite_shape_no_condition():
     sql, params = compile_query(
         FAMILY, Query(select=["handle"], where=Exists(children)), dialect=Dialect.SQLITE
     )
-    assert "EXISTS (SELECT 1 FROM person, json_each(family.json_data, ?) AS je" in sql
-    assert "person.handle = json_extract(je.value, '$.ref'))" in sql
+    assert "EXISTS (SELECT 1 FROM person AS person__target, json_each(family.json_data, ?) AS je" in sql
+    assert "person__target.handle = json_extract(je.value, '$.ref'))" in sql
     assert params == ["$.child_ref_list", 50]
 
 
@@ -1177,7 +1181,7 @@ def test_exists_postgresql_shape_ref_object_list():
     assert (
         "jsonb_array_elements(family.json_data::jsonb -> 'child_ref_list') AS je(value)" in sql
     )
-    assert "person.handle = je.value ->> 'ref'" in sql
+    assert "person__target.handle = je.value ->> 'ref'" in sql
     assert params == ["Steve", 50]
 
 
@@ -1189,7 +1193,7 @@ def test_exists_flat_handle_list_sqlite_shape():
         PERSON, Query(select=["handle"], where=Exists(notes)), dialect=Dialect.SQLITE
     )
     assert "json_each(person.json_data, ?) AS je" in sql
-    assert "note.handle = je.value" in sql
+    assert "note__target.handle = je.value" in sql
     assert "json_extract(je.value" not in sql
     assert params == ["$.note_list", 50]
 
@@ -1202,7 +1206,7 @@ def test_exists_flat_handle_list_postgresql_shape():
     assert (
         "jsonb_array_elements_text(person.json_data::jsonb -> 'note_list') AS je(value)" in sql
     )
-    assert "note.handle = je.value" in sql
+    assert "note__target.handle = je.value" in sql
     assert params == [50]
 
 
@@ -1214,7 +1218,7 @@ def test_exists_treeid_scoping():
         dialect=Dialect.SQLITE,
         treeid=7,
     )
-    assert "person.treeid = ?" in sql
+    assert "person__target.treeid = ?" in sql
     # the EXISTS subquery's own treeid clause, plus the outer query's own.
     assert sql.count("treeid = ?") == 2
     assert params == ["$.child_ref_list", "Steve", 7, 7, 50]
@@ -1338,8 +1342,8 @@ def test_collection_count_sqlite_shape_with_condition():
         Query(select=["handle"], where=Gt(CollectionCount(children, Eq("gender", 1)), 1)),
         dialect=Dialect.SQLITE,
     )
-    assert "(SELECT COUNT(*) FROM person, json_each(family.json_data, ?) AS je" in sql
-    assert "person.handle = json_extract(je.value, '$.ref')" in sql
+    assert "(SELECT COUNT(*) FROM person AS person__target, json_each(family.json_data, ?) AS je" in sql
+    assert "person__target.handle = json_extract(je.value, '$.ref')" in sql
     assert "gender IS NOT DISTINCT FROM ?" in sql
     assert ") > ?" in sql
     assert params == ["$.child_ref_list", 1, 1, 50]
@@ -1352,8 +1356,8 @@ def test_collection_count_sqlite_shape_no_condition():
         Query(select=["handle"], where=Gt(CollectionCount(children), 2)),
         dialect=Dialect.SQLITE,
     )
-    assert "(SELECT COUNT(*) FROM person, json_each(family.json_data, ?) AS je" in sql
-    assert "person.handle = json_extract(je.value, '$.ref'))" in sql
+    assert "(SELECT COUNT(*) FROM person AS person__target, json_each(family.json_data, ?) AS je" in sql
+    assert "person__target.handle = json_extract(je.value, '$.ref'))" in sql
     assert params == ["$.child_ref_list", 2, 50]
 
 
@@ -1365,8 +1369,8 @@ def test_collection_count_postgresql_shape():
         dialect=Dialect.POSTGRESQL,
     )
     assert (
-        "(SELECT COUNT(*) FROM person, jsonb_array_elements(family.json_data::jsonb -> "
-        "'child_ref_list') AS je(value) WHERE person.handle = je.value ->> 'ref')" in sql
+        "(SELECT COUNT(*) FROM person AS person__target, jsonb_array_elements(family.json_data::jsonb -> "
+        "'child_ref_list') AS je(value) WHERE person__target.handle = je.value ->> 'ref')" in sql
     )
     assert params == [2, 50]
 
@@ -1376,7 +1380,7 @@ def test_collection_count_flat_handle_list_sqlite_shape():
     sql, params = compile_query(
         PERSON, Query(select=["handle"], where=Gt(CollectionCount(notes), 0)), dialect=Dialect.SQLITE
     )
-    assert "note.handle = je.value" in sql
+    assert "note__target.handle = je.value" in sql
     assert "json_extract(je.value" not in sql
     assert params == ["$.note_list", 0, 50]
 
@@ -1389,7 +1393,7 @@ def test_collection_count_treeid_scoping():
         dialect=Dialect.SQLITE,
         treeid=7,
     )
-    assert "person.treeid = ?" in sql
+    assert "person__target.treeid = ?" in sql
     assert sql.count("treeid = ?") == 2
     assert params == ["$.child_ref_list", 1, 7, 1, 7, 50]
 
@@ -1450,3 +1454,180 @@ def test_collection_count_end_to_end_sqlite_execution():
         dialect=Dialect.SQLITE,
     )
     assert conn.execute(sql, params).fetchall() == [("fam-3kids",)]
+
+
+# --- Expanded Collection registry (all ten primary types) ---------------------
+#
+# `children`/`notes` proved out the two `Collection` shapes (ref-object list
+# needing `.ref` extraction, flat handle list already the handle) against
+# every base class Gramps core actually uses (`NoteBase`/`CitationBase`/
+# `MediaBase`/`TagBase`, plus each type's own one-off lists) -- confirmed
+# against `gramps/gen/lib/*.py`'s real class hierarchy, not guessed from
+# naming. This section registers the rest and locks in the full inventory.
+
+# (table, collection name) -> (target spec, json key, ref_field)
+_EXPECTED_COLLECTIONS = {
+    (PERSON, "notes"): (NOTE, "note_list", None),
+    (PERSON, "citations"): (CITATION, "citation_list", None),
+    (PERSON, "media"): (MEDIA, "media_list", "ref"),
+    (PERSON, "tags"): (TAG, "tag_list", None),
+    (PERSON, "families"): (FAMILY, "family_list", None),
+    (PERSON, "parent_families"): (FAMILY, "parent_family_list", None),
+    (PERSON, "associations"): (PERSON, "person_ref_list", "ref"),
+    (PERSON, "events"): (EVENT, "event_ref_list", "ref"),
+    (FAMILY, "children"): (PERSON, "child_ref_list", "ref"),
+    (FAMILY, "notes"): (NOTE, "note_list", None),
+    (FAMILY, "citations"): (CITATION, "citation_list", None),
+    (FAMILY, "media"): (MEDIA, "media_list", "ref"),
+    (FAMILY, "tags"): (TAG, "tag_list", None),
+    (FAMILY, "events"): (EVENT, "event_ref_list", "ref"),
+    (EVENT, "notes"): (NOTE, "note_list", None),
+    (EVENT, "citations"): (CITATION, "citation_list", None),
+    (EVENT, "media"): (MEDIA, "media_list", "ref"),
+    (EVENT, "tags"): (TAG, "tag_list", None),
+    (PLACE, "notes"): (NOTE, "note_list", None),
+    (PLACE, "citations"): (CITATION, "citation_list", None),
+    (PLACE, "media"): (MEDIA, "media_list", "ref"),
+    (PLACE, "tags"): (TAG, "tag_list", None),
+    (PLACE, "enclosing_places"): (PLACE, "placeref_list", "ref"),
+    (SOURCE, "notes"): (NOTE, "note_list", None),
+    (SOURCE, "media"): (MEDIA, "media_list", "ref"),
+    (SOURCE, "tags"): (TAG, "tag_list", None),
+    (SOURCE, "repositories"): (REPOSITORY, "reporef_list", "ref"),
+    (CITATION, "notes"): (NOTE, "note_list", None),
+    (CITATION, "media"): (MEDIA, "media_list", "ref"),
+    (CITATION, "tags"): (TAG, "tag_list", None),
+    (REPOSITORY, "notes"): (NOTE, "note_list", None),
+    (REPOSITORY, "tags"): (TAG, "tag_list", None),
+    (MEDIA, "notes"): (NOTE, "note_list", None),
+    (MEDIA, "citations"): (CITATION, "citation_list", None),
+    (MEDIA, "tags"): (TAG, "tag_list", None),
+    (NOTE, "tags"): (TAG, "tag_list", None),
+}
+
+
+@pytest.mark.parametrize("spec_and_name,expected", list(_EXPECTED_COLLECTIONS.items()))
+def test_expanded_collection_registry_shapes(spec_and_name, expected):
+    spec, name = spec_and_name
+    target, key, ref_field = expected
+    collection = resolve_collection(spec, name)
+    assert collection.target is target
+    assert collection.list_path == JsonPath((key,))
+    assert collection.ref_field == ref_field
+
+
+def test_expanded_collection_registry_exhaustive():
+    # Every table's registered names match _EXPECTED_COLLECTIONS exactly --
+    # catches an accidental extra/missing registration that a per-name test
+    # above wouldn't (it only checks names it's told to look for).
+    import gramps_object_query_language.query as query_module
+
+    actual = {
+        (spec, name)
+        for table, names in query_module._COLLECTIONS.items()
+        for spec in [
+            {
+                PERSON.table: PERSON,
+                FAMILY.table: FAMILY,
+                EVENT.table: EVENT,
+                PLACE.table: PLACE,
+                SOURCE.table: SOURCE,
+                CITATION.table: CITATION,
+                REPOSITORY.table: REPOSITORY,
+                MEDIA.table: MEDIA,
+                NOTE.table: NOTE,
+            }[table]
+        ]
+        for name in names
+    }
+    assert actual == set(_EXPECTED_COLLECTIONS)
+
+
+def test_tag_has_no_collections_registered():
+    # Tag is the one primary type with no note_list/citation_list/media_list/
+    # tag_list of its own (a tag doesn't tag itself) and no other one-to-many
+    # field -- confirm it's absent from the registry entirely, not just empty.
+    import gramps_object_query_language.query as query_module
+
+    assert TAG.table not in query_module._COLLECTIONS
+
+
+# --- Citation.source (one-to-one, Citation -> Source) --------------------------
+
+
+def test_citation_source_relationship_shape():
+    ref = resolve_column_path(CITATION, ["source", "title"])
+    assert isinstance(ref, RelatedObject)
+    assert ref.name == "source"
+    assert ref.target is SOURCE
+    assert ref.handle_ref == "source_handle"
+    assert ref.field == "title"
+
+
+def test_citation_source_end_to_end_sqlite_execution():
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE citation (handle TEXT, source_handle TEXT)")
+    conn.execute("CREATE TABLE source (handle TEXT, title TEXT)")
+    conn.execute("INSERT INTO source VALUES ('src1', 'Census Records')")
+    conn.execute("INSERT INTO source VALUES ('src2', 'Church Records')")
+    conn.execute("INSERT INTO citation VALUES ('c1', 'src1')")
+    conn.execute("INSERT INTO citation VALUES ('c2', 'src2')")
+
+    source_title = resolve_column_path(CITATION, ["source", "title"])
+    sql, params = compile_query(
+        CITATION,
+        Query(select=["handle"], where=Eq(source_title, "Census Records")),
+        dialect=Dialect.SQLITE,
+    )
+    assert conn.execute(sql, params).fetchall() == [("c1",)]
+
+
+# --- Self-referencing Collection (Person.associations -> Person) --------------
+#
+# The one registered collection whose target table is the *same* as the
+# outer table -- exposed a real bug (see `_collection_subquery_body`'s
+# docstring in query.py): without aliasing the target row, the subquery's
+# own `FROM person AS ...` reintroduces the bare `person` name already bound
+# to the outer, correlated row, silently breaking correlation. These are the
+# regression tests for that fix.
+
+
+def test_associations_self_reference_sqlite_end_to_end():
+    import json
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE person (handle TEXT, given_name TEXT, json_data TEXT)")
+    conn.execute(
+        "INSERT INTO person VALUES ('alice', 'Alice', ?)",
+        (json.dumps({"person_ref_list": [{"ref": "bob"}]}),),
+    )
+    conn.execute(
+        "INSERT INTO person VALUES ('bob', 'Bob', ?)", (json.dumps({"person_ref_list": []}),)
+    )
+
+    associations = resolve_collection(PERSON, "associations")
+    sql, params = compile_query(
+        PERSON,
+        Query(select=["handle"], where=Exists(associations, Eq("given_name", "Bob"))),
+        dialect=Dialect.SQLITE,
+    )
+    assert conn.execute(sql, params).fetchall() == [("alice",)]
+
+
+def test_associations_self_reference_postgresql_shape():
+    # Same aliasing fix, PostgreSQL rendering -- both branches of
+    # _collection_subquery_body go through the same target_alias.
+    associations = resolve_collection(PERSON, "associations")
+    sql, params = compile_query(
+        PERSON,
+        Query(select=["handle"], where=Exists(associations, Eq("given_name", "Bob"))),
+        dialect=Dialect.POSTGRESQL,
+    )
+    assert "person AS person__target" in sql
+    assert "person__target.handle = je.value ->> 'ref'" in sql
+    # the outer correlation (person.json_data) must still reference the
+    # *unaliased* outer table, not the newly-introduced target alias.
+    assert "person.json_data::jsonb -> 'person_ref_list'" in sql

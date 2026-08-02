@@ -23,25 +23,25 @@ does today.
   (docs/where_expr.md)
 
 **Relationships**
-- Only five one-to-one relationship links are registered: `Person` ->
-  `birth`/`death` (-> `Event`), `Family` -> `father`/`mother` (-> `Person`),
-  `Event` -> `place` (-> `Place`). Anything else one-to-one -- a person's
-  other (non-birth/death) events, a citation's source, ... -- has no
+- Six one-to-one relationship links are registered: `Person` -> `birth`/
+  `death` (-> `Event`), `Family` -> `father`/`mother` (-> `Person`), `Event`
+  -> `place` (-> `Place`), `Citation` -> `source` (-> `Source`). Anything
+  else one-to-one -- a person's other (non-birth/death) events -- has no
   relationship path at all yet, only whatever's reachable as a JSON path
   within one record's own `json_data`.
-- Two one-to-many **collections** are registered, queryable via
-  `exists(name, condition)`/`count(name, condition)` (see `docs/where_expr.md`'s
-  "One-to-many relationships"/"Counting a collection" sections): `Family` ->
-  `children` (-> `Person`, via `child_ref_list`) and `Person` -> `notes`
-  (-> `Note`, via `note_list`). Everything else one-to-many -- a family's/
-  person's other event refs, citations, sources, media, tags, associations
-  (`person_ref_list`) -- has no collection registered yet; see "More
-  relationships" under Possibilities below. There's still no `len()` over a
-  plain intra-record JSON array (`primary_name.surname_list`, not a
-  registered `Collection`), no `any(...)` over one either, and no way for an
-  `exists(...)`/`count(...)` condition to reference the *outer* row (e.g. "a
-  child with the same surname as the father") -- all three flagged as
-  follow-ups, not solved here.
+- One-to-many **collections** are registered on every type Gramps' own
+  object model gives one to, queryable via `exists(name, condition)`/
+  `count(name, condition)` (see `docs/where_expr.md`'s "One-to-many
+  relationships"/"Counting a collection" sections and its full collections
+  table): `notes`/`citations`/`media`/`tags` wherever the type has them,
+  plus `Person.families`/`parent_families`/`associations`/`events`,
+  `Family.children`/`events`, `Place.enclosing_places`,
+  `Source.repositories`. `Tag` alone has no collections at all. There's
+  still no `len()` over a plain intra-record JSON array
+  (`primary_name.surname_list`, not a registered `Collection`), no `any(...)`
+  over one either, and no way for an `exists(...)`/`count(...)` condition to
+  reference the *outer* row (e.g. "a child with the same surname as the
+  father") -- all three still flagged as follow-ups, not solved here.
 
 **Values and functions**
 - Only two whitelisted function-call forms exist: `like(field, 'pattern')`
@@ -220,6 +220,50 @@ the existing value-translation code, pre-`count()`.
 planned one: `COUNT(*)` over zero matching rows is just `0` in SQL, no
 `NULL`/`COALESCE` handling needed at all, unlike `json_array_length`'s
 NULL-on-missing-path behavior `len()` will have to work around.
+
+### More relationships/collections (all ten primary types)
+
+Implemented -- registered every remaining `_COLLECTIONS` candidate flagged
+under "Other gaps" in an earlier pass, plus one new one-to-one
+`_RELATIONSHIPS` entry (`Citation.source`), confirming this really was "one
+registry entry each," no new `query.py`/`query_lang.py`/`evaluator.py`
+machinery required. Every field name and shape (flat handle list vs.
+ref-object list needing `.ref`) was verified directly against
+`gramps/gen/lib/*.py`'s real class hierarchy, not assumed from naming --
+e.g. confirming `Source` has no `citation_list` at all (a source doesn't
+cite other citations) and `Repository` has neither `citation_list` nor
+`media_list`, so those are correctly absent from the registry rather than
+present-but-always-empty. `Tag` gets no collections registered at all --
+nothing in Gramps' object model gives a tag its own notes/citations/media/
+tags/etc.
+
+Now registered, per type: `Person` -- `notes`, `citations`, `media`, `tags`,
+`families`, `parent_families`, `associations`, `events`. `Family` -- (already
+had `children`) `notes`, `citations`, `media`, `tags`, `events`. `Event`/
+`Citation`/`Media` -- the applicable subset of `notes`/`citations`/`media`/
+`tags`. `Place` -- that subset plus `enclosing_places`. `Source` -- that
+subset (no `citations`) plus `repositories`. `Repository` -- just `notes`/
+`tags`. `Note` -- just `tags`.
+
+**Found a real bug in the process, not just registered names**: `Person`'s
+new `associations` collection (`Person.person_ref_list` -> `Person`, an
+association with another person) is the first *self-referencing* collection
+-- its target table is the same bare name (`person`) as whatever outer row
+`exists`/`count` is being compiled against. `_collection_subquery_body`'s
+`FROM {target_table}, {source}` unconditionally reintroduced that bare name
+inside the same `FROM` clause `source` already correlates back to the outer
+row through (`json_each(<outer_table>.json_data, ...)`) -- SQL resolves the
+newly-introduced local binding as nearer in scope, silently shadowing the
+outer correlation. Confirmed empirically before diagnosing: `Person
+"exists(associations, ...)"` matched zero rows for every person, even ones
+with a real matching association. Fixed by aliasing the target row
+unconditionally (`{target_table} AS {target_table}__target`), not just when
+a collision is detected -- one code path stays correct regardless of which
+future collection happens to target its own table, rather than needing a
+same-table special case. Existing `children`/`notes` tests (no self-
+reference) needed only a cosmetic SQL-shape-assertion update, not a
+behavior fix -- their target and outer tables were never the same to begin
+with.
 
 ## Possibilities
 
@@ -405,21 +449,14 @@ rendering on top, the one piece neither `count()` nor `len()` needs.
 
 ### Other gaps (not yet scoped to this level of detail)
 
-- **More relationships**:
-  - One-to-one candidates (non-birth/death events, a citation's source, ...)
-    -- mechanically similar to the existing five, a `_RELATIONSHIPS` registry
-    entry each.
-  - One-to-many candidates beyond `children`/`notes` (event refs beyond
-    birth/death, citations, sources, media, tags, `person_ref_list`
-    associations) -- now that `exists(...)`/`Collection` exist (see Done
-    above), each of these is "one `_COLLECTIONS` registry entry," the same
-    low cost the one-to-one candidates already have -- no new machinery
-    needed, just registering more (ref-object-list vs. flat-handle-list, the
-    two shapes already proven).
-  - `exists(...)` condition referencing the *outer* row (e.g. "a child with
-    the same surname as the father") -- not supported; would need the
-    condition's column resolution to see two rows (target *and* outer) at
-    once, which nothing here does today.
+- **More one-to-one relationships**: non-birth/death events, and anything
+  else not yet in `_RELATIONSHIPS` -- mechanically similar to the six
+  already there (`Citation.source` was the most recent, see Done above), a
+  registry entry each.
+- **`exists(...)`/`count(...)` condition referencing the *outer* row** (e.g.
+  "a child with the same surname as the father") -- not supported; would
+  need the condition's column resolution to see two rows (target *and*
+  outer) at once, which nothing here does today.
 - **LIKE case-sensitivity parity across dialects** -- smallest fix here:
   render `ILIKE` on PostgreSQL for `like(...)`/substring-`in`, or apply a
   case-insensitive collation. Needs a test that actually runs both dialects

@@ -149,13 +149,14 @@ A field reference is a dotted/indexed path: `gender`, `primary_name.surname_list
 - **A relationship** -- a field name that instead points at a *different*
   object, letting a path cross into it and keep going. Currently registered:
 
-  | On a...  | ...`name` traverses to | via |
-  |----------|------------------------|-----|
-  | `Person` | `birth`  -> `Event`    | the person's birth event |
-  | `Person` | `death`  -> `Event`    | the person's death event |
-  | `Family` | `father` -> `Person`   | `father_handle` |
-  | `Family` | `mother` -> `Person`   | `mother_handle` |
-  | `Event`  | `place`  -> `Place`    | the event's place |
+  | On a...   | ...`name` traverses to | via |
+  |-----------|------------------------|-----|
+  | `Person`  | `birth`  -> `Event`    | the person's birth event |
+  | `Person`  | `death`  -> `Event`    | the person's death event |
+  | `Family`  | `father` -> `Person`   | `father_handle` |
+  | `Family`  | `mother` -> `Person`   | `mother_handle` |
+  | `Event`   | `place`  -> `Place`    | the event's place |
+  | `Citation`| `source` -> `Source`   | `source_handle` |
 
   A relationship name needs something after it (`birth.date`, not just
   `birth`), and chains freely -- `birth.place.title` is `Person` ->
@@ -165,9 +166,10 @@ A field reference is a dotted/indexed path: `gender`, `primary_name.surname_list
   Person "birth.date.sortval >= 2439857"
   Person "birth.place.title == 'Chicago, Cook, Illinois, USA'"
   Family "father.surname == 'Smith'"
+  Citation "source.title == 'Census Records'"
   ```
 
-That's five relationship links registered today, in total -- every example
+That's six relationship links registered today, in total -- every example
 in [Genealogy examples](#genealogy-examples) below exercises at least one of
 them, and several combine two or three at once.
 
@@ -213,15 +215,44 @@ Family "not exists(children, given_name == 'Steve')"
 Family "exists(children)"
 ```
 
-`children`/`notes` are **collection** names -- registered separately from the
-relationship table above, and never usable as a dotted-path segment
-(`children.surname` would be ambiguous: which child?), only as `exists`'s
-first argument. Two are registered today:
+`children`/`notes`/... are **collection** names -- registered separately
+from the relationship table above, and never usable as a dotted-path
+segment (`children.surname` would be ambiguous: which child?), only as
+`exists`'s (or `count`'s, see below) first argument. Registered on every one
+of the ten record types, following Gramps' own object model exactly (a
+`Source` has no `citations` since a source doesn't cite other citations; a
+`Repository` has neither `citations` nor `media`; `Tag` has none at all --
+a tag doesn't tag itself):
 
-| On a...  | ...`name` | reaches | via |
-|----------|-----------|---------|-----|
-| `Family` | `children` -> `Person` | each entry's own record | `child_ref_list` |
-| `Person` | `notes` -> `Note` | each entry's own record | `note_list` |
+| On a...     | ...`name`                    | reaches | via |
+|-------------|-------------------------------|---------|-----|
+| `Person`    | `notes` -> `Note`             | attached notes | `note_list` |
+| `Person`    | `citations` -> `Citation`     | attached citations | `citation_list` |
+| `Person`    | `media` -> `Media`            | attached media | `media_list` |
+| `Person`    | `tags` -> `Tag`               | attached tags | `tag_list` |
+| `Person`    | `families` -> `Family`        | families as a spouse/parent | `family_list` |
+| `Person`    | `parent_families` -> `Family` | families as a child | `parent_family_list` |
+| `Person`    | `associations` -> `Person`    | other people linked via an association | `person_ref_list` |
+| `Person`    | `events` -> `Event`           | every recorded event, not just birth/death | `event_ref_list` |
+| `Family`    | `children` -> `Person`        | the family's children | `child_ref_list` |
+| `Family`    | `notes`/`citations`/`media`/`tags` | (as above) | (as above) |
+| `Family`    | `events` -> `Event`           | family events (marriage, divorce, ...) | `event_ref_list` |
+| `Event`     | `notes`/`citations`/`media`/`tags` | (as above) | (as above) |
+| `Place`     | `notes`/`citations`/`media`/`tags` | (as above) | (as above) |
+| `Place`     | `enclosing_places` -> `Place` | the place(s) this place is inside of | `placeref_list` |
+| `Source`    | `notes`/`media`/`tags`       | (as above) | (as above) |
+| `Source`    | `repositories` -> `Repository` | repositories holding this source | `reporef_list` |
+| `Citation`  | `notes`/`media`/`tags`       | (as above) | (as above) |
+| `Repository`| `notes`/`tags`               | (as above) | (as above) |
+| `Media`     | `notes`/`citations`/`tags`   | (as above) | (as above) |
+| `Note`      | `tags`                       | (as above) | (as above) |
+
+`associations` is the one *self*-referencing collection here (`Person` ->
+`Person`) -- worth knowing only because it's the one case where the SQL
+compiler has to alias the related row's table so it doesn't collide with
+the outer row's own table name; nothing about writing the query itself
+changes, `exists(associations, ...)` reads and behaves exactly like any
+other collection.
 
 `condition` is a second, ordinary `where_expr` -- anything legal as a
 top-level expression is legal here too (`and`/`or`/`not`, chained
@@ -371,6 +402,28 @@ to count every child):
 ```python
 Family "count(children) > 0"
 Family "count(children, given_name == 'Robert') == 1"
+```
+
+**`Citation -> source -> Source`** -- the newest one-to-one relationship
+link, working the same way `father`/`mother`/`place` already do:
+
+```python
+Citation "source.title == 'Census Records'"
+```
+
+**A collection registered on a different type** -- `Citation -> source`
+(one-to-one) combined with `Person -> citations` (one-to-many): people with
+at least one high-confidence citation:
+
+```python
+Person "exists(citations, confidence >= Citation.CONF_HIGH)"
+```
+
+**`associations` (self-referencing)** -- a person linked to another person
+by name, via an association:
+
+```python
+Person "exists(associations, given_name == 'Bob')"
 ```
 
 ## Constants

@@ -269,6 +269,9 @@ _RELATIONSHIPS: dict[str, dict[str, Tuple[ObjectTypeSpec, ColumnRef]]] = {
     EVENT.table: {
         "place": (PLACE, "place"),
     },
+    CITATION.table: {
+        "source": (SOURCE, "source_handle"),
+    },
 }
 
 
@@ -317,19 +320,93 @@ class CollectionCount:
     condition: Optional[Any] = None
 
 
+def _generic_collections(
+    *, notes: bool = False, citations: bool = False, media: bool = False, tags: bool = False
+) -> dict[str, Collection]:
+    """The subset of `note_list`/`citation_list`/`media_list`/`tag_list`
+    a given object type actually has -- these four recur across most of the
+    ten primary types (every type inheriting `NoteBase`/`CitationBase`/
+    `MediaBase`/`TagBase` in Gramps core), but not uniformly: e.g. `Source`
+    has no `citation_list` (a source doesn't cite other citations), and
+    `Repository` has neither `citation_list` nor `media_list`. Each caller
+    below passes only the flags matching what that type's Gramps class
+    actually inherits (verified against `gramps/gen/lib/*.py`, not guessed).
+
+    `note_list`/`citation_list`/`tag_list` are flat handle lists
+    (`ref_field=None`); `media_list` is a list of `MediaRef` objects
+    (`ref_field="ref"`) -- the two `Collection` shapes `children`/`notes`
+    already proved out.
+    """
+    entries: dict[str, Collection] = {}
+    if notes:
+        entries["notes"] = Collection("notes", NOTE, JsonPath(("note_list",)), None)
+    if citations:
+        entries["citations"] = Collection(
+            "citations", CITATION, JsonPath(("citation_list",)), None
+        )
+    if media:
+        entries["media"] = Collection("media", MEDIA, JsonPath(("media_list",)), "ref")
+    if tags:
+        entries["tags"] = Collection("tags", TAG, JsonPath(("tag_list",)), None)
+    return entries
+
+
 # Registry of one-to-many collection roots, keyed by the *current* table --
 # mirrors `_RELATIONSHIPS`'s shape, but for `EXISTS`-style membership tests
-# (see `Exists`) rather than a single correlated scalar subquery. `children`
-# proves the ref-object-list shape (`.ref` extraction); `notes` proves the
-# flat-handle-list shape (no sub-field) -- the two shapes every other
-# candidate collection (event_ref_list, citation_list, media_list, tag_list,
-# person_ref_list, ...) falls into.
+# (see `Exists`) rather than a single correlated scalar subquery.
+#
+# Every entry here is one of exactly two shapes (`children`/`notes` proved
+# both out first): a ref-object list needing `.ref` extraction
+# (`ref_field="ref"` -- `child_ref_list`, `event_ref_list`, `person_ref_list`,
+# `media_list`, `placeref_list`, `reporef_list`), or a flat handle list that's
+# already the handle itself (`ref_field=None` -- `note_list`,
+# `citation_list`, `tag_list`, `family_list`, `parent_family_list`). Adding
+# each was confirmed against the real Gramps object model
+# (`gramps/gen/lib/*.py`'s base classes and field definitions), not assumed
+# from naming alone.
 _COLLECTIONS: dict[str, dict[str, Collection]] = {
+    PERSON.table: {
+        **_generic_collections(notes=True, citations=True, media=True, tags=True),
+        "families": Collection("families", FAMILY, JsonPath(("family_list",)), None),
+        "parent_families": Collection(
+            "parent_families", FAMILY, JsonPath(("parent_family_list",)), None
+        ),
+        "associations": Collection(
+            "associations", PERSON, JsonPath(("person_ref_list",)), "ref"
+        ),
+        "events": Collection("events", EVENT, JsonPath(("event_ref_list",)), "ref"),
+    },
     FAMILY.table: {
         "children": Collection("children", PERSON, JsonPath(("child_ref_list",)), "ref"),
+        **_generic_collections(notes=True, citations=True, media=True, tags=True),
+        "events": Collection("events", EVENT, JsonPath(("event_ref_list",)), "ref"),
     },
-    PERSON.table: {
-        "notes": Collection("notes", NOTE, JsonPath(("note_list",)), None),
+    EVENT.table: {
+        **_generic_collections(notes=True, citations=True, media=True, tags=True),
+    },
+    PLACE.table: {
+        **_generic_collections(notes=True, citations=True, media=True, tags=True),
+        "enclosing_places": Collection(
+            "enclosing_places", PLACE, JsonPath(("placeref_list",)), "ref"
+        ),
+    },
+    SOURCE.table: {
+        **_generic_collections(notes=True, media=True, tags=True),
+        "repositories": Collection(
+            "repositories", REPOSITORY, JsonPath(("reporef_list",)), "ref"
+        ),
+    },
+    CITATION.table: {
+        **_generic_collections(notes=True, media=True, tags=True),
+    },
+    REPOSITORY.table: {
+        **_generic_collections(notes=True, tags=True),
+    },
+    MEDIA.table: {
+        **_generic_collections(notes=True, citations=True, tags=True),
+    },
+    NOTE.table: {
+        **_generic_collections(tags=True),
     },
 }
 
@@ -954,13 +1031,30 @@ def _collection_subquery_body(
     dialect: Dialect,
     treeid: Optional[int],
 ) -> Tuple[str, list]:
-    """`<target_table>, <source> WHERE <handle correlation>[ AND (<condition>)]
-    [ AND <target_table>.treeid = ?]` -- the subquery body shared by `Exists`
-    (`EXISTS (SELECT 1 FROM <body>)`) and `CollectionCount`
-    (`(SELECT COUNT(*) FROM <body>)`) alike; only the wrapper differs.
+    """`<target_table> AS <alias>, <source> WHERE <handle correlation>
+    [ AND (<condition>)][ AND <alias>.treeid = ?]` -- the subquery body
+    shared by `Exists` (`EXISTS (SELECT 1 FROM <body>)`) and
+    `CollectionCount` (`(SELECT COUNT(*) FROM <body>)`) alike; only the
+    wrapper differs.
+
+    The target row is *always* aliased, even when `target_table !=
+    outer_table` (the common case) -- a self-referencing collection (e.g.
+    `Person`'s own `associations`, `Person` -> `PersonRef` -> `Person`)
+    would otherwise reintroduce the very same bare table name already bound
+    to the outer, correlated row, inside this same `FROM` clause, shadowing
+    it: `source`'s `json_each(<outer_table>.json_data, ...)`/
+    `jsonb_array_elements(<outer_table>.json_data, ...)` would then resolve
+    against the newly-introduced *local* binding instead of the outer row,
+    silently breaking correlation -- confirmed empirically: `Person
+    "exists(associations, ...)"` matched zero rows for every person, even
+    ones with a real matching association, before this alias was added.
+    Aliasing unconditionally (not just when the names happen to collide)
+    keeps this one code path correct regardless of which collection targets
+    its own table, rather than needing a separate self-reference check.
     """
     target = collection.target
     target_table = target.table
+    target_alias = f"{target_table}__target"
 
     if dialect == Dialect.SQLITE:
         source, handle_expr, source_params = _collection_source_sqlite(collection, outer_table)
@@ -971,17 +1065,17 @@ def _collection_subquery_body(
     else:
         raise QueryError(f"unsupported dialect: {dialect!r}")
 
-    where_parts = [f"{target_table}.handle = {handle_expr}"]
+    where_parts = [f"{target_alias}.handle = {handle_expr}"]
     params = list(source_params)
     if condition is not None:
         cond_sql, cond_params = condition.compile(target, dialect, treeid)
         where_parts.append(f"({cond_sql})")
         params.extend(cond_params)
     if treeid is not None:
-        where_parts.append(f"{target_table}.treeid = ?")
+        where_parts.append(f"{target_alias}.treeid = ?")
         params.append(treeid)
 
-    body = f"{target_table}, {source} WHERE {' AND '.join(where_parts)}"
+    body = f"{target_table} AS {target_alias}, {source} WHERE {' AND '.join(where_parts)}"
     return body, params
 
 
