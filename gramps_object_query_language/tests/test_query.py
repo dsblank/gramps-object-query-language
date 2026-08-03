@@ -1099,32 +1099,70 @@ def test_compile_query_uses_spec_table_and_columns():
     assert "father_handle" in sql
 
 
-def test_compile_query_emits_logical_column_names():
-    # query.py has no column-override mechanism: it always emits columns
-    # exactly as `get_secondary_fields()` names them, on every backend.
+def test_compile_query_emits_logical_column_names_without_postgresql_dialect():
+    # No dialect (or SQLite): plain logical column names exactly as
+    # get_secondary_fields() names them -- SQLite never had SharedPostgreSQL's
+    # column-renaming history, so nothing needs translating there.
     query = Query(select=["handle", "description"])
     sql, _ = compile_query(EVENT, query)
     assert "description" in sql
     assert "desc_ription" not in sql
 
+    sql, _ = compile_query(EVENT, query, dialect=Dialect.SQLITE)
+    assert "description" in sql
+    assert "desc_ription" not in sql
 
-def test_legacy_shared_postgresql_hack_self_corrects_logical_names():
-    # SharedPostgreSQL's not-yet-migrated Connection.execute() still runs a
-    # blind "desc" -> "desc_" string-replace on every query it receives (see
-    # query.py's module-level note; verified live against a real deployed
-    # instance). Confirm the plain logical names query.py emits become the
-    # real physical column names after exactly one such pass -- so no
-    # compensating override is needed here (adding one double-corrupts:
-    # "desc_ription" -> "desc__ription", confirmed the hard way).
-    def legacy_hack(sql: str) -> str:
-        return sql.replace("desc", "desc_")
 
-    sql, _ = compile_query(EVENT, Query(select=["handle", "description"]))
-    assert "desc_ription" in legacy_hack(sql)
+def test_compile_query_maps_legacy_postgresql_column_names():
+    # SharedPostgreSQL's Connection.execute() used to blindly string-replace
+    # "desc" -> "desc_" on every query it ran (not just its own), which
+    # happened to auto-correct a plain logical reference like `description`
+    # into the real physical `desc_ription` column -- see
+    # _POSTGRESQL_PHYSICAL_COLUMN_OVERRIDES's module-level note.
+    #
+    # addons-source PR #1001 removed that blind rewrite (rightly -- it
+    # corrupted any identifier containing "desc" as a substring), replacing
+    # it with a _quote_column() used only inside the addon's own generated
+    # SQL. That means this compiler's plain, unmapped column names no longer
+    # get auto-corrected downstream -- confirmed live post-#1001, a bare
+    # `description`/`desc` reference now raises psycopg2's UndefinedColumn
+    # instead of reaching the real column. This compiler must emit the
+    # correct physical name itself for PostgreSQL now.
+    sql, _ = compile_query(
+        EVENT, Query(select=["handle", "description"]), dialect=Dialect.POSTGRESQL
+    )
+    assert "desc_ription" in sql
+    assert "description" not in sql
 
-    sql, _ = compile_query(MEDIA, Query(select=["handle", "desc"]))
-    # quoting survives the hack too: '"desc"' -> '"desc_"', still correct.
-    assert '"desc_"' in legacy_hack(sql)
+    sql, _ = compile_query(
+        MEDIA, Query(select=["handle", "desc"]), dialect=Dialect.POSTGRESQL
+    )
+    assert "desc_" in sql
+
+
+def test_compile_query_maps_legacy_postgresql_column_in_order_by_and_keyset():
+    # Media's default sort is by "desc" -- the override has to apply to
+    # ORDER BY and keyset pagination too, not just SELECT/WHERE, since
+    # PostgreSQL's physical table has the same renamed column either way.
+    sql, _ = compile_query(
+        MEDIA,
+        Query(select=["handle"], order_by=[OrderBy("desc", "asc")]),
+        dialect=Dialect.POSTGRESQL,
+    )
+    assert "ORDER BY desc_" in sql
+    assert '"desc"' not in sql
+
+    sql, _ = compile_query(
+        MEDIA,
+        Query(
+            select=["handle"],
+            order_by=[OrderBy("desc", "asc")],
+            after=["Funeral photo", "H0001"],
+        ),
+        dialect=Dialect.POSTGRESQL,
+    )
+    assert "desc_ > ?" in sql
+    assert '"desc"' not in sql
 
 
 def test_text_columns_exclude_non_string_fields():
