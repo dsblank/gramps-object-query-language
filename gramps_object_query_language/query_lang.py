@@ -478,10 +478,23 @@ def _is_path_node(node: ast.AST) -> bool:
 
 def _translate_compare(node: ast.Compare, spec: ObjectTypeSpec) -> dict:
     if len(node.ops) != 1 or len(node.comparators) != 1:
-        # `a < b < c` -- Python allows chained comparisons; we don't.
-        raise QueryLangError(
-            f"chained comparisons are not supported, use 'and' instead: {ast.dump(node)}"
-        )
+        # `a < b < c` -- Python allows chained comparisons, desugaring to
+        # pairwise "and": `a < b and b < c` (real Python evaluates each
+        # operand at most once; this translator only ever reads a path's
+        # *value* at query time, never re-evaluates a Python expression, so
+        # that subtlety doesn't apply here -- splitting into independent
+        # legs is exactly equivalent). Each leg is an ordinary two-term
+        # `ast.Compare`, translated by recursing into this same function --
+        # chaining introduces no new comparison semantics of its own, so
+        # every leg transparently supports whatever a plain comparison
+        # already does (operand ordering, is/is not/in, field-vs-field,
+        # even mixed operators like `1 < gender != 3`).
+        operands = [node.left, *node.comparators]
+        legs = [
+            ast.Compare(left=left, ops=[op], comparators=[right])
+            for left, op, right in zip(operands, node.ops, operands[1:])
+        ]
+        return {"and": [_translate_compare(leg, spec) for leg in legs]}
     op_type = type(node.ops[0])
     # "not in" reuses "in"'s own translation below verbatim, then wraps the
     # result in "not" at the very end -- `not (x in y)` already compiles and

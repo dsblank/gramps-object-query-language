@@ -486,9 +486,51 @@ def test_count_vs_field_still_rejected_either_order():
 # --- explicitly rejected: things with no wire-format equivalent yet -------------
 
 
-def test_chained_comparison_rejected():
-    with pytest.raises(QueryLangError):
-        parse_expr("person", "1 < gender < 3")
+def test_chained_comparison_desugars_to_and():
+    result = parse_expr("person", "1 < gender < 3")
+    assert result == parse_expr("person", "gender > 1 and gender < 3")
+    assert result == [
+        {"column": "gender", "op": "gt", "value": 1},
+        {"column": "gender", "op": "lt", "value": 3},
+    ]
+
+
+def test_chained_comparison_combines_with_operand_ordering():
+    # The originally-motivating example for splitting operand ordering (B)
+    # out from chaining (A) in the first place: a value on the left of the
+    # first leg needs both fixes together.
+    result = parse_expr(
+        "family", "Date('Jan 1, 1968') < mother.birth.sortval < Date('Jan 30, 1968')"
+    )
+    assert result == [
+        {"column": {"json_path": ["mother", "birth", "sortval"]}, "op": "gt", "value": 2439857},
+        {"column": {"json_path": ["mother", "birth", "sortval"]}, "op": "lt", "value": 2439886},
+    ]
+
+
+def test_chained_comparison_allows_mixed_operators():
+    # Python's own chaining allows mixed operators (`1 < gender != 3`) --
+    # each leg is an ordinary two-term Compare, so this falls out for free
+    # rather than needing a same-operator restriction.
+    result = parse_expr("person", "1 < gender != 3")
+    assert result == [
+        {"column": "gender", "op": "gt", "value": 1},
+        {"column": "gender", "op": "ne", "value": 3},
+    ]
+
+
+def test_not_wraps_chained_comparison():
+    result = parse_expr("person", "not (1 < gender < 3)")
+    assert result == [
+        {
+            "not": {
+                "and": [
+                    {"column": "gender", "op": "gt", "value": 1},
+                    {"column": "gender", "op": "lt", "value": 3},
+                ]
+            }
+        }
+    ]
 
 
 def test_bare_name_rejected():

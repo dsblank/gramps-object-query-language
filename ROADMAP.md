@@ -12,11 +12,8 @@ does today.
 **Boolean structure**
 - `and`/`or`/`not` are all supported, and can be mixed and nested
   (`not (a and b) or c`), following Python's own precedence and grouping.
-- No chained comparisons (`1 < gender < 3`) -- write `gender > 1 and gender < 3`
-  instead. (docs/where_expr.md) Splits into two separably-difficulty pieces,
-  not one -- see
-  [Chained comparisons / operand ordering](#chained-comparisons--operand-ordering)
-  below.
+- Chained comparisons (`1 < gender < 3`) are supported too -- see
+  [Chained comparisons](#chained-comparisons-1--gender--3) under Done.
 
 **Relationships**
 - Six one-to-one relationship links are registered: `Person` -> `birth`/
@@ -411,34 +408,41 @@ and a SQL-vs-evaluator agreement test in the same style as
 the same AST run through the real SQLite compiler and through
 `evaluate_where` against equivalent fake data, asserting they agree.
 
+### Chained comparisons (`1 < gender < 3`)
+
+Implemented -- item A, the last of the two pieces originally hiding behind
+the single "no chained comparisons" bullet in Current limitations (piece 2,
+operand ordering, was item B -- see
+[Operand ordering](#operand-ordering-value-op-field) above, shipped
+earlier).
+
+`_translate_compare` (query_lang.py) no longer rejects a multi-op
+`ast.Compare` node (`len(node.ops) != 1`) -- it desugars it into pairwise
+legs first: `operands = [node.left, *node.comparators]`, then
+`ast.Compare(left=left, ops=[op], comparators=[right])` for each
+consecutive triple, each leg translated by recursing into
+`_translate_compare` itself and the results joined as `{"and": [...]}`.
+No new comparison semantics at all -- every leg is an ordinary two-term
+comparison, so it transparently supports whatever a plain comparison
+already does: operand ordering, `is`/`is not`/`in`, field-vs-field, even
+*mixed* operators in one chain (`1 < gender != 3`), none of which needed
+special-casing since nothing here assumes same-operator legs.
+
+Confirmed the originally-motivating combined example now works, requiring
+both A and B together: `Date('Jan 1, 1968') < mother.birth.sortval <
+Date('Jan 30, 1968')` -- B alone (shipped first) wasn't sufficient, since
+chaining itself was still rejected; A alone wouldn't have been sufficient
+either, since the first leg (`Date(...) < mother.birth.sortval`) needs
+operand-order support to compile at all.
+
+Verified two ways: parser-level equivalence (`parse_expr("1 < gender < 3")
+== parse_expr("gender > 1 and gender < 3")`) and real end-to-end SQLite
+execution (`test_where_expr_examples.py`'s
+`test_chained_comparison_readme_example`) confirming the chained form
+returns the identical result set to the `and`-joined form, not just an
+identical wire shape.
+
 ## Possibilities
-
-### Chained comparisons / operand ordering
-
-Two separable pieces originally hid behind the single "no chained
-comparisons" bullet in Current limitations above -- confirmed empirically
-(not just reasoned about) before splitting them apart, since it wasn't
-obvious at first that `5 < gender` (no chaining involved at all) already
-failed for an unrelated reason. **Piece 2 (operand order) has since
-shipped** -- see [Operand ordering](#operand-ordering-value-op-field) under
-Done above. What's left here is piece 1 alone.
-
-**The chain itself**, e.g. `gender > 1 and gender < 3` written as
-`1 < gender < 3` instead. `ast.Compare` collapses `a < b < c` into a single
-node with `ops=[Lt, Lt]`/`comparators=[b, c]`; `_translate_compare`
-(query_lang.py) rejects anything but exactly one op/comparator today
-(`len(node.ops) != 1`). Fix is a straightforward rewrite into an `And` of
-the pairwise legs before falling through to the existing single-comparison
-path.
-
-**Difficulty: 1.** Now genuinely just difficulty 1 with no asterisk --
-operand ordering (the thing that would have complicated a chain with a
-literal on the left of its first leg, e.g.
-`Date('Jan 1, 1968') < mother.birth.sortval < Date('Jan 30, 1968')`) is
-already handled per-leg now that operand ordering shipped, so the chain
-rewrite doesn't need to special-case which side of each leg the literal
-landed on -- each pairwise leg, however it's shaped, already compiles
-correctly on its own.
 
 ### `len()` / array-length comparisons
 
@@ -638,6 +642,21 @@ rendering on top, the one piece neither `count()` nor `len()` needs.
   would need to accept a `JsonPath`/`RelatedObject` the way `where` already
   does, plus decide how keyset comparison and `COLLATE` selection behave
   for a column whose type isn't known until runtime.
+- **Duplicate `RelatedObject` subqueries across `And` legs** -- a chained
+  comparison against the same relationship path
+  (`Date(...) < mother.birth.sortval < Date(...)`) renders the *entire*
+  correlated subquery chain (`family.mother_handle` -> `person` ->
+  `birth_ref_index` -> `event` -> `sortval`) twice, byte-for-byte identical
+  except the bound value -- each leg of the chain is an independent
+  `Comparison` object, and nothing deduplicates a repeated `RelatedObject`
+  expression across sibling `And` legs. Not chaining-specific (writing the
+  same thing by hand with an explicit `and` has always had this cost) and
+  not a correctness issue, just an efficiency one -- deliberately left
+  as-is for now. Would need `Comparison`/`RelatedObject` rendering to
+  recognize a structurally-identical sibling and factor it out (e.g. a
+  `WITH` CTE or binding the subquery's result once), a general
+  optimization rather than anything specific to chaining or operand
+  ordering.
 
 ### Rough difficulty survey of unsupported `where_expr` shapes
 
@@ -653,12 +672,12 @@ database/collation concern, not a `where_expr` language gap.)
 Each row is lettered so the dependency analysis right below it can refer
 back to individual items. Letters are kept stable as items get implemented
 (rather than renumbered) so old discussion of e.g. "B depends on..." stays
-correct -- **B, C, and D have shipped** (see Done above) and are kept here,
-struck through, so that history stays legible.
+correct -- **A, B, C, and D have shipped** (see Done above) and are kept
+here, struck through, so that history stays legible.
 
 | # | Example | Gap | Difficulty |
 |---|---|---|---|
-| A | `1 < gender < 3` (chained, literal on the right of each leg) | no chained comparisons | 1 |
+| ~~A~~ | ~~`1 < gender < 3` (chained, literal on the right of each leg)~~ | **Done** -- see [Chained comparisons](#chained-comparisons-1--gender--3) above | ~~1~~ |
 | ~~B~~ | ~~`Date(...) < mother.birth.sortval` (literal on the left)~~ | **Done** -- see [Operand ordering](#operand-ordering-value-op-field) above | ~~2~~ |
 | ~~C~~ | ~~`gender is None`, `mother is not None`, `tag not in tags`~~ | **Done** -- see `is` / `is not` / `not in` above | ~~1~~ |
 | ~~D~~ | ~~`other_field in field`~~ | **Done** -- see [Field-vs-field substring `in`](#field-vs-field-substring-in-other_field-in-field) above | ~~2~~ |
@@ -706,6 +725,15 @@ of the other column), found only because D's own tests were the first ones
 to try two bare flat columns directly. See
 [Field-vs-field substring `in`](#field-vs-field-substring-in-other_field-in-field)
 under Done above.
+
+**A shipped at its original difficulty-1 estimate**, and needed no
+asterisk this time -- unlike D, A's premise (that B, already shipped,
+would make each leg of a chain "just work" regardless of operand order)
+held exactly as predicted. Confirmed the originally-motivating combined
+example (`Date(...) < mother.birth.sortval < Date(...)`, the reason B and A
+were split apart in the first place) compiles correctly, needing both
+pieces together. See
+[Chained comparisons](#chained-comparisons-1--gender--3) under Done above.
 
 ### Dependencies between the items above
 
@@ -762,17 +790,21 @@ each other cheaper:
   from `where_expr` compilation -- touches neither `_translate_compare`
   nor `evaluator.py`'s comparison logic at all.
 
-**Net effect on build order (as originally planned, before B/C/D shipped):**
-B was the one item worth doing early even though its own difficulty (2)
-wasn't special on its own -- it was the only item on this list with
-downstream leverage (cheapens D, and is the seam G/H would need if their
-scope grows). C shipped first instead, since it turned out to be nearly
-free once checked directly -- B followed right after, then D. **D is the
-one lesson from this whole exercise worth remembering going forward**:
-"looks cheap because a related item just shipped" is a hypothesis to check
-against the actual code (does the target class already have the pattern
-B/C proved, or does it override behavior entirely, like `Contains` did?),
-not a difficulty estimate to trust on its own -- D's own difficulty barely
-moved (2 either way), but the *reason* moved entirely, from "reuse B's
-classifier" to "`Contains` never had field-vs-field support at all, and
-neither did anything flat-column-vs-flat-column."
+**Net effect on build order (as originally planned, before A/B/C/D
+shipped):** B was the one item worth doing early even though its own
+difficulty (2) wasn't special on its own -- it was the only item on this
+list with downstream leverage (cheapens D, unblocks A, and is the seam G/H
+would need if their scope grows). Actual order ended up C, B, D, A --
+C shipped first since it turned out to be nearly free once checked
+directly; A shipped last, deliberately, since it was blocked on B (a chain
+with a value on the left of its first leg needs operand ordering solved
+first) -- landed exactly at its predicted difficulty once its prerequisite
+was actually in place. **D is the one lesson from this whole exercise worth
+remembering going forward**: "looks cheap because a related item just
+shipped" is a hypothesis to check against the actual code (does the target
+class already have the pattern B/C proved, or does it override behavior
+entirely, like `Contains` did?), not a difficulty estimate to trust on its
+own -- D's own difficulty barely moved (2 either way), but the *reason*
+moved entirely, from "reuse B's classifier" to "`Contains` never had
+field-vs-field support at all, and neither did anything
+flat-column-vs-flat-column."

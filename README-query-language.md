@@ -425,6 +425,17 @@ the same test as `'Jan' in given_name` but with a field standing in for
 the literal substring. Works the same for two plain columns on the same
 row too (`Person "given_name in surname"`).
 
+### Goal: Find everyone born strictly between 1900 and 1950
+
+```
+Person "Date('Jan 1, 1900') < birth.date.sortval < Date('Jan 1, 1950')"
+```
+
+Comparisons can be chained just like in real Python -- this means exactly
+`Date('Jan 1, 1900') < birth.date.sortval and birth.date.sortval < Date('Jan
+1, 1950')`, just shorter to write. Any comparison operator works in a
+chain, including a mix of them.
+
 ## Things this can't do (yet)
 
 - Anything beyond the patterns shown above -- this is a small, fixed set of

@@ -17,9 +17,9 @@ Exactly which fields exist to query depends on that type -- `gender` is a
 
 It is **not** general Python: it is parsed as syntax only (`ast.parse`,
 never `eval`/`exec`), and only a small, explicitly whitelisted set of node
-shapes is understood. Anything else -- chained comparisons, list/dict
-comprehensions, lambdas, arbitrary function calls, f-strings, imports --
-is rejected outright rather than silently misinterpreted.
+shapes is understood. Anything else -- list/dict comprehensions, lambdas,
+arbitrary function calls, f-strings, imports -- is rejected outright rather
+than silently misinterpreted.
 
 Every example on this page is executed against a real (in-memory) SQLite
 database in
@@ -111,8 +111,20 @@ matches a `WHERE` clause, whether or not it's negated. So `not
 recorded death date, the same as the un-negated form does -- `not` doesn't
 turn "we don't know" into "yes."
 
-Chained comparisons like `1 < gender < 3` aren't supported (write `gender
-> 1 and gender < 3` instead).
+Chained comparisons work the same as real Python's do -- `1 < gender < 3`
+means exactly `1 < gender and gender < 3`, evaluated as two independent
+comparisons joined with `and`:
+
+```python
+Person "1 < gender < 3"
+Person "gender > 1 and gender < 3"
+```
+
+These two lines compile to the same thing. Any comparison operator can
+appear in a chain, including a mix (`1 < gender != 3`), and either side of
+each leg can be a value or a field the same as any other comparison
+(see [Basic comparisons](#basic-comparisons) above) --
+`Date('Jan 1, 1968') < birth.date.sortval < Date('Jan 30, 1968')` works too.
 
 ## `in`, contains, and `like`
 
@@ -556,10 +568,6 @@ Person "birth.date.dateval[6] == 1970"
 
 ## What's *not* supported
 
-- Chained comparisons (`1 < gender < 3`) -- write `gender > 1 and gender < 3`.
-- `other_field in field` -- the substring-test shape of `in` requires a
-  string *literal* on the left, not a second field (see
-  [Field-vs-field comparisons](#field-vs-field-comparisons)).
 - Arbitrary function calls, lambdas, comprehensions, f-strings, imports --
   the parser whitelists node *shapes*, so anything it doesn't explicitly
   recognize is rejected, not silently ignored.

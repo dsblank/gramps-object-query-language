@@ -840,3 +840,19 @@ def test_operand_order_date_on_left_readme_example(db):
     reversed_ = run(db, "Person", "Date('Jan 1, 1900') > birth.date.sortval")
     assert reversed_ == forward
     assert forward == [("granddad1",), ("grandma1",)]
+
+
+def test_chained_comparison_readme_example(db):
+    # Born strictly between 1900 and 1950: dad1 (1940) and mom1 (1945) --
+    # granddad1/grandma1 (1840s) are too early, kid1 (1968) too late, and
+    # other1 (born exactly in 1900) doesn't satisfy the strict left side.
+    chained = run(
+        db, "Person", "Date('Jan 1, 1900') < birth.date.sortval < Date('Jan 1, 1950')"
+    )
+    anded = run(
+        db,
+        "Person",
+        "birth.date.sortval > Date('Jan 1, 1900') and "
+        "birth.date.sortval < Date('Jan 1, 1950')",
+    )
+    assert chained == anded == [("dad1",), ("mom1",)]
