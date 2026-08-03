@@ -117,26 +117,53 @@ def _check_column(column: str, whitelist: frozenset[str]) -> None:
 # addons-source's `PostgreSQL`/`SharedPostgreSQL` `_quote_column()` list (see
 # PLAN grounding notes); remove once gramps core PR #2178 makes this
 # core-provided instead of addon- and caller-side.
-#
-# Note: `SharedPostgreSQL`'s not-yet-migrated `Connection.execute()` still
-# runs its own blind "desc" -> "desc_" string-replace on every query it
-# receives (not just at schema-creation time) -- so a *plain, unquoted*
-# logical column name like `description` is already transformed correctly
-# into the real physical `desc_ription` by that pre-existing hack. Quoting
-# survives it fine too (`"desc"` -> `"desc_"`, still a valid reference).
-# Verified live against a real deployed instance -- see PLAN grounding
-# notes. Do not add a compensating column-name override here: since the
-# hack already runs once, layering a second correction on top double-
-# corrupts the name (`desc_ription` -> `desc__ription`).
 _RESERVED_SQL_WORDS = frozenset({"desc", "order", "where", "select"})
 
+# PostgreSQL-only physical-column-name overrides, keyed by logical column
+# name (the name `get_secondary_fields()` uses, same as every other
+# backend). Existing (and newly created -- see shareddbapi.py's own
+# `_quote_column()`) `SharedPostgreSQL` databases physically name these
+# columns this way: legacy artifacts of that addon's *former*
+# `Connection.execute()`, which used to blindly string-replace
+# "desc" -> "desc_" on every query it ran, not just its own -- so a plain,
+# unquoted logical name like `description` used to come out the other end
+# already corrected to the real physical `desc_ription`, no override
+# needed here.
+#
+# addons-source PR #1001 removed that blind rewrite (rightly -- it
+# corrupted any identifier containing "desc" as a substring) in favor of a
+# `_quote_column()` used only inside the addon's own generated SQL
+# (schema creation, its `ORDER BY`/`UPDATE` paths). It was never wired up
+# to also cover SQL built by an external caller like this module, so the
+# free auto-correction this compiler used to (silently, fragilely) depend
+# on is gone: confirmed live post-#1001, a plain `description`/`desc`
+# reference now 500s with `psycopg2.errors.UndefinedColumn` instead of
+# reaching the real column. This override table replaces that dependency
+# with an explicit one, owned here instead of incidentally supplied by a
+# side effect two repos away.
+#
+# SQLite never had this hack -- its columns are named exactly like every
+# other backend's logical name, so nothing is mapped for
+# `Dialect.SQLITE`/no dialect.
+_POSTGRESQL_PHYSICAL_COLUMN_OVERRIDES: dict[str, str] = {
+    "desc": "desc_",
+    "description": "desc_ription",
+}
 
-def _quote_column(column: str) -> str:
-    """Quote a column identifier if it collides with a reserved SQL word.
 
-    Not a general identifier-quoting scheme -- every whitelisted column not
-    in `_RESERVED_SQL_WORDS` is emitted bare, matching prior output exactly.
+def _quote_column(column: str, dialect: Optional["Dialect"] = None) -> str:
+    """Render a column identifier for the given dialect.
+
+    PostgreSQL: a column in `_POSTGRESQL_PHYSICAL_COLUMN_OVERRIDES` is
+    rendered as its real physical name (see that dict's note); anything
+    else that collides with a reserved SQL word is double-quoted.
+
+    SQLite (or no dialect given): always the bare logical name, quoted only
+    if it collides with a reserved SQL word -- matching prior output
+    exactly for every caller that doesn't pass a dialect.
     """
+    if dialect == Dialect.POSTGRESQL and column in _POSTGRESQL_PHYSICAL_COLUMN_OVERRIDES:
+        return _POSTGRESQL_PHYSICAL_COLUMN_OVERRIDES[column]
     return f'"{column}"' if column in _RESERVED_SQL_WORDS else column
 
 
@@ -641,7 +668,7 @@ def _render_handle_ref(
     naturally, confirmed live, no guard needed).
     """
     if isinstance(handle_ref, str):
-        return f"{outer_table}.{_quote_column(handle_ref)}", None
+        return f"{outer_table}.{_quote_column(handle_ref, dialect)}", None
     if isinstance(handle_ref, JsonPath):
         index_columns = [
             segment.column
@@ -759,7 +786,7 @@ def _render_related_object(
         field_sql, field_params = _render_json_path(related.field, dialect, value)
     else:
         _check_column(related.field, related.target.columns)
-        field_sql, field_params = _quote_column(related.field), []
+        field_sql, field_params = _quote_column(related.field, dialect), []
 
     subquery_where = [f"{target_alias}.handle = ({handle_sql})"]
     where_params: list = []
@@ -800,7 +827,7 @@ def _render_column(
     if isinstance(column, FlatColumnRef):
         column = column.name
     _check_column(column, spec.columns)
-    return _quote_column(column), []
+    return _quote_column(column, dialect), []
 
 
 # --- WHERE: comparison leaves -----------------------------------------------
@@ -1302,14 +1329,22 @@ class Query:
             raise QueryError(f"limit must be positive: {self.limit!r}")
 
 
-def _column_expr(column: str, spec: ObjectTypeSpec, collation: Optional[str]) -> str:
+def _column_expr(
+    column: str,
+    spec: ObjectTypeSpec,
+    collation: Optional[str],
+    dialect: Optional[Dialect] = None,
+) -> str:
     """Column reference, with a locale `COLLATE` clause when applicable.
 
     Only columns in `spec.text_columns` are collatable -- applying `COLLATE`
     to a non-text column (e.g. an integer) is a SQL error on PostgreSQL, so
-    this is deliberately narrower than "every ORDER BY column".
+    this is deliberately narrower than "every ORDER BY column". `dialect` is
+    forwarded to `_quote_column` -- an `ORDER BY`/keyset reference to a
+    column in `_POSTGRESQL_PHYSICAL_COLUMN_OVERRIDES` (e.g. `Media.desc`)
+    needs the same physical-name mapping a `SELECT`/`WHERE` reference does.
     """
-    quoted = _quote_column(column)
+    quoted = _quote_column(column, dialect)
     if collation and column in spec.text_columns:
         return f'{quoted} COLLATE "{collation}"'
     return quoted
@@ -1320,6 +1355,7 @@ def _compile_keyset(
     after: Sequence[Any],
     spec: ObjectTypeSpec,
     collation: Optional[str],
+    dialect: Optional[Dialect] = None,
 ) -> Tuple[str, list]:
     """Seek-method WHERE fragment for keyset pagination.
 
@@ -1341,11 +1377,11 @@ def _compile_keyset(
         and_terms = []
         for j in range(i):
             and_terms.append(
-                f"{_column_expr(effective_order_by[j].column, spec, collation)} = ?"
+                f"{_column_expr(effective_order_by[j].column, spec, collation, dialect)} = ?"
             )
             params.append(after[j])
         op = ">" if ob.direction == "asc" else "<"
-        and_terms.append(f"{_column_expr(ob.column, spec, collation)} {op} ?")
+        and_terms.append(f"{_column_expr(ob.column, spec, collation, dialect)} {op} ?")
         params.append(after[i])
         or_terms.append("(" + " AND ".join(and_terms) + ")")
     return " OR ".join(or_terms), params
@@ -1414,10 +1450,13 @@ def compile_query(
 
     `dialect` selects which backend-specific SQL to render for any `select`
     or `where` entry that's a `JsonPath` or a `RelatedObject` (see
-    `_render_json_path`/`_render_related_object`) rather than a plain
-    column name. Not needed, and may be omitted, for plain-column-only
-    queries -- `order_by`/keyset pagination support neither yet, so
-    `dialect` never affects them.
+    `_render_json_path`/`_render_related_object`), and also which physical
+    name a plain column gets if it's in `_POSTGRESQL_PHYSICAL_COLUMN_OVERRIDES`
+    (e.g. `Media.desc`) -- that applies to `order_by`/keyset pagination too,
+    not just `select`/`where`, since PostgreSQL's physical table has the
+    same renamed column either way. Omitting `dialect` is safe for a query
+    that touches none of the above (plain columns not in that override
+    table, no `JsonPath`/`RelatedObject`); it is not safe in general.
     """
     columns = list(query.select) if query.select else sorted(spec.columns)
 
@@ -1436,7 +1475,7 @@ def compile_query(
     params.extend(where_params)
 
     if query.after is not None:
-        sql, p = _compile_keyset(effective_order_by, query.after, spec, collation)
+        sql, p = _compile_keyset(effective_order_by, query.after, spec, collation, dialect)
         where_clauses.append(f"({sql})")
         params.extend(p)
 
@@ -1444,7 +1483,7 @@ def compile_query(
     if where_clauses:
         sql += " WHERE " + " AND ".join(where_clauses)
     sql += " ORDER BY " + ", ".join(
-        f"{_column_expr(ob.column, spec, collation)} {ob.direction.upper()}"
+        f"{_column_expr(ob.column, spec, collation, dialect)} {ob.direction.upper()}"
         for ob in effective_order_by
     )
     if query.limit is not None:

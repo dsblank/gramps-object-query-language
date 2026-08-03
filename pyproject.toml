@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gramps-object-query-language"
-version = "0.3.1"
+version = "0.3.2"
 description = "A small, closed object query language and SQL compiler for Gramps genealogy data"
 readme = "README.md"
 license = { text = "AGPL-3.0-or-later" }
