@@ -272,6 +272,17 @@ _RELATIONSHIPS: dict[str, dict[str, Tuple[ObjectTypeSpec, ColumnRef]]] = {
     CITATION.table: {
         "source": (SOURCE, "source_handle"),
     },
+    PLACE.table: {
+        # Self-referencing (Place -> Place), the first entry in this row's
+        # own placeref_list -- a real, indexed flat column in Gramps' own
+        # DBAPI schema (`enclosed_by VARCHAR(50)`), already exposed via
+        # PLACE's extra_columns but never registered as a relationship
+        # until now. Distinct from the `enclosing_places` Collection
+        # (one-to-many, the full placeref_list with its date ranges) --
+        # this is just the one, denormalized "primary enclosing place"
+        # handle Gramps' own backend maintains for fast lookups.
+        "enclosed_by": (PLACE, "enclosed_by"),
+    },
 }
 
 
@@ -674,24 +685,45 @@ def _render_related_object(
     dialect: Optional[Dialect],
     treeid: Optional[int],
     value: Any = None,
+    _depth: int = 0,
 ) -> Tuple[str, list]:
     """Render a `RelatedObject` as a correlated scalar subquery.
 
     ```sql
-    (SELECT <field extraction> FROM <target.table>
-     WHERE <target.table>.handle = <handle_ref, CASE-guarded if dynamic>
-       AND <target.table>.treeid = ?     -- when treeid is given
+    (SELECT <field extraction> FROM <target.table> AS <target.table>__hop<depth>
+     WHERE <target.table>__hop<depth>.handle = <handle_ref, CASE-guarded if dynamic>
+       AND <target.table>__hop<depth>.treeid = ?     -- when treeid is given
      LIMIT 1)
     ```
 
     Not a `JOIN` -- a self-contained SQL scope with its own `FROM`,
-    correlated back to `outer_table` by name, never aliased. Confirmed
-    live this composes correctly at any depth: sibling subqueries
-    referencing the same table (father vs. mother, both `FROM person`)
-    don't collide with each other, and a chain (nested `SELECT`s, for a
-    path like `birth.place.title`) correlates correctly across levels --
-    each `RelatedObject`'s subquery is an independent scope regardless of
-    how deep it's nested.
+    correlated back to `outer_table` by name. Confirmed live this composes
+    correctly at any depth: sibling subqueries referencing the same table
+    (father vs. mother, both targeting `person`) don't collide with each
+    other, and a chain (nested `SELECT`s, for a path like `birth.place.title`)
+    correlates correctly across levels -- each `RelatedObject`'s subquery is
+    an independent scope regardless of how deep it's nested.
+
+    **Every level is aliased unconditionally** (`_depth` increments by one
+    per level of `RelatedObject` chaining), not just when a same-table
+    collision is detected -- confirmed *necessary*, not just defensive, for
+    a self-referencing relationship (`Place.enclosed_by` -> `Place`, the
+    first one registered): without an alias, a nested subquery's own
+    `FROM place` shadows any ancestor scope that also happens to be
+    `place`, so a bare `place.enclosed_by` reference inside the subquery's
+    own `WHERE` resolves to the *subquery's own* row, not the correlated
+    ancestor's -- silently making `place.handle = place.enclosed_by` true
+    only for a (nonexistent) place that encloses itself, so the whole
+    relationship matches nothing, for every row, regardless of real data.
+    Confirmed empirically before fixing (`enclosed_by.title == 'Cook
+    County'` matched zero rows against a real 3-level place hierarchy where
+    it should have matched one) -- the same class of bug as `Collection`
+    self-reference (`Person.associations`, see Done above), just one level
+    more subtle since `RelatedObject` nests arbitrarily deep rather than
+    being a single flat subquery, so a *fixed* alias suffix (which was
+    sufficient there) isn't enough here -- two nested self-referencing hops
+    (`enclosed_by.enclosed_by`) would still collide with each other under a
+    fixed suffix; only a depth-varying one guarantees every level distinct.
 
     `treeid` scoping applies to *this* subquery's own row, not the outer
     query -- a related row in another tree makes this field come back
@@ -715,12 +747,13 @@ def _render_related_object(
             "but none was given"
         )
     target_table = related.target.table
+    target_alias = f"{target_table}__hop{_depth}"
 
     handle_sql = _guarded_handle_ref_sql(related.handle_ref, outer_table, dialect)
 
     if isinstance(related.field, RelatedObject):
         field_sql, field_params = _render_related_object(
-            related.field, target_table, dialect, treeid, value
+            related.field, target_alias, dialect, treeid, value, _depth=_depth + 1
         )
     elif isinstance(related.field, JsonPath):
         field_sql, field_params = _render_json_path(related.field, dialect, value)
@@ -728,14 +761,14 @@ def _render_related_object(
         _check_column(related.field, related.target.columns)
         field_sql, field_params = _quote_column(related.field), []
 
-    subquery_where = [f"{target_table}.handle = ({handle_sql})"]
+    subquery_where = [f"{target_alias}.handle = ({handle_sql})"]
     where_params: list = []
     if treeid is not None:
-        subquery_where.append(f"{target_table}.treeid = ?")
+        subquery_where.append(f"{target_alias}.treeid = ?")
         where_params.append(treeid)
 
     subquery = (
-        f"(SELECT {field_sql} FROM {target_table} "
+        f"(SELECT {field_sql} FROM {target_table} AS {target_alias} "
         f"WHERE {' AND '.join(subquery_where)} LIMIT 1)"
     )
     return subquery, field_params + where_params

@@ -413,12 +413,20 @@ def test_related_object_postgresql_shape():
 
 def test_related_object_father_surname_sqlite_shape():
     # A direct FK (father_handle) needs no CASE WHEN guard at all -- NULL
-    # already fails the handle equality naturally.
+    # already fails the handle equality naturally. The target table is
+    # aliased (person__hop0) unconditionally, even here where "person"
+    # doesn't collide with anything -- see FlatColumnRef-adjacent note in
+    # _render_related_object's docstring: a self-referencing relationship
+    # (Place.enclosed_by) needs this same aliasing to be correct, so every
+    # RelatedObject gets it rather than special-casing self-reference.
     sql, params = compile_query(
         FAMILY, Query(select=["handle", FATHER_SURNAME]), dialect=Dialect.SQLITE
     )
     assert "CASE WHEN" not in sql
-    assert "SELECT surname FROM person WHERE person.handle = (family.father_handle)" in sql
+    assert (
+        "SELECT surname FROM person AS person__hop0 "
+        "WHERE person__hop0.handle = (family.father_handle)"
+    ) in sql
 
 
 def test_related_object_sibling_subqueries_same_table_no_conflict():
@@ -436,9 +444,13 @@ def test_related_object_two_hop_chain_sqlite_shape():
     sql, params = compile_query(
         PERSON, Query(select=["handle", BIRTH_PLACE_TITLE]), dialect=Dialect.SQLITE
     )
-    # Nested subquery: event lookup contains a place lookup.
-    assert "SELECT (SELECT title FROM place WHERE place.handle = (event.place)" in sql
-    assert "FROM event WHERE event.handle = (CASE WHEN person.birth_ref_index" in sql
+    # Nested subquery: event lookup contains a place lookup -- each hop gets
+    # its own alias (event__hop0, place__hop1), incrementing with depth.
+    assert (
+        "SELECT (SELECT title FROM place AS place__hop1 "
+        "WHERE place__hop1.handle = (event__hop0.place)"
+    ) in sql
+    assert "FROM event AS event__hop0 WHERE event__hop0.handle = (CASE WHEN person.birth_ref_index" in sql
 
 
 def test_related_object_treeid_applies_to_subquery():
@@ -452,7 +464,7 @@ def test_related_object_treeid_applies_to_subquery():
     # before its own treeid param, plus the outer query's own treeid clause,
     # plus the trailing LIMIT param.
     assert params == ["$.date", 7, "$.date", 7, 7, 50]
-    assert sql.count("event.treeid = ?") == 2
+    assert sql.count("__hop0.treeid = ?") == 2
 
 
 def test_related_object_death_ref_index():
@@ -584,7 +596,7 @@ def test_related_object_sortval_treeid_scoping():
         dialect=Dialect.SQLITE,
         treeid=7,
     )
-    assert "event.treeid = ?" in sql
+    assert "event__hop0.treeid = ?" in sql
     assert 7 in params
 
 
@@ -1825,3 +1837,124 @@ def test_associations_self_reference_postgresql_shape():
     # the outer correlation (person.json_data) must still reference the
     # *unaliased* outer table, not the newly-introduced target alias.
     assert "person.json_data::jsonb -> 'person_ref_list'" in sql
+
+
+# --- Place.enclosed_by: RelatedObject self-reference --------------------------
+#
+# The same class of bug as Person.associations above, one level more subtle:
+# RelatedObject nests arbitrarily deep rather than being a single flat
+# subquery, so a *fixed* alias suffix (sufficient for Collection) isn't
+# enough here -- two nested self-referencing hops would still collide with
+# each other. _render_related_object's _depth parameter gives every level a
+# distinct alias instead.
+
+ENCLOSED_BY_TITLE = resolve_column_path(PLACE, ["enclosed_by", "title"])
+ENCLOSED_BY_ENCLOSED_BY_TITLE = resolve_column_path(PLACE, ["enclosed_by", "enclosed_by", "title"])
+
+
+def test_place_enclosed_by_sqlite_shape():
+    sql, params = compile_query(
+        PLACE, Query(select=["handle", ENCLOSED_BY_TITLE]), dialect=Dialect.SQLITE
+    )
+    assert "FROM place AS place__hop0 WHERE place__hop0.handle = (place.enclosed_by)" in sql
+
+
+def test_place_enclosed_by_two_hop_self_reference_sqlite_shape():
+    # Each hop gets its own alias (place__hop0, place__hop1) even though
+    # both target the same table as each other *and* as the outer query.
+    sql, params = compile_query(
+        PLACE, Query(select=["handle", ENCLOSED_BY_ENCLOSED_BY_TITLE]), dialect=Dialect.SQLITE
+    )
+    assert "FROM place AS place__hop0 WHERE place__hop0.handle = (place.enclosed_by)" in sql
+    assert (
+        "FROM place AS place__hop1 WHERE place__hop1.handle = (place__hop0.enclosed_by)"
+    ) in sql
+
+
+def test_place_enclosed_by_self_reference_end_to_end_sqlite_execution():
+    # The actual regression guard: a real 3-level hierarchy
+    # (city -> county -> state), proving both hops resolve to the correct
+    # row rather than a subquery shadowing its own ancestor and matching
+    # nothing (the bug this session found: enclosed_by.title == 'Cook
+    # County' matched zero rows before _depth-based aliasing).
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE place (handle TEXT, title TEXT, enclosed_by TEXT)")
+    conn.execute("INSERT INTO place VALUES ('city', 'Chicago', 'county')")
+    conn.execute("INSERT INTO place VALUES ('county', 'Cook County', 'state')")
+    conn.execute("INSERT INTO place VALUES ('state', 'Illinois', NULL)")
+
+    sql, params = compile_query(
+        PLACE,
+        Query(select=["handle"], where=Eq(ENCLOSED_BY_TITLE, "Cook County")),
+        dialect=Dialect.SQLITE,
+    )
+    assert conn.execute(sql, params).fetchall() == [("city",)]
+
+    sql, params = compile_query(
+        PLACE,
+        Query(select=["handle"], where=Eq(ENCLOSED_BY_ENCLOSED_BY_TITLE, "Illinois")),
+        dialect=Dialect.SQLITE,
+    )
+    assert conn.execute(sql, params).fetchall() == [("city",)]
+
+
+def test_place_enclosed_by_postgresql_shape():
+    sql, params = compile_query(
+        PLACE, Query(select=["handle", ENCLOSED_BY_TITLE]), dialect=Dialect.POSTGRESQL
+    )
+    assert "FROM place AS place__hop0" in sql
+    assert "place__hop0.handle = (place.enclosed_by)" in sql
+
+
+def test_place_enclosed_by_sql_matches_evaluator():
+    # The same SQL-vs-evaluator agreement pattern used for the associations
+    # self-reference fix and evaluate_where's Not/missing-value fix (see
+    # ROADMAP.md's Done section) -- run the same AST through the real
+    # SQLite compiler and through evaluate_where against equivalent fake
+    # data, and assert they agree.
+    import sqlite3
+
+    from gramps_object_query_language.evaluator import evaluate_where
+
+    class _FakePlaceRef:
+        def __init__(self, ref):
+            self.ref = ref
+
+    class _FakePlace:
+        def __init__(self, handle, title, enclosed_by):
+            self.handle = handle
+            self.title = title
+            self._enclosed_by = enclosed_by
+
+        def get_placeref_list(self):
+            return [_FakePlaceRef(self._enclosed_by)] if self._enclosed_by else []
+
+    class _FakeDb:
+        def __init__(self, places):
+            self.places = places
+
+        def get_place_from_handle(self, handle):
+            return self.places[handle]
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE place (handle TEXT, title TEXT, enclosed_by TEXT)")
+    conn.execute("INSERT INTO place VALUES ('city', 'Chicago', 'county')")
+    conn.execute("INSERT INTO place VALUES ('county', 'Cook County', 'state')")
+    conn.execute("INSERT INTO place VALUES ('state', 'Illinois', NULL)")
+
+    where = Eq(ENCLOSED_BY_TITLE, "Cook County")
+    sql, params = compile_query(PLACE, Query(select=["handle"], where=where), dialect=Dialect.SQLITE)
+    sql_matches = {row[0] for row in conn.execute(sql, params).fetchall()}
+
+    places = {
+        "city": _FakePlace("city", "Chicago", "county"),
+        "county": _FakePlace("county", "Cook County", "state"),
+        "state": _FakePlace("state", "Illinois", None),
+    }
+    db = _FakeDb(places)
+    evaluator_matches = {
+        handle for handle, obj in places.items() if evaluate_where(db, obj, where, PLACE)
+    }
+    assert sql_matches == evaluator_matches == {"city"}

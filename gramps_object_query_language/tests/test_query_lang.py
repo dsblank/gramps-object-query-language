@@ -846,6 +846,27 @@ def test_two_hop_chain_reference():
     ]
 
 
+def test_place_enclosed_by_self_reference():
+    # Place -> Place, the first self-referencing one-to-one relationship --
+    # query_lang.py itself has no relationship-specific knowledge either
+    # way, so this is identical in shape to father/mother/birth/death.
+    result = parse_expr("place", "enclosed_by.title == 'Cook County'")
+    assert result == [
+        {"column": {"json_path": ["enclosed_by", "title"]}, "op": "eq", "value": "Cook County"}
+    ]
+
+
+def test_place_enclosed_by_chained_self_reference():
+    result = parse_expr("place", "enclosed_by.enclosed_by.title == 'Illinois'")
+    assert result == [
+        {
+            "column": {"json_path": ["enclosed_by", "enclosed_by", "title"]},
+            "op": "eq",
+            "value": "Illinois",
+        }
+    ]
+
+
 def test_bare_relationship_name_parses_here_rejected_downstream():
     # query_lang.py itself doesn't know "birth" is special -- a bare
     # relationship name with nothing after it just becomes a single-segment

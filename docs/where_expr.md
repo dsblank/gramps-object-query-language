@@ -201,19 +201,24 @@ A field reference is a dotted/indexed path: `gender`, `primary_name.surname_list
   | `Family`  | `mother` -> `Person`   | `mother_handle` |
   | `Event`   | `place`  -> `Place`    | the event's place |
   | `Citation`| `source` -> `Source`   | `source_handle` |
+  | `Place`   | `enclosed_by` -> `Place` | the place that encloses this one (e.g. a city's county) |
 
   A relationship name needs something after it (`birth.date`, not just
   `birth`), and chains freely -- `birth.place.title` is `Person` ->
-  (birth) `Event` -> (place) `Place` -> `title`:
+  (birth) `Event` -> (place) `Place` -> `title`. `enclosed_by` is
+  self-referencing, so it chains with itself too --
+  `enclosed_by.enclosed_by.title` reaches two levels up (a city's *state*,
+  say, skipping the county in between):
 
   ```python
   Person "birth.date.sortval >= 2439857"
   Person "birth.place.title == 'Chicago, Cook, Illinois, USA'"
   Family "father.surname == 'Smith'"
   Citation "source.title == 'Census Records'"
+  Place "enclosed_by.title == 'Cook County'"
   ```
 
-That's six relationship links registered today, in total -- every example
+That's seven relationship links registered today, in total -- every example
 in [Genealogy examples](#genealogy-examples) below exercises at least one of
 them, and several combine two or three at once.
 

@@ -572,6 +572,31 @@ def test_citation_source_relationship_doc_example():
     assert result == [("c1",)]
 
 
+# --- relationship traversal (Place -> Place, self-reference) -----------------
+
+
+def test_place_enclosed_by_relationship_doc_example():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE place (handle TEXT, title TEXT, enclosed_by TEXT)")
+    conn.execute("INSERT INTO place VALUES ('city', 'Chicago', 'county')")
+    conn.execute("INSERT INTO place VALUES ('county', 'Cook County', 'state')")
+    conn.execute("INSERT INTO place VALUES ('state', 'Illinois', NULL)")
+
+    result = run(conn, "Place", "enclosed_by.title == 'Cook County'")
+    assert result == [("city",)]
+
+
+def test_place_enclosed_by_chained_self_reference_doc_example():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE place (handle TEXT, title TEXT, enclosed_by TEXT)")
+    conn.execute("INSERT INTO place VALUES ('city', 'Chicago', 'county')")
+    conn.execute("INSERT INTO place VALUES ('county', 'Cook County', 'state')")
+    conn.execute("INSERT INTO place VALUES ('state', 'Illinois', NULL)")
+
+    result = run(conn, "Place", "enclosed_by.enclosed_by.title == 'Illinois'")
+    assert result == [("city",)]
+
+
 def test_exists_citations_confidence_doc_example():
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE person (handle TEXT, json_data TEXT)")

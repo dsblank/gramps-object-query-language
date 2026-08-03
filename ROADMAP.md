@@ -16,12 +16,18 @@ does today.
   [Chained comparisons](#chained-comparisons-1--gender--3) under Done.
 
 **Relationships**
-- Six one-to-one relationship links are registered: `Person` -> `birth`/
+- Seven one-to-one relationship links are registered: `Person` -> `birth`/
   `death` (-> `Event`), `Family` -> `father`/`mother` (-> `Person`), `Event`
-  -> `place` (-> `Place`), `Citation` -> `source` (-> `Source`). Anything
-  else one-to-one -- a person's other (non-birth/death) events -- has no
-  relationship path at all yet, only whatever's reachable as a JSON path
-  within one record's own `json_data`.
+  -> `place` (-> `Place`), `Citation` -> `source` (-> `Source`), `Place` ->
+  `enclosed_by` (-> `Place`, self-referencing -- see Done below). Checked
+  directly against Gramps' own object model (every `get_*_handle()` across
+  all ten primary types) rather than assumed -- this appears to be the
+  complete set of genuine one-to-one FK-like fields; a person's other
+  (non-birth/death) events, for instance, aren't a missing one-to-one
+  candidate at all -- Gramps has no dedicated ref-index column for them the
+  way `birth_ref_index`/`death_ref_index` exist, so they're inherently
+  one-to-many (already reachable via the `events` collection), not a gap
+  in this list.
 - One-to-many **collections** are registered on every type Gramps' own
   object model gives one to, queryable via `exists(name, condition)`/
   `count(name, condition)` (see `docs/where_expr.md`'s "One-to-many
@@ -264,6 +270,59 @@ same-table special case. Existing `children`/`notes` tests (no self-
 reference) needed only a cosmetic SQL-shape-assertion update, not a
 behavior fix -- their target and outer tables were never the same to begin
 with.
+
+### `Place.enclosed_by` -- one-to-one self-reference (item E)
+
+Implemented -- but not the vague "several missing relationships" item E's
+own name originally implied. Checked Gramps' actual object model first
+(every `get_*_handle()` across all ten primary types, plus each
+`ObjectTypeSpec`'s flat columns) rather than assuming: the six already
+registered turned out to be *every* genuine one-to-one FK-like field except
+one -- `Place.enclosed_by`, a real, indexed flat column already in Gramps'
+own DBAPI schema (`enclosed_by VARCHAR(50)`, computed as the first
+`placeref_list` entry's handle -- see `gen/db/generic.py`), already exposed
+on `PLACE`'s spec via `extra_columns`, but never registered in
+`_RELATIONSHIPS`. "A person's other events," this section's own original
+example of a missing one-to-one relationship, turned out not to be one at
+all -- Gramps has no dedicated ref-index column for any event type besides
+birth/death, so anything else is inherently one-to-many (the `events`
+collection already covers it), not a one-to-one gap.
+
+**Found a second self-reference bug, not just registered a name** --
+`enclosed_by` is self-referencing (`Place` -> `Place`), the same shape as
+`Person.associations` above, and it exposed a bug in `RelatedObject`
+rendering nobody had hit before, since no two existing relationships ever
+targeted the same table as their own outer table. `_render_related_object`
+rendered every hop's target as a bare, unaliased table name
+(`FROM place WHERE place.handle = ...`) -- for a self-referencing hop, the
+subquery's own `FROM place` shadows the outer scope's `place`, so a
+correlated reference meant for the outer row (`place.enclosed_by`) resolves
+to the subquery's *own* row instead, making `place.handle = place.enclosed_by`
+true only for a place enclosing itself (never, in real data) -- the whole
+relationship silently matched nothing, for every row, regardless of real
+data. Confirmed empirically before diagnosing (`enclosed_by.title ==
+'Cook County'` matched zero rows against a real 3-level place hierarchy
+where it should have matched one).
+
+Unlike the `Collection` fix (a single flat subquery, a *fixed* alias
+suffix was enough), `RelatedObject` nests arbitrarily deep, so a fixed
+suffix isn't sufficient here -- two nested self-referencing hops
+(`enclosed_by.enclosed_by`) would still collide with *each other* under a
+fixed suffix. Fixed with a `_depth` parameter threaded through
+`_render_related_object`'s recursion, giving every level a distinct alias
+(`{target_table}__hop{depth}`) unconditionally -- not just when a collision
+is detected, matching the same "one code path stays correct regardless of
+which future relationship happens to self-reference" philosophy as the
+`Collection` fix. Every pre-existing `RelatedObject` test needed only a
+cosmetic SQL-shape-assertion update (the alias appearing in the expected
+SQL text), not a behavior fix -- no existing relationship chain was ever
+actually self-referencing before this one.
+
+Verified three ways: parser-level shape (`enclosed_by.title`,
+`enclosed_by.enclosed_by.title`), real end-to-end SQLite execution against
+a 3-level hierarchy (city -> county -> state) for both one and two hops,
+and a SQL-vs-evaluator agreement test in the same style as the
+`associations`/`Not`/missing-value regression guards.
 
 ### `is` / `is not` / `not in`
 
@@ -626,10 +685,6 @@ rendering on top, the one piece neither `count()` nor `len()` needs.
 
 ### Other gaps (not yet scoped to this level of detail)
 
-- **More one-to-one relationships**: non-birth/death events, and anything
-  else not yet in `_RELATIONSHIPS` -- mechanically similar to the six
-  already there (`Citation.source` was the most recent, see Done above), a
-  registry entry each.
 - **`exists(...)`/`count(...)` condition referencing the *outer* row** (e.g.
   "a child with the same surname as the father") -- not supported; would
   need the condition's column resolution to see two rows (target *and*
@@ -672,7 +727,7 @@ database/collation concern, not a `where_expr` language gap.)
 Each row is lettered so the dependency analysis right below it can refer
 back to individual items. Letters are kept stable as items get implemented
 (rather than renumbered) so old discussion of e.g. "B depends on..." stays
-correct -- **A, B, C, and D have shipped** (see Done above) and are kept
+correct -- **A, B, C, D, and E have shipped** (see Done above) and are kept
 here, struck through, so that history stays legible.
 
 | # | Example | Gap | Difficulty |
@@ -681,7 +736,7 @@ here, struck through, so that history stays legible.
 | ~~B~~ | ~~`Date(...) < mother.birth.sortval` (literal on the left)~~ | **Done** -- see [Operand ordering](#operand-ordering-value-op-field) above | ~~2~~ |
 | ~~C~~ | ~~`gender is None`, `mother is not None`, `tag not in tags`~~ | **Done** -- see `is` / `is not` / `not in` above | ~~1~~ |
 | ~~D~~ | ~~`other_field in field`~~ | **Done** -- see [Field-vs-field substring `in`](#field-vs-field-substring-in-other_field-in-field) above | ~~2~~ |
-| E | a person's non-birth/death event, one-to-one | only 6 `_RELATIONSHIPS` entries registered | 1 |
+| ~~E~~ | ~~a person's non-birth/death event, one-to-one~~ | **Done** -- see [`Place.enclosed_by`](#placeenclosed_by----one-to-one-self-reference-item-e) above | ~~1~~ |
 | F | `event.type == EventType.MARRIAGE` (or `FamilyRelType.*`, `NameType.*`, ...) | ~~only `Person`/`Citation`/`Note` constants wired~~ -- **stale, already Done**: `_CONSTANT_CLASSES` (query_lang.py) already covers `EventType`/`FamilyRelType`/`NameType`/`PlaceType`/and 10 more `GrampsType` classes, verified directly against a live parse (`event.type.value == EventType.BIRTH` compiles today). This row's original premise no longer holds; kept only as a note to fix the "Values and functions" bullet in Current limitations, not as an open item. | n/a |
 | G | `len(primary_name.surname_list) > 1` | see `len()` section above | 3 |
 | H | `upper(surname) == 'SMITH'`, string concatenation, arithmetic | no general function calls -- only `like()`/`Date()` are whitelisted | 3-4 |
@@ -735,6 +790,22 @@ were split apart in the first place) compiles correctly, needing both
 pieces together. See
 [Chained comparisons](#chained-comparisons-1--gender--3) under Done above.
 
+**E shipped at its original difficulty-1 estimate on the surface, but its
+own premise was wrong, the same way F's was** -- checked Gramps' actual
+object model before assuming "several missing relationships" was accurate,
+and found exactly one real candidate (`Place.enclosed_by`), not several --
+"a person's other events," the item's own motivating example, turned out
+not to be a one-to-one gap at all. The registry entry itself really was
+difficulty 1, as predicted -- but registering it surfaced a second,
+unplanned `RelatedObject` self-reference bug (see
+[`Place.enclosed_by`](#placeenclosed_by----one-to-one-self-reference-item-e)
+under Done above), the same class of issue as the `Collection`
+self-reference bug found while shipping "More relationships/collections."
+Two for two now: every self-referencing relationship/collection registered
+in this project so far has exposed a latent same-table-shadowing bug the
+first time it was tried, in a part of the rendering code that had never
+needed to handle it before.
+
 ### Dependencies between the items above
 
 Checked directly against `_translate_compare`'s actual branches rather than
@@ -783,8 +854,11 @@ each other cheaper:
   exactly what `exists()` already does. `len()` isn't a real prerequisite --
   nesting `len()` inside an `any()` condition is a plausible nice-to-have,
   not something I structurally depends on.
-- **E, J, K are independent islands.** E is pure registry entries, sharing
-  no code with anything else here. J extends `exists`/`count`'s
+- **E, J, K were/are independent islands.** E (shipped) was pure registry
+  entries plus its own `RelatedObject`-rendering fix, sharing no code with
+  A-D/F-I -- its dependency was on the *actual object model*, not on
+  anything else in this list, which is exactly what made "just a registry
+  entry" an incomplete prediction. J extends `exists`/`count`'s
   already-Done machinery to see two rows at once -- orthogonal to A-I. K
   lives entirely in `order_by`/keyset pagination, a different subsystem
   from `where_expr` compilation -- touches neither `_translate_compare`
@@ -808,3 +882,14 @@ own -- D's own difficulty barely moved (2 either way), but the *reason*
 moved entirely, from "reuse B's classifier" to "`Contains` never had
 field-vs-field support at all, and neither did anything
 flat-column-vs-flat-column."
+
+**E adds a second, related lesson**: a difficulty-1 "just a registry
+entry" item can still hide a real bug if it's the *first* instance of a
+shape nothing before it exercised -- here, the first self-referencing
+`RelatedObject`. This is now a pattern, not a one-off: both self-reference
+cases tried so far (`Person.associations` as a `Collection`,
+`Place.enclosed_by` as a `RelatedObject`) each broke on their first attempt,
+in each mechanism's own previously-untested same-table-shadowing corner.
+Worth checking proactively before registering any *future* self-referencing
+relationship or collection, rather than waiting to find it by accident
+again a third time.

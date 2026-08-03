@@ -383,6 +383,17 @@ Citation "source.title == 'Census Records'"
 `source` reaches from a citation to the source it cites -- works just like
 `father`/`mother` reaching from a family to a parent.
 
+### Goal: Find places enclosed by a specific county
+
+```
+Place "enclosed_by.title == 'Cook County'"
+```
+
+`enclosed_by` reaches from a place to the place that encloses it (a city's
+county, say) -- and since it points to another `Place`, it chains with
+itself: `enclosed_by.enclosed_by.title` reaches two levels up (skipping the
+county to get straight to the state).
+
 ### Goal: Find people with no death record at all
 
 ```
