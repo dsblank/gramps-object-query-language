@@ -516,6 +516,30 @@ def test_count_children_with_condition(db):
     assert result == []
 
 
+# --- comprehension sugar for exists(...)/count(...) --------------------------
+
+
+def test_any_comprehension_matches_exists_children_with_condition(db):
+    # Same fixture, same result as test_exists_children_with_condition --
+    # any(...) is pure sugar for exists(...), so it has to answer identically.
+    result = run(db, "Family", "any(c.given_name == 'Steve' for c in children)")
+    assert result == []
+    result = run(db, "Family", "any(c.given_name == 'Robert' for c in children)")
+    assert result == [("fam1",)]
+
+
+def test_len_listcomp_matches_count_children_with_condition(db):
+    # Same fixture, same result as test_count_children_with_condition.
+    result = run(
+        db, "Family", "len([c for c in children if c.given_name == 'Robert']) == 1"
+    )
+    assert result == [("fam1",)]
+    result = run(
+        db, "Family", "len([c for c in children if c.given_name == 'Steve']) == 1"
+    )
+    assert result == []
+
+
 def test_count_children_more_than_two_readme_example():
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE family (handle TEXT, json_data TEXT)")

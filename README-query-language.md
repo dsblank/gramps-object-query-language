@@ -447,6 +447,20 @@ Comparisons can be chained just like in real Python -- this means exactly
 1, 1950')`, just shorter to write. Any comparison operator works in a
 chain, including a mix of them.
 
+### Goal: Find families that have a child named Steve, written as a comprehension
+
+```
+Family "any(c.given_name == 'Steve' for c in children)"
+```
+
+The same query as the "child named Steve" example above, just spelled the
+way real Python would write "does any of these match" -- `any(...)`
+wrapping a generator expression is sugar for `exists(...)` and compiles to
+the exact same query, not merely an equivalent one. `count(...)` has a
+matching spelling too, as a list comprehension inside `len(...)`:
+`len([c for c in children if c.given_name == 'Robert']) == 1` means the
+same thing as `count(children, given_name == 'Robert') == 1`.
+
 ## Things this can't do (yet)
 
 - Anything beyond the patterns shown above -- this is a small, fixed set of

@@ -501,9 +501,62 @@ execution (`test_where_expr_examples.py`'s
 returns the identical result set to the `and`-joined form, not just an
 identical wire shape.
 
+### Comprehension sugar for `exists(...)`/`count(...)` (`any(... for x in rel)`, `len([... for x in rel])`)
+
+Implemented -- `_desugar_comprehensions`/`_ComprehensionDesugarer`
+(query_lang.py), a preprocessing pass over the raw `ast` tree that runs
+once, before `_translate_top_level` -- rewrites `any(cond for x in rel [if
+...])` into `exists(rel, cond)` and `len([... for x in rel if ...])` into
+`count(rel, ...)`, so every `_translate_*` function still only ever sees
+the two original call forms; nothing downstream knows the sugar spelling
+was involved.
+
+The one real piece of work is dropping the loop variable: `exists`/
+`count`'s condition is parsed directly against the collection's target
+type with no prefix of its own, so `x.field` inside the comprehension has
+to become plain `field` -- `_BoundNameStripper` does that once per
+comprehension level, and composes correctly across nested comprehensions
+(`any(any(e.type.value == X for e in c.events) for c in children)` ->
+`exists(children, exists(events, type.value == X))`) with no symbol table,
+since each level's stripper fully consumes or errors on every reference to
+its own bound name before the next level up ever runs -- including the
+case where an inner comprehension reuses the same loop-variable name as an
+outer one (verified: resolves correctly, matching real Python's own rule
+that a comprehension's first `for` clause's `iter` is evaluated in the
+*enclosing* scope, not its own).
+
+Scope matches what `exists`/`count` already support by hand, on purpose,
+so the sugar can't silently become more expressive than the call syntax
+it's standing in for: exactly one `for` clause, a plain-name loop target
+(no tuple unpacking), and `in ...` restricted to a bare collection name or
+exactly one attribute off an *enclosing* comprehension's own loop variable
+(mirroring `exists(children, exists(events, ...))`'s existing nesting,
+never a longer chain). `all(...)`/`sum(...)` deliberately not covered --
+`all(...)` would need double-negation (`not exists(rel, not cond)`) for
+not much payoff without a concrete motivating case yet.
+
+**Naming note for whoever eventually builds the `len()`/`any()` items
+below:** both names are now spoken for by this sugar too, but the two
+meanings don't actually collide -- Python's own call syntax keeps them
+apart. This sugar only ever fires when the *sole* argument is a real
+`ast.GeneratorExp`/`ast.ListComp` node (`_rewrite_any`/`_rewrite_len` in
+`query_lang.py` check the node type explicitly and raise otherwise); the
+array-length/membership forms described below take a bare path (or path +
+condition) as their argument instead, a different, unambiguous AST shape.
+Building either later item just means adding an `else` branch to the
+existing `any`/`len` dispatch in `_ComprehensionDesugarer.visit_Call` for
+"argument wasn't a comprehension," not renaming anything.
+
 ## Possibilities
 
 ### `len()` / array-length comparisons
+
+**Naming note:** `len(...)` is already in use for a *different* thing --
+comprehension sugar for `count(...)`, see Done above -- but the two don't
+collide; that form only fires when `len(...)`'s sole argument is a real
+`ast.ListComp` node, so a bare-path argument here (`len(x) > 1`) is free to
+mean this instead. Building this just adds an `else` branch to the
+existing dispatch, not a rename.
 
 Motivated by: "does a person have more than one surname recorded?" --
 today only answerable indirectly, by indexing a fixed position
@@ -585,6 +638,13 @@ recorded" reads as "zero", not "unknown"); non-array-value and NULL-vs-zero
 edge cases written as tests *before* either dialect is wired up.
 
 ### `any(...)` -- intra-record JSON array membership
+
+**Naming note:** `any(...)` is already in use for a *different* thing --
+comprehension sugar for `exists(...)`, see Done above -- but the two don't
+collide; that form only fires when `any(...)`'s sole argument is a real
+`ast.GeneratorExp` node, so a path-and-condition argument list here
+(`any(path, condition)`) is free to mean this instead. Building this just
+adds an `else` branch to the existing dispatch, not a rename.
 
 Resolves an open question from `exists(...)`'s own scoping pass (see
 "Done" above): is `any` just redundant with `exists`? **No** -- they target

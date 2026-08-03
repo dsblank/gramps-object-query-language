@@ -25,10 +25,19 @@ Uses `ast.parse(expr, mode="eval")` as pure syntax, never `eval()` or
 `compile()` -- the tree is inspected and translated node-by-node into plain
 JSON, never executed. Safety comes from whitelisting node *shapes*, not
 blacklisting names: any AST node this module doesn't explicitly recognize
-(function calls other than the one whitelisted `like(...)` form, lambdas,
-comprehensions, attribute access building toward dunder names, imports,
+(function calls other than the whitelisted `like(...)`/`any(...)`/`len(...)`
+forms, lambdas, attribute access building toward dunder names, imports,
 walrus, f-strings, ...) is rejected by `_translate_*` simply never handling
 it and falling through to a `QueryLangError`.
+
+The one exception to "parsed, never rewritten": `any(cond for x in rel [if
+...])` and `len([... for x in rel if ...])` are comprehension *sugar* for
+`exists(rel, cond)`/`count(rel, cond)`, desugared by a dedicated AST pass
+(`_desugar_comprehensions`, see the "comprehension sugar" section below)
+before any `_translate_*` function runs -- every other comprehension shape
+(bare `[...]`/`{...}`/`{...: ...}`, more than one `for` clause, tuple-unpack
+targets, ...) still falls through to the same `QueryLangError` any other
+unrecognized node shape gets.
 
 Deliberately not wired to any HTTP endpoint yet -- see `query.py`'s
 `JsonPath`, which followed the same build-it-standalone-first,
@@ -691,6 +700,235 @@ def _translate_top_level(node: ast.AST, spec: ObjectTypeSpec) -> List[dict]:
     return [translated]
 
 
+# --- comprehension sugar for exists(...)/count(...) -------------------------
+#
+# `any(cond for x in rel)`/`len([... for x in rel if cond])` are pure syntax
+# sugar for `exists(rel, cond)`/`count(rel, cond)` -- rewritten away entirely
+# by `_ComprehensionDesugarer` before `_translate_top_level` ever runs, so
+# every `_translate_*` function above keeps treating `exists(...)`/`count(...)`
+# as the only call shapes that carry a nested condition. Nothing downstream of
+# this section knows comprehension syntax was ever involved.
+#
+# The one piece of real work is dropping the loop variable: `where_expr`'s
+# `exists`/`count` condition is parsed directly against the collection's
+# target type, with no loop-variable prefix of its own (`exists(children,
+# given_name == 'Steve')`, not `exists(children, c.given_name == 'Steve')`),
+# so `c.given_name` has to become plain `given_name` -- `_BoundNameStripper`
+# does exactly that, once per comprehension level.
+
+
+class _BoundNameStripper(ast.NodeTransformer):
+    """Rewrites a comprehension body so every `<bound_name>.attr` /
+    `<bound_name>[i]` chain drops its `<bound_name>` root -- `c.given_name`
+    becomes plain `given_name`, `c.events` becomes plain `events` (so a
+    *nested* comprehension's already-desugared `exists(c.events, ...)`/
+    `count(c.events, ...)` call, produced one level down, loses its `c.`
+    prefix too -- this is a blind syntactic substitution, indifferent to
+    what's inside, so it composes correctly across nesting levels without
+    a symbol table).
+
+    A bare reference to `bound_name` with nothing after it (`c == x`, `c in
+    [...]`) has no equivalent -- `where_expr` conditions are always a field
+    path, never "the whole related object" -- so that's rejected with a
+    clear error rather than silently dropped.
+
+    Reusing the same loop-variable name at two nesting levels (`any(any(c.a
+    == 1 for c in c.rel) for c in top)`) works correctly without this class
+    needing to track more than one name at a time: the *inner*
+    `_BoundNameStripper` runs first (`_ComprehensionDesugarer` desugars
+    bottom-up) and either strips or errors on every reference to its own
+    `c` within its own `elt`/`ifs`, so nothing referring to "the inner `c`"
+    can survive unconsumed into the outer pass -- any `c` the outer stripper
+    later encounters (e.g. in the inner-produced call's own collection-name
+    argument) unambiguously belongs to the outer scope, exactly matching
+    real Python's own scoping rule that a comprehension's first `for`
+    clause's `iter` is evaluated in the *enclosing* scope.
+    """
+
+    def __init__(self, bound_name: str):
+        self.bound_name = bound_name
+
+    def _is_own_root(self, node: ast.AST) -> bool:
+        return isinstance(node, ast.Name) and node.id == self.bound_name
+
+    def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
+        if self._is_own_root(node.value):
+            return ast.copy_location(ast.Name(id=node.attr, ctx=ast.Load()), node)
+        node.value = self.visit(node.value)
+        return node
+
+    def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
+        if self._is_own_root(node.value):
+            raise QueryLangError(
+                f"can't index the loop variable directly: {ast.dump(node)}"
+            )
+        node.value = self.visit(node.value)
+        return node
+
+    def visit_Name(self, node: ast.Name) -> ast.AST:
+        if node.id == self.bound_name:
+            raise QueryLangError(
+                f"'{self.bound_name}' can only be used as '{self.bound_name}.field', "
+                f"never compared directly (there's no whole-object comparison in "
+                f"where_expr, only field paths): {ast.dump(node)}"
+            )
+        return node
+
+    def _reject_nested_comprehension(self, node: ast.AST) -> ast.AST:
+        # By the time a condition reaches this stripper, any comprehension
+        # nested inside it should already have been rewritten into an
+        # `exists(...)`/`count(...)` call by `_ComprehensionDesugarer`
+        # running bottom-up -- a raw comprehension surviving to this point
+        # means it wasn't wrapped in a recognized `any(...)`/`len(...)`
+        # form, the same "not a whitelisted shape" rejection every other
+        # unrecognized node gets.
+        raise QueryLangError(
+            f"comprehension must be wrapped in any(...) or len([...]): {ast.dump(node)}"
+        )
+
+    visit_GeneratorExp = _reject_nested_comprehension
+    visit_ListComp = _reject_nested_comprehension
+    visit_SetComp = _reject_nested_comprehension
+    visit_DictComp = _reject_nested_comprehension
+
+
+def _comprehension_generator(comp: Union[ast.GeneratorExp, ast.ListComp], call: ast.Call) -> ast.comprehension:
+    """Validate and return the single `for x in rel` clause of a
+    comprehension being desugared -- `call` is only used for error messages
+    (the original `any(...)`/`len(...)` call, more useful to a caller than
+    the comprehension fragment alone).
+
+    Restricted on purpose to exactly what `exists(...)`/`count(...)` already
+    support written by hand: one loop variable, bound to a plain name (not a
+    tuple-unpack), iterating either a bare collection name (`children`) or
+    exactly one attribute off an *enclosing* comprehension's own loop
+    variable (`c.events`, matching how `exists(children, exists(events,
+    ...))` nests today) -- never a longer chain, so this sugar can't
+    silently become more expressive than the call syntax it stands in for.
+    """
+    if len(comp.generators) != 1:
+        raise QueryLangError(
+            f"comprehension must have exactly one 'for' clause: {ast.dump(call)}"
+        )
+    generator = comp.generators[0]
+    if generator.is_async:
+        raise QueryLangError(f"async comprehensions aren't supported: {ast.dump(call)}")
+    if not isinstance(generator.target, ast.Name):
+        raise QueryLangError(
+            f"comprehension's loop variable must be a plain name: {ast.dump(call)}"
+        )
+    iter_node = generator.iter
+    is_bare_name = isinstance(iter_node, ast.Name)
+    is_one_attr_off_a_name = isinstance(iter_node, ast.Attribute) and isinstance(
+        iter_node.value, ast.Name
+    )
+    if not (is_bare_name or is_one_attr_off_a_name):
+        raise QueryLangError(
+            "comprehension's 'in ...' must be a bare collection name, or exactly "
+            f"one attribute off an enclosing loop variable: {ast.dump(call)}"
+        )
+    return generator
+
+
+def _and_together(parts: List[ast.expr]) -> ast.expr:
+    return parts[0] if len(parts) == 1 else ast.BoolOp(op=ast.And(), values=parts)
+
+
+def _any_condition(comp: ast.GeneratorExp, bound_name: str) -> Union[ast.expr, None]:
+    """`any(...)`'s condition: `elt` *is* the boolean predicate (unlike
+    `len([...])`'s `elt`, which only ever projects), ANDed with any `if`
+    clauses on the generator itself -- `any(x.a == 1 for x in rel if x.b ==
+    2)` means the same as `any(x.a == 1 and x.b == 2 for x in rel)`. A bare
+    `elt` that's just the loop variable itself (`any(x for x in rel if
+    x.b == 2)`) carries no predicate of its own -- the condition is then
+    whatever the `if` clauses provide alone (or `None`, "no condition at
+    all", if there aren't any either -- `any(x for x in rel)` is just
+    `exists(rel)`).
+    """
+    stripper = _BoundNameStripper(bound_name)
+    parts = []
+    if not (isinstance(comp.elt, ast.Name) and comp.elt.id == bound_name):
+        parts.append(stripper.visit(comp.elt))
+    parts.extend(stripper.visit(if_node) for if_node in comp.generators[0].ifs)
+    return _and_together(parts) if parts else None
+
+
+def _len_condition(comp: ast.ListComp, bound_name: str) -> Union[ast.expr, None]:
+    """`len([...])`'s condition: unlike `any(...)`, `elt` here only ever
+    *projects* what gets collected (traditionally into the list being
+    measured), so it carries no predicate -- `len([x for x in rel if
+    x.a == 1])` counts by its `if` clause alone. `elt` itself is required to
+    be trivial (the loop variable, or a plain literal like `1`) so nothing
+    meaningful is silently thrown away by ignoring it; anything else is
+    rejected rather than guessed at.
+    """
+    elt = comp.elt
+    if not (
+        (isinstance(elt, ast.Name) and elt.id == bound_name)
+        or isinstance(elt, ast.Constant)
+    ):
+        raise QueryLangError(
+            "len([...])'s projection must be the loop variable or a plain "
+            f"literal (e.g. 'len([1 for x in rel if ...])'): {ast.dump(elt)}"
+        )
+    stripper = _BoundNameStripper(bound_name)
+    ifs = [stripper.visit(if_node) for if_node in comp.generators[0].ifs]
+    return _and_together(ifs) if ifs else None
+
+
+def _make_call(name: str, iter_node: ast.expr, condition: Union[ast.expr, None]) -> ast.Call:
+    args = [iter_node] if condition is None else [iter_node, condition]
+    return ast.Call(func=ast.Name(id=name, ctx=ast.Load()), args=args, keywords=[])
+
+
+class _ComprehensionDesugarer(ast.NodeTransformer):
+    """Rewrites `any(cond for x in rel [if ...])` into `exists(rel, cond)`,
+    and `len([... for x in rel if ...])` into `count(rel, ...)`, run once
+    over the whole tree before `_translate_top_level` -- see this section's
+    module-level comment above.
+
+    Runs bottom-up (`generic_visit` before inspecting the current node), so
+    a comprehension nested inside another gets desugared first -- by the
+    time the outer level's own condition is stripped of its loop variable
+    (`_BoundNameStripper`), any inner `exists(...)`/`count(...)` call
+    already sitting in it gets its own loop-variable prefix (`c.events` ->
+    `events`) stripped along with everything else, with no special-casing
+    needed for "this child happens to be a call I generated a moment ago."
+    """
+
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        self.generic_visit(node)
+        if not isinstance(node.func, ast.Name) or node.keywords:
+            return node
+        name = node.func.id
+        if name == "any":
+            if len(node.args) != 1 or not isinstance(node.args[0], ast.GeneratorExp):
+                raise QueryLangError(
+                    "any(...) is only supported wrapping a generator comprehension, "
+                    f"e.g. any(x.field == 1 for x in rel): {ast.dump(node)}"
+                )
+            comp = node.args[0]
+            generator = _comprehension_generator(comp, node)
+            condition = _any_condition(comp, generator.target.id)
+            return ast.copy_location(_make_call("exists", generator.iter, condition), node)
+        if name == "len":
+            if len(node.args) != 1 or not isinstance(node.args[0], ast.ListComp):
+                raise QueryLangError(
+                    "len(...) is only supported wrapping a list comprehension, "
+                    f"e.g. len([1 for x in rel if x.field == 1]): {ast.dump(node)}"
+                )
+            comp = node.args[0]
+            generator = _comprehension_generator(comp, node)
+            condition = _len_condition(comp, generator.target.id)
+            return ast.copy_location(_make_call("count", generator.iter, condition), node)
+        return node
+
+
+def _desugar_comprehensions(node: ast.AST) -> ast.AST:
+    rewritten = _ComprehensionDesugarer().visit(node)
+    return ast.fix_missing_locations(rewritten)
+
+
 def parse_expr_for_spec(spec: ObjectTypeSpec, expr: str) -> List[dict]:
     """Parse an "almost Python" expression against an already-known `ObjectTypeSpec`.
 
@@ -705,7 +943,8 @@ def parse_expr_for_spec(spec: ObjectTypeSpec, expr: str) -> List[dict]:
         tree = ast.parse(expr, mode="eval")
     except SyntaxError as error:
         raise QueryLangError(f"invalid syntax: {error}") from error
-    return _translate_top_level(tree.body, spec)
+    body = _desugar_comprehensions(tree.body)
+    return _translate_top_level(body, spec)
 
 
 def parse_expr(namespace: str, expr: str) -> List[dict]:

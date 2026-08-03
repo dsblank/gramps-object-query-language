@@ -1203,6 +1203,165 @@ def test_count_on_right_hand_side_rejected():
         parse_expr("family", "1 < count(children)")
 
 
+# --- comprehension sugar for exists(...)/count(...) --------------------------
+
+
+def test_any_comprehension_matches_exists_with_condition():
+    sugar = parse_expr("family", "any(c.given_name == 'Steve' for c in children)")
+    plain = parse_expr("family", "exists(children, given_name == 'Steve')")
+    assert sugar == plain
+
+
+def test_any_comprehension_bare_target_matches_exists_without_condition():
+    sugar = parse_expr("family", "any(c for c in children)")
+    plain = parse_expr("family", "exists(children)")
+    assert sugar == plain
+
+
+def test_any_comprehension_if_clause_alone_is_the_condition():
+    # elt is just the bound name (no predicate of its own) -- the condition
+    # comes entirely from the generator's own "if" clause.
+    sugar = parse_expr("family", "any(c for c in children if c.given_name == 'Steve')")
+    plain = parse_expr("family", "exists(children, given_name == 'Steve')")
+    assert sugar == plain
+
+
+def test_any_comprehension_elt_and_if_clause_are_anded_together():
+    sugar = parse_expr(
+        "family", "any(c.gender == 1 for c in children if c.given_name == 'Steve')"
+    )
+    plain = parse_expr(
+        "family", "exists(children, gender == 1 and given_name == 'Steve')"
+    )
+    assert sugar == plain
+
+
+def test_any_comprehension_condition_can_chain_relationships():
+    sugar = parse_expr("family", "any(c.birth.place.title == 'Chicago' for c in children)")
+    plain = parse_expr("family", "exists(children, birth.place.title == 'Chicago')")
+    assert sugar == plain
+
+
+def test_not_any_comprehension_matches_not_exists():
+    sugar = parse_expr("family", "not any(c.given_name == 'Steve' for c in children)")
+    plain = parse_expr("family", "not exists(children, given_name == 'Steve')")
+    assert sugar == plain
+
+
+def test_any_comprehension_composes_with_and():
+    sugar = parse_expr(
+        "family",
+        "any(c.given_name == 'Steve' for c in children) and father.surname == 'Smith'",
+    )
+    plain = parse_expr(
+        "family",
+        "exists(children, given_name == 'Steve') and father.surname == 'Smith'",
+    )
+    assert sugar == plain
+
+
+def test_len_listcomp_matches_count_with_condition():
+    sugar = parse_expr(
+        "family", "len([c for c in children if c.given_name == 'Robert']) == 1"
+    )
+    plain = parse_expr("family", "count(children, given_name == 'Robert') == 1")
+    assert sugar == plain
+
+
+def test_len_listcomp_constant_elt_matches_count():
+    sugar = parse_expr("family", "len([1 for c in children]) > 2")
+    plain = parse_expr("family", "count(children) > 2")
+    assert sugar == plain
+
+
+def test_len_listcomp_supports_in_operator():
+    sugar = parse_expr("family", "len([c for c in children]) in [1, 2, 3]")
+    plain = parse_expr("family", "count(children) in [1, 2, 3]")
+    assert sugar == plain
+
+
+def test_nested_any_comprehension_matches_nested_exists():
+    # Family -> children (Person) -> events (Event), two collection hops.
+    sugar = parse_expr(
+        "family",
+        "any(any(e.type.value == 12 for e in c.events) for c in children)",
+    )
+    plain = parse_expr(
+        "family", "exists(children, exists(events, type.value == 12))"
+    )
+    assert sugar == plain
+
+
+def test_nested_any_comprehension_shadowed_loop_variable_still_resolves():
+    # Reusing "c" at both nesting levels still resolves correctly -- the
+    # inner comprehension's own "c" is fully consumed before the outer
+    # pass ever runs (see _BoundNameStripper's docstring).
+    sugar = parse_expr(
+        "family", "any(any(c.a == 1 for c in c.events) for c in children)"
+    )
+    plain = parse_expr(
+        "family", "exists(children, exists(events, a == 1))"
+    )
+    assert sugar == plain
+
+
+def test_any_comprehension_bare_loop_variable_comparison_rejected():
+    # "c == 1" has no equivalent -- where_expr conditions are always a
+    # field path, never a comparison against "the whole related object".
+    with pytest.raises(QueryLangError):
+        parse_expr("family", "any(c == 1 for c in children)")
+
+
+def test_any_comprehension_tuple_target_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("family", "any(c.a == 1 for c, d in children)")
+
+
+def test_any_comprehension_multiple_for_clauses_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("family", "any(c.a == 1 for c in children for d in c.notes)")
+
+
+def test_any_comprehension_not_wrapping_generator_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("family", "any(children)")
+
+
+def test_len_listcomp_not_wrapping_listcomp_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("family", "len(children) > 2")
+
+
+def test_len_listcomp_computed_elt_rejected():
+    # elt must be trivial (the loop var or a literal) -- len(...) has no
+    # way to fold a computed projection into a condition, so it's rejected
+    # rather than silently ignored.
+    with pytest.raises(QueryLangError):
+        parse_expr("family", "len([c.a for c in children]) > 0")
+
+
+def test_bare_comprehension_not_wrapped_in_any_or_len_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("family", "[c.a for c in children] == 1")
+
+
+def test_compile_expr_any_comprehension_matches_exists():
+    # Exists doesn't define __eq__ (see test_compile_expr_not_becomes_not's
+    # comment above) -- compare repr() instead, same as comparing fields.
+    _, sugar_where = compile_expr(
+        "family", "any(c.given_name == 'Steve' for c in children)"
+    )
+    _, plain_where = compile_expr("family", "exists(children, given_name == 'Steve')")
+    assert isinstance(sugar_where, Exists)
+    assert repr(sugar_where) == repr(plain_where)
+
+
+def test_compile_expr_len_listcomp_matches_count():
+    _, sugar_where = compile_expr("family", "len([c for c in children]) > 2")
+    _, plain_where = compile_expr("family", "count(children) > 2")
+    assert sugar_where == plain_where
+
+
 # --- compile_expr / compile_expr_for_spec (expr string -> query.py AST) ------
 
 

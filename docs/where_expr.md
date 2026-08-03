@@ -367,6 +367,62 @@ verbatim, just wrapped as `(SELECT COUNT(*) FROM ...)` instead of
 at all) is `0`, not `NULL`, the same way `COUNT(*)` over zero matching rows
 always is in SQL.
 
+## Comprehension sugar: `any(...)` and `len([...])`
+
+`exists(children, given_name == 'Steve')` reads reasonably close to plain
+English, but for anyone more used to reaching for Python's own idiom, the
+same query can be spelled as a generator expression instead:
+
+```python
+Family "any(c.given_name == 'Steve' for c in children)"
+```
+
+This is pure syntax sugar -- parsed and immediately rewritten into exactly
+the `exists(...)` form above before anything else runs, so it compiles to
+the identical query, not merely an equivalent one. `count(...)` has a
+matching spelling, as a list comprehension inside `len(...)`:
+
+```python
+Family "len([c for c in children if c.given_name == 'Robert']) == 1"
+```
+
+which rewrites to `count(children, given_name == 'Robert') == 1`. Both
+directions are checked directly in
+[`test_query_lang.py`](../gramps_object_query_language/tests/test_query_lang.py)
+(`parse_expr("any(...)") == parse_expr("exists(...)")`, and likewise for
+`len([...])`/`count(...)`), not just documented as equivalent.
+
+A few rules of thumb, all mirroring what `exists(...)`/`count(...)`
+already support written by hand rather than adding anything new underneath:
+
+- `any(...)`'s comprehension `elt` *is* the condition (`any(c.a == 1 for c
+  in rel)`); a bare loop variable with no attribute after it (`any(c for c
+  in rel)`) has no condition of its own, matching `exists(rel)` with
+  nothing to filter on. An `if` clause on the generator ANDs in as an
+  additional condition either way (`any(c for c in rel if c.a == 1)` and
+  `any(c.a == 1 for c in rel)` compile identically).
+- `len([...])`'s projection (its `elt`) is required to be trivial -- the
+  loop variable itself, or a plain literal like `1` -- since unlike
+  `any(...)`'s `elt`, it was never a condition to begin with; the condition
+  comes entirely from the comprehension's `if` clause(s), if any.
+- Only one `for` clause is allowed, and the loop variable must be a plain
+  name (no tuple-unpacking) -- exactly what a single `exists`/`count` call
+  already assumes.
+- Nested comprehensions work, mapping onto nested `exists`/`count` calls
+  the same way a hand-written nested call would --
+  `any(any(e.type.value == EventType.BIRTH for e in c.events) for c in
+  children)` is `exists(children, exists(events, type.value ==
+  EventType.BIRTH))` -- but the inner `for ... in ...` is restricted to a
+  bare collection name or exactly one attribute off the *enclosing*
+  comprehension's own loop variable (`c.events`, not a longer chain), the
+  same restriction `exists`'s own first argument already has.
+
+`all(...)`/`sum(...)` aren't recognized -- there's no established
+motivating query for them yet, and `all(...)` in particular would need a
+double negation (`not exists(rel, not cond)`) under the hood to mean the
+same thing SQL's `NOT EXISTS` doesn't already give you a shorter way to
+reach for.
+
 ## Genealogy examples
 
 One example of each of the five registered relationship links, plus a few
@@ -573,9 +629,15 @@ Person "birth.date.dateval[6] == 1970"
 
 ## What's *not* supported
 
-- Arbitrary function calls, lambdas, comprehensions, f-strings, imports --
-  the parser whitelists node *shapes*, so anything it doesn't explicitly
-  recognize is rejected, not silently ignored.
+- Arbitrary function calls, lambdas, f-strings, imports -- the parser
+  whitelists node *shapes*, so anything it doesn't explicitly recognize is
+  rejected, not silently ignored.
+- Comprehensions, mostly -- `any(cond for x in rel)` and `len([... for x in
+  rel])` are recognized (see [Comprehension sugar](#comprehension-sugar-any-and-len)
+  above), but only in exactly that shape: every other comprehension form
+  (a bare list/set/dict comprehension not wrapped in `any(...)`/`len(...)`,
+  more than one `for` clause, a tuple-unpacking loop target, `all(...)`/
+  `sum(...)`, ...) is rejected the same as any other unrecognized node.
 
 ## Using it from Python
 
