@@ -1350,6 +1350,96 @@ def test_keyset_pagination_mixed_directions_seek_expansion():
     assert sql.index("OR") > 0
 
 
+# --- Keyset pagination: NULL-safety --------------------------------------
+#
+# Regression guard for two real bugs found (and fixed) in `_compile_keyset`:
+# a plain `col = ?`/`col > ?`/`col < ?` against a bound `NULL` parameter is
+# always `UNKNOWN` in SQL, never `TRUE` -- which silently broke seeking past
+# a `NULL`-valued cursor row entirely, and separately, silently dropped
+# `desc`-sorted `NULL` rows from every later page regardless of the cursor.
+# Both confirmed empirically against real SQLite before fixing (see
+# `_keyset_leg_sql`'s docstring), not just reasoned about.
+
+
+def test_keyset_asc_null_cursor_uses_is_not_null_not_bound_comparison():
+    query = Query(
+        select=["handle"],
+        order_by=[OrderBy("surname", "asc")],
+        after=(None, "h123"),
+    )
+    sql, params = compile_query(PERSON, query)
+    assert "surname IS NOT NULL" in sql
+    # The `NULL` cursor value itself is never bound as a `?` param for this
+    # leg -- `col > ?` against a bound `NULL` would just be `UNKNOWN` again.
+    assert None not in params
+    assert "h123" in params
+
+
+def test_keyset_desc_null_cursor_leg_is_structurally_impossible():
+    """When *every* effective `order_by` column is `desc` with a cursor
+    value of `None` (the minimum), nothing can rank after any of them -- the
+    whole predicate correctly collapses to "no further rows," not an error
+    or a silently wrong `UNKNOWN`-based fragment. (`handle` is given
+    explicitly here, both `desc`, so no `asc` tiebreaker gets appended to
+    save one of the legs.)
+    """
+    query = Query(
+        select=["handle"],
+        order_by=[OrderBy("surname", "desc"), OrderBy("handle", "desc")],
+        after=(None, None),
+    )
+    sql, params = compile_query(PERSON, query)
+    assert "WHERE (0 = 1)" in sql
+    # No keyset params bound (the leg contributed none) -- only the
+    # trailing LIMIT param remains.
+    assert params == [query.limit]
+
+
+def test_keyset_desc_non_null_cursor_still_includes_null_rows():
+    """Even with an ordinary, non-`NULL` cursor, a `desc` seek leg has to
+    admit `NULL` rows too -- `NULL` sorts last in `desc`, so a `NULL` row
+    always ranks after any real cursor value.
+    """
+    query = Query(
+        select=["handle"],
+        order_by=[OrderBy("surname", "desc")],
+        after=("Smith", "h123"),
+    )
+    sql, params = compile_query(PERSON, query)
+    assert "surname IS NULL OR" in sql
+    assert "surname < ?" in sql
+
+
+def test_keyset_null_safety_end_to_end_sqlite():
+    """Real SQLite execution, not just SQL-shape assertions -- proves the
+    fixed predicate actually returns the rows it's supposed to, for both
+    failure modes `_keyset_leg_sql`'s docstring describes.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE person (handle TEXT, surname TEXT)")
+    conn.executemany(
+        "INSERT INTO person VALUES (?, ?)",
+        [("h0", None), ("h1", "Anderson"), ("h2", "Baker")],
+    )
+
+    def rows(order_by, after):
+        query = Query(select=["handle", "surname"], order_by=order_by, after=after)
+        sql, params = compile_query(PERSON, query)
+        return conn.execute(sql, params).fetchall()
+
+    # asc: NULL sorts first -- seeking past the NULL cursor must still reach
+    # both real-surname rows, not zero rows.
+    asc = [OrderBy("surname", "asc")]
+    assert rows(asc, (None, "h0")) == [("h1", "Anderson"), ("h2", "Baker")]
+
+    # desc: NULL sorts last -- seeking past a real cursor must still include
+    # the NULL row on a later page, not silently drop it.
+    desc = [OrderBy("surname", "desc")]
+    assert rows(desc, ("Baker", "h2")) == [("h1", "Anderson"), ("h0", None)]
+
+
 def test_and_or_require_at_least_one_expr():
     with pytest.raises(QueryError):
         And()

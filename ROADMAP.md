@@ -70,15 +70,12 @@ does today.
 - `order_by` and keyset pagination (`after`) only work against flat SQL
   columns -- a `JsonPath` or `RelatedObject` field (`primary_name.surname_list[0].surname`,
   `birth.date.sortval`) can be filtered on but not sorted by. (query.py)
-- The evaluator/proxied path (`proxied_query.py::run_query`, backing
-  `evaluator.py`) has no `order_by`/`limit`/`after` support at all, for any
-  column -- it returns every `where`-matching object in whatever order the
-  underlying handle enumeration happens to produce, untruncated. A broader
-  gap than the bullet above: that one is "SQL path can't sort by a `JsonPath`
-  column," this is "the non-SQL path can't sort, seek, or limit by *any*
-  column." See [Evaluator-path pagination/sort
-  parity](#evaluator-path-paginationsort-parity-order_bylimitafter) under
-  Possibilities below.
+- ~~The evaluator/proxied path (`proxied_query.py::run_query`) has no
+  `order_by`/`limit`/`after` support at all~~ -- **Done**, see [Evaluator-path
+  pagination/sort parity](#evaluator-path-paginationsort-parity-order_bylimitafterselect)
+  below. `run_query` now accepts `order_by`/`limit`/`after`/`select`
+  directly, capped at the same "flat columns only" scope this bullet's own
+  SQL-path limitation already has.
 
 **Cross-dialect behavior**
 - `like(...)` and the substring form of `in` both compile to a plain SQL
@@ -556,6 +553,105 @@ Building either later item just means adding an `else` branch to the
 existing `any`/`len` dispatch in `_ComprehensionDesugarer.visit_Call` for
 "argument wasn't a comprehension," not renaming anything.
 
+### Evaluator-path pagination/sort parity (`order_by`/`limit`/`after`/`select`)
+
+Implemented -- `run_query` (proxied_query.py) accepts `order_by`, `limit`,
+`after`, and `select` directly now, applied entirely in Python over the
+match list `Filter.apply()`/the direct-loop path already collects, so a
+`Query` means the same thing on this path as it does through `query.py`'s
+compiled SQL, matching this section's own motivation exactly.
+
+Landed close to its own scoping pass above, with one deliberate scope
+change: `select` was **not** left out. The scoping pass's argument for
+leaving it out (`run_query` returns real objects, not projected rows) turned
+out not to force a choice between the two -- `select` is optional and
+additive: omitted, `run_query` still returns full objects, byte-for-byte the
+same as every caller from before this change relied on; given, it returns a
+list of value tuples (one per `select` entry, resolved via the existing
+`resolve_column_ref`) instead, the evaluator-path equivalent of the SQL
+path's own `SELECT` list. No caller that doesn't pass `select` can observe
+any difference at all.
+
+Sort/seek/limit landed exactly as the scoping pass laid out:
+
+- **Sort** -- `effective_order_by` (renamed from `_effective_order_by`,
+  now public so `proxied_query.py` can import it, alongside `query.py`'s
+  existing `after_columns`/`check_columns`) supplies the same trailing
+  `handle` tiebreaker the SQL path always compiles; `_sort_matches`
+  resolves each row's sort key via `resolve_column_ref` and orders with
+  `functools.cmp_to_key` (needed because a mixed asc/desc multi-column sort
+  isn't expressible as a single `sorted(key=...)` tuple once NULL placement
+  is direction-dependent).
+- **NULL placement (verified, not assumed)** -- confirmed directly against
+  real SQLite (`ORDER BY v ASC`/`DESC` over a mixed NULL/int column) before
+  writing `_null_safe_cmp`: NULL sorts as the smallest value in *both*
+  directions, so `DESC` is the exact reverse of `ASC`, NULLs included --
+  matches this section's own "pin down against SQLite's real, verified
+  default" requirement.
+- **Collation** -- ASCII/codepoint only (plain Python `<`/`>`), exactly the
+  documented gap this section anticipated; no attempt at locale-aware
+  `COLLATE` parity.
+- **`order_by` stays flat-columns-only** -- `OrderBy.column` is already
+  structurally a plain string (no `JsonPath`/`RelatedObject` shape exists
+  for it), so this path was never at risk of leapfrogging past item K's own
+  SQL-path cap; no extra guard was needed beyond the existing
+  `check_columns` whitelist check `compile_query` already applies.
+
+**Found a real, pre-existing bug in `query.py`'s own `_compile_keyset` in the
+process, not just a Python-side mirroring gap** -- surfaced while writing
+`_matches_keyset` and explaining the design out loud, not found by staring at
+the code cold. The original compiled seek predicate (`(c1 > ?) OR (c1 = ? AND
+c2 > ?) OR ...`) used plain, non-NULL-safe SQL comparisons throughout. Since a
+comparison against a real SQL `NULL` is always `UNKNOWN` (never `TRUE`), this
+silently broke keyset pagination in two different, independently-confirmed
+ways (checked against real SQLite before fixing, in both directions):
+
+- **Seeking past a cursor row whose own sort value was `NULL`** returned
+  *zero* further rows, even when real rows exist after it in the established
+  order -- every leg touching that bound `NULL` parameter was `UNKNOWN`, so
+  the whole `OR` was too.
+- **A `desc`-sorted column silently dropped its own `NULL` rows from every
+  later page**, regardless of what the cursor was -- `NULL` sorts *last* in
+  `desc` (the same "NULL is smallest" total order plain `ORDER BY` already
+  uses, just at the other end), but a plain `col < ?` against a `NULL` row is
+  `UNKNOWN`, not `TRUE`, so those rows never satisfied the predicate on any
+  page after the first.
+
+Fixed with `_keyset_tie_sql`/`_keyset_leg_sql` (query.py): each leg is now
+built NULL-safely, using the concrete cursor value already known at *compile*
+time (not a runtime unknown) to choose `col IS NULL`/`col IS NOT NULL` instead
+of a bound comparison whenever the cursor value at that position is `None`,
+and unconditionally admitting `NULL` rows on a `desc` leg
+(`(col IS NULL OR col < ?)`) regardless of the cursor. A leg that can never
+hold at all (`desc`, cursor already `None` -- nothing ranks after the
+minimum) returns `None` from `_keyset_leg_sql` and is dropped from the `OR`
+entirely; if *every* leg drops this way, `_compile_keyset` emits a literal
+`0 = 1` ("no further rows") rather than an empty, malformed `OR`.
+
+This fix applies to **both paths at once**, and had to -- `_matches_keyset`
+(the Python mirror) was simplified to directly reuse `_null_safe_cmp` (the
+exact same NULL-is-smallest total order plain sorting already uses) rather
+than hand-rolling its own three-valued-`UNKNOWN` logic, so seeking and
+sorting now share one NULL rule, not two, on both the SQL and evaluator
+paths. Fixing only the Python side (to keep the parity goal this whole
+section exists for) would have meant deliberately reproducing a bug on the
+SQL path that's now known to be wrong -- not an option once found.
+
+Verified with the same SQL-vs-evaluator agreement style as every other
+regression guard in this document (`test_evaluator.py`'s Not/Exists/Count
+tests) -- `test_proxied_query.py`'s "order_by/limit/after/select parity"
+section runs the identical `Query` shape through `query.py`'s real compiled
+SQL (against the fixture's own underlying Gramps SQLite backend) and through
+`run_query`, and asserts the rows match, across ASC, DESC, `limit`, a keyset
+second page, `select` projection, and a genuinely-nullable flat column
+(`Family.father_handle` -- `Person.given_name` doesn't work for this, since
+Gramps always stores it as `""`, never a real SQL NULL) -- plus two dedicated
+regression tests for the NULL-keyset bug itself, one seeking past a `NULL`
+cursor and one confirming a `desc` page doesn't drop a `NULL` row after an
+ordinary cursor. `test_query.py` additionally covers the fixed SQL shape and
+a real end-to-end SQLite execution directly, independent of the Gramps
+fixture.
+
 ## Possibilities
 
 ### `len()` / array-length comparisons
@@ -752,89 +848,6 @@ rather than inventing it from scratch. `any()` still goes last: it needs
 that same pattern *and* its own new no-target-table `EXISTS`-over-JSON-array
 rendering on top, the one piece neither `count()` nor `len()` needs.
 
-### Evaluator-path pagination/sort parity (`order_by`/`limit`/`after`)
-
-Motivated by: making the proxied/evaluator path (`proxied_query.py::run_query`,
-`evaluator.py`) act indistinguishable from the SQL path from a caller's point
-of view -- the same `Query` object should mean the same thing regardless of
-which path actually executes it, instead of the caller having to know that
-`order_by`/`limit`/`after` are quietly no-ops once a proxy is involved.
-
-**Current state, confirmed directly against the code:** `run_query`
-(proxied_query.py:113) takes only `where` -- no `order_by`, `limit`, `after`,
-or `select` parameter exists on that path at all. It returns every
-`where`-matching object in whatever order `Filter.apply()`/`get_*_handles()`
-happens to enumerate handles (not a documented ordering guarantee), with no
-truncation. `evaluate_where`/`resolve_column_ref` (evaluator.py) resolve
-`where` correctly against real, possibly-proxied objects, but nothing
-downstream sorts, seeks, or limits the result. This is a strictly bigger gap
-than item K in the difficulty table below (K is "the *SQL* path's
-`order_by`/`after` can't reach a `JsonPath`/`RelatedObject` column") -- here,
-the non-SQL path can't sort, seek, or limit by *any* column, flat or not.
-
-**Difficulty:** medium-large. **Invasiveness:** contained to
-`proxied_query.py` (a new sort/seek/limit pass over `run_query`'s matches)
-plus a small addition to `evaluator.py` (a sort-key resolver built on the
-existing `resolve_column_ref`) -- unlike `len()`/`any()`, `where_expr`'s
-shape doesn't change, so `query_lang.py` is untouched.
-
-**What it would take, layer by layer:**
-
-1. **Sort.** After `run_query` collects its matches, sort them in Python by
-   `_effective_order_by(query.order_by)` (already exported from query.py,
-   including its implicit trailing `handle` tiebreaker), using
-   `evaluator.resolve_column_ref` per sort key instead of a rendered SQL
-   column. `Comparison`'s three-valued NULL logic doesn't apply to a sort
-   key -- Python's `sorted(key=...)` needs a total order, so `None` needs an
-   explicit placement policy matching SQLite's actual default (verify, don't
-   assume -- see E/F's notes elsewhere in this doc for what happens when a
-   premise like that goes unchecked).
-2. **Collation.** SQL sorts text columns through a locale `COLLATE` clause
-   (`_column_expr`, query.py:1305); Python's default string comparison is a
-   plain codepoint sort, not locale-aware. Full parity needs either the same
-   collation the SQL layer's `collation` parameter names, or an explicitly
-   documented gap for non-default collations (ASCII-default order matches
-   either way).
-3. **Keyset seek (`after`).** `_compile_keyset`'s OR-of-ANDs seek predicate
-   (query.py:1318) needs a Python equivalent over the sorted list from step
-   1: given a resolved `after` tuple (same shape `after_columns()` already
-   documents), find the first row strictly past the cursor under the same
-   per-column direction (`asc`/`desc`) and tie-breaking the SQL predicate
-   uses. `after_columns()`/`check_columns()` are reusable as-is; only the
-   predicate evaluation itself is new.
-4. **Limit.** Trivial once 1-3 land -- slice the seeked list to `query.limit`.
-5. **`select`.** Deliberately out of scope: this path returns real Gramps
-   objects, not projected rows, and every existing caller already reads
-   whatever fields it wants straight off the object. Honoring `select` here
-   would mean inventing a row-projection shape this path has never had --
-   a separate design decision, not a sorting/pagination one. Called out
-   explicitly so it isn't silently assumed to be included in "parity."
-6. **Docs + tests** -- sort/seek/limit cases added wherever `run_query`'s
-   coverage lives today; `README-query-language.md`/`docs/where_expr.md`
-   updated to say pagination behaves the same on both paths, once true.
-
-**Risk / open decisions:**
-
-- **`NULL` ordering policy** (step 1) needs to be pinned down against
-  SQLite's real, verified default, not assumed.
-- **Collation parity** (step 2) may not be fully achievable in pure Python
-  depending on which collation names callers actually pass -- worth scoping
-  as "correct for the ASCII default, documented gap otherwise" rather than
-  blocking on a full locale-aware port.
-- **Performance expectations.** Sorting the *entire* matched set in Python
-  before seeking/limiting is consistent with `evaluator.py`'s own docstring
-  ("intended for ... where the query's result set is expected to be small
-  relative to the table"), but worth stating explicitly: this adds no
-  keyset-style "narrow before fetching" benefit the way the SQL path's seek
-  predicate does -- every candidate is still fetched and evaluated first,
-  same as today, just also sorted afterward.
-
-**Recommended scope for a v1:** flat-column `order_by` only (matches the SQL
-path's own current limitation, item K, so this lands at exact parity rather
-than accidentally ahead of it); a verified, documented `NULL`-placement
-policy; ASCII-default collation only; `select` explicitly left out per point
-5 above.
-
 ### Other gaps (not yet scoped to this level of detail)
 
 - **`exists(...)`/`count(...)` condition referencing the *outer* row** (e.g.
@@ -895,7 +908,7 @@ here, struck through, so that history stays legible.
 | I | `any(primary_name.surname_list, surname == 'Doyle')` | see `any()` section above | 5 |
 | J | `exists(children, surname == father.surname)` | `exists`/`count` conditions can't see the outer row | 4 |
 | K | `order_by=primary_name.surname_list[0].surname` | `order_by`/keyset pagination only works on flat SQL columns | 3 |
-| L | any `order_by`/`limit`/`after` under a proxy (e.g. `PrivateProxyDb`) | evaluator/proxied path (`proxied_query.py::run_query`) has no sort/seek/limit at all -- see [Evaluator-path pagination/sort parity](#evaluator-path-paginationsort-parity-order_bylimitafter) above | 3-4 |
+| ~~L~~ | ~~any `order_by`/`limit`/`after` under a proxy (e.g. `PrivateProxyDb`)~~ | **Done** -- see [Evaluator-path pagination/sort parity](#evaluator-path-paginationsort-parity-order_bylimitafterselect) above | ~~3-4~~ |
 
 Difficulty here means "distance from today's code," not "priority" -- a low
 number isn't necessarily higher-value, just cheaper to build.
@@ -1016,15 +1029,17 @@ each other cheaper:
   lives entirely in `order_by`/keyset pagination, a different subsystem
   from `where_expr` compilation -- touches neither `_translate_compare`
   nor `evaluator.py`'s comparison logic at all.
-- **L is downstream of K, not independent of it.** L's own recommended v1
-  scope (flat columns only) is deliberately capped at whatever K currently
-  supports, so that the evaluator path doesn't leapfrog the SQL path's own
-  `order_by` capability. If K ships first (SQL path gains `JsonPath`/
-  `RelatedObject` sort columns), L's v1 boundary moves with it; if L ships
-  first, its own flat-column cap is the ceiling until K lands. Otherwise L
-  shares no rendering code with K at all -- K is pure SQL generation
-  (query.py), L is a pure Python sort/seek pass (`proxied_query.py`,
-  `evaluator.py`).
+- **L shipped downstream of K, capped rather than independent, exactly as
+  predicted.** L's own recommended v1 scope (flat columns only) landed
+  deliberately capped at whatever K still supports today, so the evaluator
+  path didn't leapfrog the SQL path's own `order_by` capability -- L shares
+  no rendering code with K at all (K is pure SQL generation in `query.py`,
+  L is a pure Python sort/seek pass in `proxied_query.py`), but its scope
+  boundary is a direct function of K's. If K ever ships (SQL path gains
+  `JsonPath`/`RelatedObject` sort columns), L's cap is free to move with it
+  -- nothing about L's implementation assumes flat-columns-only beyond the
+  one `check_columns` whitelist call, so widening it later is additive, not
+  a rewrite.
 
 **Net effect on build order (as originally planned, before A/B/C/D
 shipped):** B was the one item worth doing early even though its own

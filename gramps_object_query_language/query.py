@@ -1280,11 +1280,14 @@ class OrderBy:
             raise QueryError(f"invalid sort direction: {self.direction!r}")
 
 
-def _effective_order_by(order_by: Sequence[OrderBy]) -> Tuple[OrderBy, ...]:
+def effective_order_by(order_by: Sequence[OrderBy]) -> Tuple[OrderBy, ...]:
     """`order_by` with a trailing `handle` tiebreaker appended if not present.
 
     Guarantees a stable, fully-determined order for both `ORDER BY` emission
     and keyset pagination, even when the caller specifies no sort at all.
+    Public (not underscore-prefixed) since `proxied_query.py`'s Python-side
+    sort/seek needs the exact same effective order the SQL path compiles,
+    not just the column names `after_columns()` exposes.
     """
     if any(ob.column == "handle" for ob in order_by):
         return tuple(order_by)
@@ -1298,7 +1301,7 @@ def after_columns(order_by: Sequence[OrderBy]) -> Tuple[str, ...]:
     tuple by looking up these columns for that row (one extra lookup) before
     compiling -- this module does no database access itself.
     """
-    return tuple(ob.column for ob in _effective_order_by(order_by))
+    return tuple(ob.column for ob in effective_order_by(order_by))
 
 
 def check_columns(columns: Iterable[str], spec: ObjectTypeSpec) -> None:
@@ -1350,6 +1353,55 @@ def _column_expr(
     return quoted
 
 
+def _keyset_tie_sql(column_expr: str, value: Any) -> Tuple[str, list]:
+    """NULL-safe "ties with the cursor" fragment for an earlier-in-order
+    `order_by` column. A bound `NULL` parameter makes plain `col = ?`
+    `UNKNOWN` (never `TRUE`), so a cursor value of `None` needs `col IS NULL`
+    instead, to correctly express "this row's earlier columns match the
+    cursor row's" when the cursor row itself had a `NULL` there.
+    """
+    if value is None:
+        return f"{column_expr} IS NULL", []
+    return f"{column_expr} = ?", [value]
+
+
+def _keyset_leg_sql(
+    column_expr: str, direction: str, value: Any
+) -> Optional[Tuple[str, list]]:
+    """NULL-safe "ranks strictly after the cursor" fragment for the one
+    `order_by` column a seek's OR-term actually advances past, matching
+    `ORDER BY`'s own verified default total order (`NULL` is the smallest
+    value in both directions -- see `_null_safe_cmp` in `proxied_query.py`,
+    which mirrors this same order for the evaluator path).
+
+    A plain `col > ?`/`col < ?` against a real SQL `NULL` is always
+    `UNKNOWN`, which gets this wrong in two different ways a naive
+    translation misses:
+
+    - `asc`, cursor value `None` -- nothing is "greater than NULL" in plain
+      SQL, but under `NULL`-is-smallest ordering *every* non-`NULL` value
+      ranks after it. Needs `col IS NOT NULL`, not `col > ?` against a bound
+      `NULL` (which would just be `UNKNOWN` for every row).
+    - `desc`, *any* cursor value -- `NULL` sorts last in `desc`, so a `NULL`
+      row always ranks after a non-`NULL` cursor -- but plain `col < ?` is
+      `UNKNOWN`, not `TRUE`, when `col` is `NULL`, silently dropping those
+      rows from every later page regardless of what the cursor itself was.
+      Needs `(col IS NULL OR col < ?)`.
+
+    Returns `None` when the condition can never hold at all (`desc`, cursor
+    value `None` -- nothing ranks after the minimum value already), so the
+    caller can drop this leg from the `OR` entirely instead of emitting a
+    fragment that's always false.
+    """
+    if direction == "asc":
+        if value is None:
+            return f"{column_expr} IS NOT NULL", []
+        return f"{column_expr} > ?", [value]
+    if value is None:
+        return None
+    return f"({column_expr} IS NULL OR {column_expr} < ?)", [value]
+
+
 def _compile_keyset(
     effective_order_by: Sequence[OrderBy],
     after: Sequence[Any],
@@ -1365,6 +1417,15 @@ def _compile_keyset(
     same `COLLATE` clause as the matching `ORDER BY` column -- otherwise a
     row could satisfy a binary-comparison seek predicate while sorting
     differently under collation, corrupting page boundaries.
+
+    NULL-safe throughout (`_keyset_tie_sql`/`_keyset_leg_sql`) -- verified
+    empirically against real SQLite before fixing (not just reasoned about):
+    the original plain-comparison version silently returned zero further
+    rows when seeking past a cursor whose own sort value was `NULL`, and
+    separately, silently dropped `NULL` rows from every later page of a
+    `desc`-sorted column regardless of the cursor, since `NULL`'s own
+    three-valued comparison semantics (`UNKNOWN`, not `TRUE`/`FALSE`) don't
+    match `ORDER BY`'s "`NULL` is smallest" total order on their own.
     """
     if len(after) != len(effective_order_by):
         raise QueryError(
@@ -1374,16 +1435,29 @@ def _compile_keyset(
     or_terms = []
     params: list = []
     for i, ob in enumerate(effective_order_by):
+        leg = _keyset_leg_sql(
+            _column_expr(ob.column, spec, collation, dialect), ob.direction, after[i]
+        )
+        if leg is None:
+            continue
         and_terms = []
+        and_params: list = []
         for j in range(i):
-            and_terms.append(
-                f"{_column_expr(effective_order_by[j].column, spec, collation, dialect)} = ?"
+            tie_sql, tie_params = _keyset_tie_sql(
+                _column_expr(effective_order_by[j].column, spec, collation, dialect), after[j]
             )
-            params.append(after[j])
-        op = ">" if ob.direction == "asc" else "<"
-        and_terms.append(f"{_column_expr(ob.column, spec, collation, dialect)} {op} ?")
-        params.append(after[i])
+            and_terms.append(tie_sql)
+            and_params.extend(tie_params)
+        leg_sql, leg_params = leg
+        and_terms.append(leg_sql)
+        and_params.extend(leg_params)
         or_terms.append("(" + " AND ".join(and_terms) + ")")
+        params.extend(and_params)
+    if not or_terms:
+        # Every leg was structurally impossible (e.g. a lone `desc` column
+        # whose cursor value is already `None`, the minimum -- nothing can
+        # rank after it). Correctly means "no further rows", not an error.
+        return "0 = 1", []
     return " OR ".join(or_terms), params
 
 
@@ -1460,8 +1534,8 @@ def compile_query(
     """
     columns = list(query.select) if query.select else sorted(spec.columns)
 
-    effective_order_by = _effective_order_by(query.order_by)
-    for ob in effective_order_by:
+    ordering = effective_order_by(query.order_by)
+    for ob in ordering:
         _check_column(ob.column, spec.columns)
 
     select_parts = []
@@ -1475,7 +1549,7 @@ def compile_query(
     params.extend(where_params)
 
     if query.after is not None:
-        sql, p = _compile_keyset(effective_order_by, query.after, spec, collation, dialect)
+        sql, p = _compile_keyset(ordering, query.after, spec, collation, dialect)
         where_clauses.append(f"({sql})")
         params.extend(p)
 
@@ -1484,7 +1558,7 @@ def compile_query(
         sql += " WHERE " + " AND ".join(where_clauses)
     sql += " ORDER BY " + ", ".join(
         f"{_column_expr(ob.column, spec, collation, dialect)} {ob.direction.upper()}"
-        for ob in effective_order_by
+        for ob in ordering
     )
     if query.limit is not None:
         sql += " LIMIT ?"
