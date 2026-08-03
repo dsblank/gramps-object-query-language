@@ -984,8 +984,17 @@ _OP_CLASSES: dict[str, type] = {
     "gte": Gte,
 }
 
+# Every leaf `op` a condition dict can carry -- `_OP_CLASSES`'s keys plus
+# "in"/"like"/"contains" (special-cased in `_condition_from_json`, not
+# plain `Comparison` subclasses). Public so `object_query.py`'s own
+# `where`-body schema validates against this directly instead of a second,
+# hand-copied whitelist that can (and did) drift -- new ops added here are
+# then automatically valid for a raw `where` JSON body too, no
+# gramps-web-api change needed.
+VALID_LEAF_OPS = frozenset(_OP_CLASSES) | {"in", "like", "contains"}
 
-def _json_column_to_ref(column: Union[str, dict], spec: ObjectTypeSpec) -> ColumnRef:
+
+def json_column_to_ref(column: Union[str, dict], spec: ObjectTypeSpec) -> ColumnRef:
     """A wire-format column reference (plain string, `{"json_path": [...]}`,
     or `{"count_of": {...}}`), resolved to a `ColumnRef` -- via
     `resolve_column_path`, so a path crossing a relationship
@@ -996,7 +1005,7 @@ def _json_column_to_ref(column: Union[str, dict], spec: ObjectTypeSpec) -> Colum
     `{"count_of": {"relationship": ..., "where": [...]}}` resolves to a
     `CollectionCount` the same way `_node_from_json`'s `"exists"` case
     resolves to an `Exists` -- same `resolve_collection` lookup, same
-    recursive `_where_list_to_ast` for the optional condition.
+    recursive `where_list_to_ast` for the optional condition.
     """
     if isinstance(column, str):
         return column
@@ -1004,7 +1013,7 @@ def _json_column_to_ref(column: Union[str, dict], spec: ObjectTypeSpec) -> Colum
         payload = column["count_of"]
         collection = resolve_collection(spec, payload["relationship"])
         condition = (
-            _where_list_to_ast(payload["where"], collection.target)
+            where_list_to_ast(payload["where"], collection.target)
             if "where" in payload
             else None
         )
@@ -1015,7 +1024,7 @@ def _json_column_to_ref(column: Union[str, dict], spec: ObjectTypeSpec) -> Colum
 def _condition_from_json(condition: dict, spec: ObjectTypeSpec) -> Any:
     """One `parse_expr`-shaped condition dict, translated to a `query.py`
     comparison object (`Eq`, `Lt`, `In`, `Like`, `Contains`, ...)."""
-    column = _json_column_to_ref(condition["column"], spec)
+    column = json_column_to_ref(condition["column"], spec)
     op = condition["op"]
     if op == "in":
         return In(column, condition["value"])
@@ -1024,7 +1033,7 @@ def _condition_from_json(condition: dict, spec: ObjectTypeSpec) -> Any:
     if "value_column" in condition:
         # Field-vs-field, e.g. "mother.death.date.sortval < father.death.date.sortval",
         # or (for "contains") "other_field in field".
-        value = _json_column_to_ref(condition["value_column"], spec)
+        value = json_column_to_ref(condition["value_column"], spec)
         if isinstance(value, str):
             # A flat (same-table) column resolves to a bare str here --
             # identical in shape to an ordinary literal, which
@@ -1040,12 +1049,27 @@ def _condition_from_json(condition: dict, spec: ObjectTypeSpec) -> Any:
     return _OP_CLASSES[op](column, value)
 
 
-def _where_list_to_ast(conditions: List[dict], spec: ObjectTypeSpec) -> Any:
+def where_list_to_ast(conditions: List[dict], spec: ObjectTypeSpec) -> Any:
     """A `parse_expr`-shaped list of top-level conditions (implicitly AND'd),
     translated to a single `query.py` boolean expression -- shared by
     `compile_expr_for_spec` and `_node_from_json`'s `"exists"` case, whose
     `where` payload is exactly this same shape, just against the collection's
     target type instead of the outer spec.
+
+    Public (no leading underscore) specifically so gramps-web-api's
+    `object_query.py` can call it directly for its own `where`/`where_expr`
+    request bodies, rather than maintaining a second, hand-written copy of
+    this same JSON -> AST translation that can (and did) drift out of sync
+    every time this module gains a feature -- e.g. missing 'and'/'exists'/
+    'count_of' support, and silently mishandling same-table field-vs-field
+    comparisons that need `FlatColumnRef` wrapping (see `_condition_from_json`).
+    Raises `QueryError` (not `QueryLangError` -- there's no parsing here,
+    only already-parsed JSON) on a malformed condition; callers building
+    `where` from raw, untrusted client JSON (as opposed to this module's own
+    `parse_expr_for_spec` output, always well-formed by construction) are
+    responsible for their own leaf-shape validation first -- see
+    `object_query.py`'s `_validate_leaf_condition` for what that needs to
+    cover that this function intentionally doesn't re-check.
     """
     asts = [_node_from_json(condition, spec) for condition in conditions]
     return asts[0] if len(asts) == 1 else And(*asts)
@@ -1067,7 +1091,7 @@ def _node_from_json(node: dict, spec: ObjectTypeSpec) -> Any:
         payload = node["exists"]
         collection = resolve_collection(spec, payload["relationship"])
         condition = (
-            _where_list_to_ast(payload["where"], collection.target)
+            where_list_to_ast(payload["where"], collection.target)
             if "where" in payload
             else None
         )
@@ -1082,7 +1106,7 @@ def compile_expr_for_spec(spec: ObjectTypeSpec, expr: str) -> Any:
     `spec` -- see `parse_expr_for_spec`.
     """
     conditions = parse_expr_for_spec(spec, expr)
-    return _where_list_to_ast(conditions, spec)
+    return where_list_to_ast(conditions, spec)
 
 
 def compile_expr(namespace: str, expr: str) -> Tuple[ObjectTypeSpec, Any]:
