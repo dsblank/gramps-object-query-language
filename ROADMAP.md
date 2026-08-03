@@ -70,6 +70,15 @@ does today.
 - `order_by` and keyset pagination (`after`) only work against flat SQL
   columns -- a `JsonPath` or `RelatedObject` field (`primary_name.surname_list[0].surname`,
   `birth.date.sortval`) can be filtered on but not sorted by. (query.py)
+- The evaluator/proxied path (`proxied_query.py::run_query`, backing
+  `evaluator.py`) has no `order_by`/`limit`/`after` support at all, for any
+  column -- it returns every `where`-matching object in whatever order the
+  underlying handle enumeration happens to produce, untruncated. A broader
+  gap than the bullet above: that one is "SQL path can't sort by a `JsonPath`
+  column," this is "the non-SQL path can't sort, seek, or limit by *any*
+  column." See [Evaluator-path pagination/sort
+  parity](#evaluator-path-paginationsort-parity-order_bylimitafter) under
+  Possibilities below.
 
 **Cross-dialect behavior**
 - `like(...)` and the substring form of `in` both compile to a plain SQL
@@ -743,6 +752,89 @@ rather than inventing it from scratch. `any()` still goes last: it needs
 that same pattern *and* its own new no-target-table `EXISTS`-over-JSON-array
 rendering on top, the one piece neither `count()` nor `len()` needs.
 
+### Evaluator-path pagination/sort parity (`order_by`/`limit`/`after`)
+
+Motivated by: making the proxied/evaluator path (`proxied_query.py::run_query`,
+`evaluator.py`) act indistinguishable from the SQL path from a caller's point
+of view -- the same `Query` object should mean the same thing regardless of
+which path actually executes it, instead of the caller having to know that
+`order_by`/`limit`/`after` are quietly no-ops once a proxy is involved.
+
+**Current state, confirmed directly against the code:** `run_query`
+(proxied_query.py:113) takes only `where` -- no `order_by`, `limit`, `after`,
+or `select` parameter exists on that path at all. It returns every
+`where`-matching object in whatever order `Filter.apply()`/`get_*_handles()`
+happens to enumerate handles (not a documented ordering guarantee), with no
+truncation. `evaluate_where`/`resolve_column_ref` (evaluator.py) resolve
+`where` correctly against real, possibly-proxied objects, but nothing
+downstream sorts, seeks, or limits the result. This is a strictly bigger gap
+than item K in the difficulty table below (K is "the *SQL* path's
+`order_by`/`after` can't reach a `JsonPath`/`RelatedObject` column") -- here,
+the non-SQL path can't sort, seek, or limit by *any* column, flat or not.
+
+**Difficulty:** medium-large. **Invasiveness:** contained to
+`proxied_query.py` (a new sort/seek/limit pass over `run_query`'s matches)
+plus a small addition to `evaluator.py` (a sort-key resolver built on the
+existing `resolve_column_ref`) -- unlike `len()`/`any()`, `where_expr`'s
+shape doesn't change, so `query_lang.py` is untouched.
+
+**What it would take, layer by layer:**
+
+1. **Sort.** After `run_query` collects its matches, sort them in Python by
+   `_effective_order_by(query.order_by)` (already exported from query.py,
+   including its implicit trailing `handle` tiebreaker), using
+   `evaluator.resolve_column_ref` per sort key instead of a rendered SQL
+   column. `Comparison`'s three-valued NULL logic doesn't apply to a sort
+   key -- Python's `sorted(key=...)` needs a total order, so `None` needs an
+   explicit placement policy matching SQLite's actual default (verify, don't
+   assume -- see E/F's notes elsewhere in this doc for what happens when a
+   premise like that goes unchecked).
+2. **Collation.** SQL sorts text columns through a locale `COLLATE` clause
+   (`_column_expr`, query.py:1305); Python's default string comparison is a
+   plain codepoint sort, not locale-aware. Full parity needs either the same
+   collation the SQL layer's `collation` parameter names, or an explicitly
+   documented gap for non-default collations (ASCII-default order matches
+   either way).
+3. **Keyset seek (`after`).** `_compile_keyset`'s OR-of-ANDs seek predicate
+   (query.py:1318) needs a Python equivalent over the sorted list from step
+   1: given a resolved `after` tuple (same shape `after_columns()` already
+   documents), find the first row strictly past the cursor under the same
+   per-column direction (`asc`/`desc`) and tie-breaking the SQL predicate
+   uses. `after_columns()`/`check_columns()` are reusable as-is; only the
+   predicate evaluation itself is new.
+4. **Limit.** Trivial once 1-3 land -- slice the seeked list to `query.limit`.
+5. **`select`.** Deliberately out of scope: this path returns real Gramps
+   objects, not projected rows, and every existing caller already reads
+   whatever fields it wants straight off the object. Honoring `select` here
+   would mean inventing a row-projection shape this path has never had --
+   a separate design decision, not a sorting/pagination one. Called out
+   explicitly so it isn't silently assumed to be included in "parity."
+6. **Docs + tests** -- sort/seek/limit cases added wherever `run_query`'s
+   coverage lives today; `README-query-language.md`/`docs/where_expr.md`
+   updated to say pagination behaves the same on both paths, once true.
+
+**Risk / open decisions:**
+
+- **`NULL` ordering policy** (step 1) needs to be pinned down against
+  SQLite's real, verified default, not assumed.
+- **Collation parity** (step 2) may not be fully achievable in pure Python
+  depending on which collation names callers actually pass -- worth scoping
+  as "correct for the ASCII default, documented gap otherwise" rather than
+  blocking on a full locale-aware port.
+- **Performance expectations.** Sorting the *entire* matched set in Python
+  before seeking/limiting is consistent with `evaluator.py`'s own docstring
+  ("intended for ... where the query's result set is expected to be small
+  relative to the table"), but worth stating explicitly: this adds no
+  keyset-style "narrow before fetching" benefit the way the SQL path's seek
+  predicate does -- every candidate is still fetched and evaluated first,
+  same as today, just also sorted afterward.
+
+**Recommended scope for a v1:** flat-column `order_by` only (matches the SQL
+path's own current limitation, item K, so this lands at exact parity rather
+than accidentally ahead of it); a verified, documented `NULL`-placement
+policy; ASCII-default collation only; `select` explicitly left out per point
+5 above.
+
 ### Other gaps (not yet scoped to this level of detail)
 
 - **`exists(...)`/`count(...)` condition referencing the *outer* row** (e.g.
@@ -803,6 +895,7 @@ here, struck through, so that history stays legible.
 | I | `any(primary_name.surname_list, surname == 'Doyle')` | see `any()` section above | 5 |
 | J | `exists(children, surname == father.surname)` | `exists`/`count` conditions can't see the outer row | 4 |
 | K | `order_by=primary_name.surname_list[0].surname` | `order_by`/keyset pagination only works on flat SQL columns | 3 |
+| L | any `order_by`/`limit`/`after` under a proxy (e.g. `PrivateProxyDb`) | evaluator/proxied path (`proxied_query.py::run_query`) has no sort/seek/limit at all -- see [Evaluator-path pagination/sort parity](#evaluator-path-paginationsort-parity-order_bylimitafter) above | 3-4 |
 
 Difficulty here means "distance from today's code," not "priority" -- a low
 number isn't necessarily higher-value, just cheaper to build.
@@ -923,6 +1016,15 @@ each other cheaper:
   lives entirely in `order_by`/keyset pagination, a different subsystem
   from `where_expr` compilation -- touches neither `_translate_compare`
   nor `evaluator.py`'s comparison logic at all.
+- **L is downstream of K, not independent of it.** L's own recommended v1
+  scope (flat columns only) is deliberately capped at whatever K currently
+  supports, so that the evaluator path doesn't leapfrog the SQL path's own
+  `order_by` capability. If K ships first (SQL path gains `JsonPath`/
+  `RelatedObject` sort columns), L's v1 boundary moves with it; if L ships
+  first, its own flat-column cap is the ceiling until K lands. Otherwise L
+  shares no rendering code with K at all -- K is pure SQL generation
+  (query.py), L is a pure Python sort/seek pass (`proxied_query.py`,
+  `evaluator.py`).
 
 **Net effect on build order (as originally planned, before A/B/C/D
 shipped):** B was the one item worth doing early even though its own
