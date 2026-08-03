@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest"]
+test = ["pytest", "PyGObject"]
 
 [project.urls]
 Homepage = "https://github.com/dsblank/gramps-object-query-language"
