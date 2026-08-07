@@ -43,9 +43,10 @@ does today.
   father") -- all three still flagged as follow-ups, not solved here.
 
 **Values and functions**
-- Only two whitelisted function-call forms exist: `like(field, 'pattern')`
-  and `Date('...')`. No arithmetic, string functions (`upper()`, `lower()`,
-  concatenation), or general function calls.
+- Three whitelisted function-call forms exist: `like(field, 'pattern')`,
+  `regex(field, 'pattern')` (see Done below), and `Date('...')`. No
+  arithmetic, string functions (`upper()`, `lower()`, concatenation), or
+  general function calls.
 - `ClassName.CONST` constants: **this bullet was stale** -- found and
   corrected while adding `is`/`is not`/`not in` below. `_CONSTANT_CLASSES`
   (query_lang.py) already covers the full `GrampsType` constant space
@@ -86,6 +87,16 @@ does today.
   case-*sensitive* by default. Nothing in the compiler accounts for this --
   the same `where_expr` string can match different rows depending on which
   dialect executes it. No test currently exercises this gap.
+- `regex(...)` (see Done below) doesn't have this particular gap -- both
+  dialects match case-sensitively -- but has a *syntax* gap instead: SQLite
+  runs the pattern through Python's own `re` (via gramps core's registered
+  UDF), PostgreSQL through its own POSIX-ARE-flavored `~` operator. A
+  pattern using Python-only syntax (lookahead/lookbehind, `(?P<name>...)`
+  named groups) compiles and runs fine against SQLite but errors or means
+  something different against PostgreSQL. No test currently exercises this
+  gap either -- would need a pattern in that syntax gap run against both a
+  real SQLite and a real PostgreSQL backend to pin down exactly where the
+  divergence starts.
 
 **Integration**
 - The `where_expr` language itself isn't wired to any HTTP endpoint yet --
@@ -653,6 +664,76 @@ cursor and one confirming a `desc` page doesn't drop a `NULL` row after an
 ordinary cursor. `test_query.py` additionally covers the fixed SQL shape and
 a real end-to-end SQLite execution directly, independent of the Gramps
 fixture.
+
+### `regex(...)` -- a third whitelisted function-call form
+
+Implemented -- a new `regex(field, 'pattern')` operator, structurally a
+close copy of `like(...)`'s addition (a new `Comparison` subclass, a new
+`query_lang.py` whitelisted call, a new `"regex"` entry in `_OP_CLASSES`'s
+sibling set/`VALID_LEAF_OPS`), but with a dialect-sensitive `compile()`
+(like `JsonPath`/`RelatedObject` already have, unlike every other
+`Comparison` subclass) since neither backend has a plain, portable `LIKE`-
+style keyword for it: SQLite renders `column REGEXP ?`, PostgreSQL
+`column ~ ?`.
+
+**The pleasant surprise: SQLite needed no new plumbing at all.** SQLite has
+no built-in `REGEXP` operator, but gramps core's `dbapi/sqlite.py`
+`Connection.__init__` already registers one as a UDF on every connection it
+opens (`self.__connection.create_function("regexp", 2, regexp)`, where
+`regexp(expr, value)` is `re.search(expr, value, re.MULTILINE) is not
+None`) -- confirmed live, not assumed. So `column REGEXP ?` already works
+against a real Gramps SQLite backend with zero core changes; this module
+only had to emit the right SQL text. PostgreSQL's native `~` operator has
+the same unanchored, case-sensitive substring-search semantics, so no
+extension is needed there either.
+
+**Found a real bug in gramps core's UDF in the process, not just wired up
+an operator**: that `regexp()` UDF is not NULL-safe. `re.search(None,
+...)`/`re.search(..., None)` both raise `TypeError` in plain Python, which
+`sqlite3` surfaces as a hard `OperationalError: user-defined function
+raised exception` instead of SQL's usual "NULL propagates to NULL" --
+confirmed live (`test_sql_and_evaluator_agree_on_regex` crashed the query
+outright before this was fixed, the moment it exercised a missing value).
+Every other operator in this module gets NULL-safety for free from a
+native SQL operator; this one couldn't, since gramps core's UDF is the
+thing doing the (Python-side) NULL-unsafe work. Fixed in `Regex.compile()`
+with an explicit `CASE WHEN <column> IS NULL OR <pattern> IS NULL THEN
+NULL ELSE <column> REGEXP <pattern> END` on the SQLite side only --
+PostgreSQL's native `~` NULL-propagates correctly on its own, so it needed
+no such guard. `evaluator.py`'s `_compare` mirrors the same short-circuit
+(`if left is None or right is None: return None`, checked *before* calling
+`re.search`, same as `LIKE`'s existing branch), so both paths agree on a
+missing value the same way they already agree on everything else.
+
+**A second, un-fixable gap, documented rather than papered over**: the two
+backends don't speak quite the same regex dialect. SQLite's UDF is
+literally Python's `re` (so it agrees exactly with `evaluator.py`); Post-
+greSQL uses POSIX "advanced regular expressions" -- no lookahead/
+lookbehind, no `(?P<name>...)` named groups. Nothing in the compiler can
+paper over a genuine syntax difference between two regex engines, so this
+is called out in `docs/where_expr.md`'s new `regex(...)` section and in the
+"Cross-dialect behavior" bullet above, rather than silently left for a user
+to discover.
+
+Field-vs-field support (`regex(surname, given_name)`, both plain columns or
+either crossing a relationship) came for free from `Comparison`'s existing
+base-class shape, the same way `Like`'s already does -- no escaping needed
+here, unlike `Contains`'s field-vs-field addition, since a regex pattern is
+meant to be interpreted as a real regex either way, literal or field-
+sourced. The wire-format surface (`query_lang.py`'s `regex(...)` call,
+gramps-web-api's raw `where` JSON leaf) still restricts the *pattern* to a
+literal string, matching `like(...)`'s own restriction -- a pattern only
+known at row-execution time can't be validated as a compilable regex ahead
+of time.
+
+Verified four ways: SQL-shape assertions for both dialects (`test_query.py`),
+real end-to-end SQLite execution manually registering the same UDF gramps
+core does (`test_query.py`, `test_where_expr_examples.py`), an evaluator
+unit-test section including the case-sensitivity divergence from `Like`/
+`Contains` (`test_evaluator.py`), and a SQL-vs-evaluator agreement test run
+against the fixture's real underlying Gramps SQLite backend -- the one that
+gets the core `regexp` UDF for free rather than needing to mirror it by
+hand, and the one that originally caught the NULL-safety bug above.
 
 ## Possibilities
 

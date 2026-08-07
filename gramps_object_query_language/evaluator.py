@@ -283,6 +283,16 @@ def _compare(op: str, left: Any, right: Any) -> Optional[bool]:
         if left is None or right is None:
             return None
         return _like_to_regex(str(right)).match(str(left)) is not None
+    if op == "REGEXP":
+        # Mirrors gramps core's `dbapi/sqlite.py` `regexp(expr, value)` UDF
+        # exactly (`re.search(expr, value, re.MULTILINE)`) -- an unanchored,
+        # case-sensitive search, not `_like_to_regex`'s case-insensitive
+        # full-match -- so this evaluator path and a real SQLite backend
+        # agree on every row. `right` is the pattern (`Regex.value`), `left`
+        # the haystack, same left/right convention as `LIKE` above.
+        if left is None or right is None:
+            return None
+        return re.search(str(right), str(left), re.MULTILINE) is not None
     if op in _ORDERING_OPS:
         # SQL's ordering comparisons against a NULL operand are UNKNOWN, not
         # False, under standard three-valued logic -- Python raises

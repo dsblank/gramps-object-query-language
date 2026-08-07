@@ -37,6 +37,7 @@ A few symbols you'll see over and over:
 | `in [ ... ]` | matches any one of a list of values |
 | `'text' in field` | matches if `field` contains `'text'` anywhere in it |
 | `like(field, 'pattern')` | matches a text pattern, where `%` stands for "anything" |
+| `regex(field, 'pattern')` | matches a regular expression (for those who already know them) |
 
 Text values go in single quotes (`'Smith'`); numbers don't (`1968`).
 
@@ -126,6 +127,42 @@ Person "like(given_name, 'J%')"
 The `%` means "anything can follow" -- so this matches John, Jane, James,
 Julia, and so on. (Use `like(field, '%son')` to match names *ending* in
 "son" instead.)
+
+### Goal: Find everyone named John or Jane, using a regular expression
+
+```
+Person "regex(given_name, 'John|Jane')"
+```
+
+`regex(field, 'pattern')` is for people already comfortable with regular
+expressions -- a more powerful (and more technical) kind of pattern than
+`like(...)`'s `%`/`_`. This example matches the same people as
+`given_name in ['John', 'Jane']`, just spelled a different way. If you
+don't already know regular expressions, `in [...]`/`like(...)`/`'text' in
+field` above cover most everyday searches just fine.
+
+### Goal: Find everyone whose last name starts with S or D
+
+```
+Person "regex(surname, '^[SD]')"
+```
+
+`[SD]` means "either S or D" -- one thing a regular expression can do that
+`like(...)` can't: `like(...)`'s patterns only have `%`/`_` to work with, no
+way to say "one of these letters" without writing out a separate `or` for
+each one (`surname == 'Smith' or surname == 'Doyle' or ...`). This matches
+every Smith and Doyle in the tree in one go.
+
+### Goal: Find people whose death record mentions an accident or an unknown cause
+
+```
+Person "regex(death.description, 'accident|unknown')"
+```
+
+The `|` means "either of these" -- another thing a plain `like(...)`/`in`
+pattern can't express in a single condition; without it, this would need
+`like(death.description, '%accident%') or like(death.description,
+'%unknown%')` instead.
 
 ### Goal: Find everyone whose name contains "an" anywhere in it
 

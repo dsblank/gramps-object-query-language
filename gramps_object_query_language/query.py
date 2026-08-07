@@ -948,6 +948,76 @@ class Like(Comparison):
     op = "LIKE"
 
 
+class Regex(Comparison):
+    """WHERE column REGEXP <pattern> (SQLite) / column ~ <pattern> (PostgreSQL)
+    -- an unanchored, case-sensitive regex search (`re.search` semantics, not
+    `re.fullmatch`), not a plain SQL operator, so it needs a dialect to
+    compile at all (like `JsonPath`/`RelatedObject`).
+
+    SQLite has no built-in `REGEXP` operator, but gramps core's
+    `dbapi/sqlite.py` `Connection.__init__` already registers one as a UDF
+    on every connection it opens (`regexp(expr, value)`, calling Python's
+    `re.search(expr, value, re.MULTILINE)`), so `column REGEXP ?` works
+    there for free -- no schema/connection change needed by this module.
+    PostgreSQL's native `~` operator has the same unanchored, case-sensitive
+    substring-search semantics, so no extension is needed there either.
+
+    The two engines don't speak the same regex dialect, though: SQLite's UDF
+    is literally Python's `re` (so it agrees exactly with `evaluator.py`'s
+    in-memory `_compare`), while PostgreSQL uses POSIX ARE -- no
+    lookahead/lookbehind, no `(?P<name>...)` named groups. A pattern meant
+    to behave identically on both backends should stick to the intersection
+    (character classes, `\\d`/`\\w`/`\\s`, quantifiers, alternation, plain
+    groups, anchors).
+
+    SQLite's UDF is also not NULL-safe, unlike every native operator this
+    module otherwise relies on: `re.search(None, ...)`/`re.search(..., None)`
+    both raise `TypeError` in plain Python, which `sqlite3` surfaces as a
+    hard `OperationalError: user-defined function raised exception` instead
+    of SQL's usual "NULL propagates to NULL" -- confirmed live against
+    gramps core's registered `regexp()` UDF. `compile()` guards both
+    operands with a `CASE` on SQLite so a missing haystack or (field-vs-field)
+    pattern comes back `NULL`/`UNKNOWN`, same as every other operator here,
+    rather than crashing the query outright. PostgreSQL's native `~`
+    NULL-propagates correctly on its own, so no guard is needed there.
+    """
+
+    op = "REGEXP"
+
+    def compile(
+        self,
+        spec: ObjectTypeSpec,
+        dialect: Optional[Dialect] = None,
+        treeid: Optional[int] = None,
+    ) -> Tuple[str, list]:
+        if dialect == Dialect.SQLITE:
+            sql_op = "REGEXP"
+        elif dialect == Dialect.POSTGRESQL:
+            sql_op = "~"
+        else:
+            raise QueryError(
+                f"a dialect is required to compile a Regex, but got {dialect!r}"
+            )
+        # Always a TEXT extraction -- same reasoning as Contains, just below:
+        # there's no numeric/boolean form of a regex match.
+        column_sql, column_params = _render_column(
+            self.column, spec, dialect, value="", treeid=treeid
+        )
+        if isinstance(self.value, (JsonPath, RelatedObject, FlatColumnRef)):
+            value_sql, value_params = _render_column(
+                self.value, spec, dialect, value="", treeid=treeid
+            )
+        else:
+            value_sql, value_params = "?", [self.value]
+        if dialect == Dialect.SQLITE:
+            sql = (
+                f"(CASE WHEN {column_sql} IS NULL OR {value_sql} IS NULL "
+                f"THEN NULL ELSE {column_sql} {sql_op} {value_sql} END)"
+            )
+            return sql, (column_params + value_params) * 2
+        return f"{column_sql} {sql_op} {value_sql}", column_params + value_params
+
+
 class Contains(Comparison):
     """WHERE column LIKE '%<value>%' ESCAPE '\\' -- a plain substring test
     (`'Jan' in given_name`), as opposed to `Like`'s user-authored SQL pattern

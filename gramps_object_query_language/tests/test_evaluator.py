@@ -72,6 +72,7 @@ from gramps_object_query_language.query import (
     Ne,
     Not,
     Or,
+    Regex,
     resolve_collection,
     resolve_column_path,
 )
@@ -282,6 +283,21 @@ def test_evaluate_where_like(db_handles):
     assert evaluate_where(db, father, Like("surname", "Zzz%"), PERSON) is False
 
 
+def test_evaluate_where_regex(db_handles):
+    db, handles = db_handles
+    father = db.get_person_from_handle(handles["father"])
+    assert evaluate_where(db, father, Regex("surname", "^And.*son$"), PERSON) is True
+    assert evaluate_where(db, father, Regex("surname", "^Zzz"), PERSON) is False
+    # Unanchored -- a bare "nder" (no ^/$) still matches as a substring
+    # search, same as re.search, not re.fullmatch.
+    assert evaluate_where(db, father, Regex("surname", "nder"), PERSON) is True
+    # Case-sensitive, unlike Like/Contains just above -- mirrors gramps
+    # core's `dbapi/sqlite.py` `regexp()` UDF, a plain `re.search` with no
+    # IGNORECASE flag, so this evaluator path stays exactly in step with a
+    # real SQLite backend (see test_sql_and_evaluator_agree_on_regex below).
+    assert evaluate_where(db, father, Regex("surname", "^and"), PERSON) is False
+
+
 def test_evaluate_where_contains(db_handles):
     db, handles = db_handles
     father = db.get_person_from_handle(handles["father"])
@@ -355,6 +371,14 @@ def test_evaluate_where_not_of_like_against_missing_value(db_handles):
     ref = resolve_column_path(PERSON, ["birth", "gramps_id"])
     assert evaluate_where(db, person, Like(ref, "E%"), PERSON) is False
     assert evaluate_where(db, person, Not(Like(ref, "E%")), PERSON) is False
+
+
+def test_evaluate_where_not_of_regex_against_missing_value(db_handles):
+    db, handles = db_handles
+    person = db.get_person_from_handle(handles["no_birth"])
+    ref = resolve_column_path(PERSON, ["birth", "gramps_id"])
+    assert evaluate_where(db, person, Regex(ref, "^E"), PERSON) is False
+    assert evaluate_where(db, person, Not(Regex(ref, "^E")), PERSON) is False
 
 
 def test_evaluate_where_and_false_dominates_unknown_sibling(db_handles):
@@ -488,6 +512,47 @@ def test_sql_and_evaluator_agree_on_exists(db_handles):
         for key, family in families.items():
             expected = handles[key] in sql_matches
             actual = evaluate_where(db, family, where, FAMILY)
+            assert actual == expected, f"{where!r} on {key!r}: SQL={expected} eval={actual}"
+
+
+def test_sql_and_evaluator_agree_on_regex(db_handles):
+    """Same style of regression guard as test_sql_and_evaluator_agree_on_exists
+    above, but for Regex specifically: runs the same AST through the
+    fixture's real underlying Gramps SQLite backend (`db.dbapi.execute`) --
+    which already has gramps core's `regexp` UDF registered on it, the same
+    way any real deployment does, no manual registration needed here -- and
+    through `evaluate_where`, and checks they agree. Includes a
+    lowercase-anchored pattern specifically to catch a case-sensitivity
+    mismatch (this evaluator path is deliberately case-sensitive, unlike
+    Like/Contains -- see test_evaluate_where_regex), and a missing-value
+    case to catch a three-valued-logic mismatch.
+    """
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+
+    db, handles = db_handles
+    birth_gramps_id = resolve_column_path(PERSON, ["birth", "gramps_id"])
+    wheres = [
+        Regex("surname", "^And.*son$"),
+        Regex("surname", "^and"),  # lowercase -- must not match case-sensitively
+        Regex("surname", "ake"),  # unanchored substring, matches "Baker"
+        Not(Regex("surname", "^And.*son$")),
+        Regex(birth_gramps_id, "^E"),  # missing for "no_birth" -- UNKNOWN
+        Not(Regex(birth_gramps_id, "^E")),
+    ]
+    people = {
+        "father": db.get_person_from_handle(handles["father"]),
+        "mother": db.get_person_from_handle(handles["mother"]),
+        "no_birth": db.get_person_from_handle(handles["no_birth"]),
+    }
+    for where in wheres:
+        sql, params = compile_query(
+            PERSON, Query(select=["handle"], where=where), dialect=Dialect.SQLITE
+        )
+        db.dbapi.execute(sql, params)
+        sql_matches = {row[0] for row in db.dbapi.fetchall()}
+        for key, person in people.items():
+            expected = handles[key] in sql_matches
+            actual = evaluate_where(db, person, where, PERSON)
             assert actual == expected, f"{where!r} on {key!r}: SQL={expected} eval={actual}"
 
 

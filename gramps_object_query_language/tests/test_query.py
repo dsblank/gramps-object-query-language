@@ -55,6 +55,7 @@ from gramps_object_query_language.query import (
     Query,
     QueryError,
     RelatedObject,
+    Regex,
     after_columns,
     compile_count_query,
     compile_query,
@@ -926,6 +927,98 @@ def test_ordering_and_like_and_in_ops_unaffected_by_null_safe_rewrite():
 
     sql, _ = compile_query(PERSON, Query(select=["handle"], where=In("gender", [1, 2])))
     assert "gender IN (?, ?)" in sql
+
+
+# --- Regex --------------------------------------------------------------
+#
+# Dialect-sensitive, like JsonPath/RelatedObject rendering -- SQLite has no
+# built-in REGEXP operator, but gramps core's `dbapi/sqlite.py` already
+# registers a `regexp(expr, value)` UDF (`re.search(expr, value,
+# re.MULTILINE)`) on every connection it opens, so `column REGEXP ?` works
+# there for free; PostgreSQL has a native `~` operator with the same
+# unanchored, case-sensitive substring-search semantics.
+
+
+def test_regex_sqlite_shape():
+    sql, params = compile_query(
+        PERSON,
+        Query(select=["handle"], where=Regex("surname", "^Sm.*h$")),
+        dialect=Dialect.SQLITE,
+    )
+    assert "surname REGEXP ?" in sql
+    assert params[0] == "^Sm.*h$"
+
+
+def test_regex_postgresql_shape():
+    sql, params = compile_query(
+        PERSON,
+        Query(select=["handle"], where=Regex("surname", "^Sm.*h$")),
+        dialect=Dialect.POSTGRESQL,
+    )
+    assert "surname ~ ?" in sql
+    assert params[0] == "^Sm.*h$"
+
+
+def test_regex_requires_a_dialect():
+    # Unlike a plain flat-column Like/Eq/..., Regex can't fall back to a
+    # dialect-agnostic rendering -- REGEXP vs ~ has to be picked explicitly.
+    with pytest.raises(QueryError):
+        compile_query(PERSON, Query(select=["handle"], where=Regex("surname", "^Sm")))
+
+
+def test_regex_repr_shows_raw_pattern():
+    assert repr(Regex("surname", "^Sm.*h$")) == "Regex('surname', '^Sm.*h$')"
+
+
+def test_regex_field_vs_field_sqlite_shape():
+    # Same field-vs-field support Comparison's base compile() already gives
+    # every other op -- no escaping needed here (unlike Contains), since a
+    # regex pattern is meant to be interpreted as a real regex either way.
+    sql, params = compile_query(
+        PERSON,
+        Query(select=["handle"], where=Regex("surname", FlatColumnRef("given_name"))),
+        dialect=Dialect.SQLITE,
+    )
+    assert "surname REGEXP given_name" in sql
+    assert params == [50]  # only the outer treeid param -- no bound pattern
+
+
+def test_regex_field_vs_field_through_relationships_postgresql_shape():
+    birth_place_title = resolve_column_path(PERSON, ["birth", "place", "title"])
+    death_place_title = resolve_column_path(PERSON, ["death", "place", "title"])
+    sql, params = compile_query(
+        PERSON,
+        Query(select=["handle"], where=Regex(death_place_title, birth_place_title)),
+        dialect=Dialect.POSTGRESQL,
+    )
+    assert sql.count("SELECT") >= 2
+    assert " ~ " in sql
+
+
+def test_regex_end_to_end_sqlite_execution():
+    # Mirrors gramps core's `dbapi/sqlite.py` Connection.__init__ exactly --
+    # a bare stdlib sqlite3 connection (what every other end-to-end test in
+    # this file uses) has no REGEXP operator of its own, so this registers
+    # the same UDF gramps core registers on every real connection, to prove
+    # the SQL this module emits actually works against it.
+    import re
+    import sqlite3
+
+    def regexp(expr, value):
+        return re.search(expr, value, re.MULTILINE) is not None
+
+    conn = sqlite3.connect(":memory:")
+    conn.create_function("regexp", 2, regexp)
+    conn.execute("CREATE TABLE person (handle TEXT, surname TEXT)")
+    conn.execute("INSERT INTO person VALUES ('dad1', 'Smith')")
+    conn.execute("INSERT INTO person VALUES ('other1', 'Jones')")
+    sql, params = compile_query(
+        PERSON,
+        Query(select=["handle"], where=Regex("surname", "^Sm.*h$")),
+        dialect=Dialect.SQLITE,
+    )
+    rows = conn.execute(sql, params).fetchall()
+    assert rows == [("dad1",)]
 
 
 def test_contains_wraps_value_in_wildcards_and_binds_as_param():

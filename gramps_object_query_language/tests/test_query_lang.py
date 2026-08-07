@@ -22,6 +22,7 @@
 import pytest
 
 from gramps_object_query_language.query_lang import (
+    VALID_LEAF_OPS,
     QueryLangError,
     compile_expr,
     compile_expr_for_spec,
@@ -42,6 +43,7 @@ from gramps_object_query_language.query import (
     Not,
     Or,
     RelatedObject,
+    Regex,
 )
 
 
@@ -193,6 +195,35 @@ def test_like_call_wrong_arity_rejected():
 def test_like_call_non_string_pattern_rejected():
     with pytest.raises(QueryLangError):
         parse_expr("person", "like(gender, 5)")
+
+
+def test_regex_call():
+    result = parse_expr("person", "regex(primary_name.first_name, '^Jo')")
+    assert result == [
+        {
+            "column": {"json_path": ["primary_name", "first_name"]},
+            "op": "regex",
+            "value": "^Jo",
+        }
+    ]
+
+
+def test_regex_call_wrong_arity_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "regex(gender)")
+
+
+def test_regex_call_non_string_pattern_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "regex(gender, 5)")
+
+
+def test_valid_leaf_ops_includes_regex():
+    # VALID_LEAF_OPS is also what object_query.py's raw `where` JSON schema
+    # validates against (see its own docstring) -- this just locks in that
+    # "regex" was actually added there, not just wired into the "almost
+    # Python" surface syntax above.
+    assert "regex" in VALID_LEAF_OPS
 
 
 # --- literals --------------------------------------------------------------------
@@ -1374,6 +1405,11 @@ def test_compile_expr_plain_column():
 def test_compile_expr_for_spec_matches_compile_expr():
     spec, where = compile_expr("person", "gender == 1")
     assert compile_expr_for_spec(PERSON, "gender == 1") == where
+
+
+def test_compile_expr_regex_call():
+    _, where = compile_expr("person", "regex(surname, '^Sm.*h$')")
+    assert where == Regex("surname", "^Sm.*h$")
 
 
 def test_compile_expr_json_path_not_a_relationship():

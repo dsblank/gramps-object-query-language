@@ -28,12 +28,23 @@ markdown file can't assert anything on its own.
 """
 
 import json
+import re
 import sqlite3
 
 import pytest
 
 from gramps_object_query_language.query import Dialect, Query, compile_query
 from gramps_object_query_language.query_lang import compile_expr
+
+
+def _regexp(expr, value):
+    """Mirrors gramps core's `dbapi/sqlite.py` `regexp()` UDF exactly -- a
+    bare stdlib `sqlite3` connection (what this fixture otherwise is) has no
+    REGEXP operator of its own, so `db` below registers this the same way
+    every real Gramps SQLite connection already does, to prove `regex(...)`
+    examples run against the same SQL a real deployment would see.
+    """
+    return re.search(expr, value, re.MULTILINE) is not None
 
 
 @pytest.fixture
@@ -52,6 +63,7 @@ def db():
       actually exclude non-matches.
     """
     conn = sqlite3.connect(":memory:")
+    conn.create_function("regexp", 2, _regexp)
     conn.execute(
         "CREATE TABLE person (handle TEXT, gender INTEGER, given_name TEXT, "
         "surname TEXT, birth_ref_index INTEGER, death_ref_index INTEGER, "
@@ -203,6 +215,29 @@ def test_like_operator(db):
     assert result == [("dad1",), ("mom1",)]
 
 
+def test_regex_operator(db):
+    # Unanchored, case-sensitive regex search -- "^J" matches both "John"
+    # and "Jane" the same as like(given_name, 'J%') above, but a regex can
+    # express things a LIKE pattern can't, e.g. "either John or Jane".
+    result = run(db, "Person", "regex(given_name, '^(John|Jane)$')")
+    assert result == [("dad1",), ("mom1",)]
+
+
+def test_regex_operator_readme_example(db):
+    # README-query-language.md's cookbook example, spelled without the
+    # anchors used above but matching the same two people.
+    result = run(db, "Person", "regex(given_name, 'John|Jane')")
+    assert result == [("dad1",), ("mom1",)]
+
+
+def test_regex_character_class_readme_example(db):
+    # README-query-language.md's cookbook example -- "[SD]" (either S or D)
+    # matches every Smith (dad1, mom1, kid1, granddad1) and Doyle (grandma1),
+    # not Jones (other1) -- a character class LIKE has no equivalent for.
+    result = run(db, "Person", "regex(surname, '^[SD]')")
+    assert result == [("dad1",), ("granddad1",), ("grandma1",), ("kid1",), ("mom1",)]
+
+
 def test_contains_operator(db):
     # "'sub' in field" is a plain substring test -- 'Jan' matches "Jane"
     # (mom1) with no wildcard characters written out, unlike `like()`.
@@ -348,6 +383,15 @@ def test_death_description_contains(db):
     # substring test instead of a hand-written LIKE pattern.
     result = run(db, "Person", "'accident' in death.description")
     assert result == [("dad1",)]
+
+
+def test_death_description_regex_alternation_readme_example(db):
+    # README-query-language.md's cookbook example -- "|" (either of these)
+    # matches dad1's "Died in a car accident." and other1's "Cause
+    # unknown.", something neither like(...) nor 'text' in field can express
+    # in a single condition (each only ever tests for one substring).
+    result = run(db, "Person", "regex(death.description, 'accident|unknown')")
+    assert result == [("dad1",), ("other1",)]
 
 
 # --- relationship traversal (Person -> Event -> Place) -----------------------

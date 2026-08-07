@@ -25,10 +25,11 @@ Uses `ast.parse(expr, mode="eval")` as pure syntax, never `eval()` or
 `compile()` -- the tree is inspected and translated node-by-node into plain
 JSON, never executed. Safety comes from whitelisting node *shapes*, not
 blacklisting names: any AST node this module doesn't explicitly recognize
-(function calls other than the whitelisted `like(...)`/`any(...)`/`len(...)`
-forms, lambdas, attribute access building toward dunder names, imports,
-walrus, f-strings, ...) is rejected by `_translate_*` simply never handling
-it and falling through to a `QueryLangError`.
+(function calls other than the whitelisted `like(...)`/`regex(...)`/
+`any(...)`/`len(...)` forms, lambdas, attribute access building toward
+dunder names, imports, walrus, f-strings, ...) is rejected by
+`_translate_*` simply never handling it and falling through to a
+`QueryLangError`.
 
 The one exception to "parsed, never rewritten": `any(cond for x in rel [if
 ...])` and `len([... for x in rel if ...])` are comprehension *sugar* for
@@ -76,8 +77,9 @@ supports today:
   the left, a path on the right) is a plain substring test (`Contains`),
   disambiguated from `path in [...]` purely by the right-hand node's shape
   (`ast.List` vs. a path) -- the same `ast.Compare`/`ast.In` node either way.
-- `like(path, 'pattern%')` is a whitelisted function-call form, for the one
-  operator (`Like`) that isn't a Python operator.
+- `like(path, 'pattern%')` and `regex(path, 'pattern')` are whitelisted
+  function-call forms, for the two operators (`Like`, `Regex`) that aren't
+  Python operators.
 - A path is a bare identifier optionally followed by `.attr` / `[index]`
   segments, e.g. `gender` or `primary_name.surname_list[0].surname`.
   Single-segment paths that match the target type's flat column whitelist
@@ -93,8 +95,8 @@ supports today:
   (`birth.date.modifier == Date.MOD_ABOUT`, `type.value == EventType.BIRTH`)
   -- the constant class list is unrelated to where the field it's compared
   against happens to live.
-- Also on the value side, `Date('Jan 1, 1968')` -- the second and last
-  whitelisted call form -- parses a human date string with Gramps' own
+- Also on the value side, `Date('Jan 1, 1968')` -- another whitelisted call
+  form -- parses a human date string with Gramps' own
   date parser and resolves to `.sortval`, a plain comparable integer
   (Julian day number), so `event.date.sortval >= Date('Jan 1, 1968')` and
   `birth.date.sortval >= Date('Jan 1, 1968')` both work with ordinary
@@ -165,6 +167,7 @@ from .query import (
     ObjectTypeSpec,
     Or,
     QueryError,
+    Regex,
     resolve_collection,
     resolve_column_path,
 )
@@ -611,6 +614,16 @@ def _translate_like_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:
     return {"column": column, "op": "like", "value": pattern}
 
 
+def _translate_regex_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:
+    if len(node.args) != 2 or node.keywords:
+        raise QueryLangError("regex(path, 'pattern') takes exactly 2 positional arguments")
+    column = _translate_column(node.args[0], spec)
+    pattern = _translate_value(node.args[1])
+    if not isinstance(pattern, str):
+        raise QueryLangError("regex(...)'s second argument must be a string literal")
+    return {"column": column, "op": "regex", "value": pattern}
+
+
 def _translate_exists_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:
     """Translate `exists(relationship[, condition])` into
     `{"exists": {"relationship": ..., "where": [...]}}` -- `where` omitted
@@ -645,17 +658,20 @@ def _translate_exists_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:
 
 
 def _translate_comparison_like_node(node: ast.AST, spec: ObjectTypeSpec) -> dict:
-    """A single leaf: a `Compare`, or a whitelisted `like(...)`/`exists(...)` call."""
+    """A single leaf: a `Compare`, or a whitelisted
+    `like(...)`/`regex(...)`/`exists(...)` call."""
     if isinstance(node, ast.Compare):
         return _translate_compare(node, spec)
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
         if node.func.id == "like":
             return _translate_like_call(node, spec)
+        if node.func.id == "regex":
+            return _translate_regex_call(node, spec)
         if node.func.id == "exists":
             return _translate_exists_call(node, spec)
     raise QueryLangError(
         f"expected a comparison (a == b, a in [...], like(a, 'pat'), "
-        f"exists(rel, cond)), got: {ast.dump(node)}"
+        f"regex(a, 'pat'), exists(rel, cond)), got: {ast.dump(node)}"
     )
 
 
@@ -985,13 +1001,15 @@ _OP_CLASSES: dict[str, type] = {
 }
 
 # Every leaf `op` a condition dict can carry -- `_OP_CLASSES`'s keys plus
-# "in"/"like"/"contains" (special-cased in `_condition_from_json`, not
+# "in"/"like"/"regex"/"contains" (special-cased in `_condition_from_json`, not
 # plain `Comparison` subclasses). Public so `object_query.py`'s own
 # `where`-body schema validates against this directly instead of a second,
 # hand-copied whitelist that can (and did) drift -- new ops added here are
 # then automatically valid for a raw `where` JSON body too, no
-# gramps-web-api change needed.
-VALID_LEAF_OPS = frozenset(_OP_CLASSES) | {"in", "like", "contains"}
+# gramps-web-api change needed (though gramps-web-api's own `value_column`
+# restriction for "in"/"like"/"regex" is a separate, hand-maintained check --
+# see its `_validate_leaf_condition`).
+VALID_LEAF_OPS = frozenset(_OP_CLASSES) | {"in", "like", "regex", "contains"}
 
 
 def json_column_to_ref(column: Union[str, dict], spec: ObjectTypeSpec) -> ColumnRef:
@@ -1023,13 +1041,20 @@ def json_column_to_ref(column: Union[str, dict], spec: ObjectTypeSpec) -> Column
 
 def _condition_from_json(condition: dict, spec: ObjectTypeSpec) -> Any:
     """One `parse_expr`-shaped condition dict, translated to a `query.py`
-    comparison object (`Eq`, `Lt`, `In`, `Like`, `Contains`, ...)."""
+    comparison object (`Eq`, `Lt`, `In`, `Like`, `Regex`, `Contains`, ...)."""
     column = json_column_to_ref(condition["column"], spec)
     op = condition["op"]
     if op == "in":
         return In(column, condition["value"])
     if op == "like":
         return Like(column, condition["value"])
+    if op == "regex":
+        # Literal pattern only, same as "like" just above -- a pattern only
+        # known at row-execution time (via "value_column") can't be
+        # validated as a compilable regex ahead of time, so it's not
+        # supported here (gramps-web-api's `_validate_leaf_condition`
+        # enforces the same restriction on a raw `where` JSON body).
+        return Regex(column, condition["value"])
     if "value_column" in condition:
         # Field-vs-field, e.g. "mother.death.date.sortval < father.death.date.sortval",
         # or (for "contains") "other_field in field".

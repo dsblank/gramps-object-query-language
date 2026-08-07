@@ -161,6 +161,29 @@ substring literally -- if it happens to contain a `%` or `_`, that
 character is escaped so it's matched literally too, not reinterpreted as
 a wildcard.
 
+## `regex(...)`
+
+```python
+Person "regex(given_name, '^(John|Jane)$')"
+```
+
+`regex(field, 'pattern')` is another whitelisted function-call form, for a
+regex search SQL has no operator syntax for. Unlike `like(...)`'s `%`/`_`
+wildcards, `pattern` is a real regular expression, matched unanchored (a
+substring search, like Python's `re.search` -- not `re.fullmatch`, so
+`regex(given_name, 'ohn')` matches `"John"` too) and case-sensitively
+(unlike `like(...)`/`in`'s substring form, which both match
+case-insensitively).
+
+Two different regex engines actually run a `regex(...)` condition,
+depending on the database backend: SQLite runs it through a small Python
+function (so it's exactly Python's `re` syntax), while PostgreSQL uses its
+own native operator (POSIX "advanced regular expressions"). The two mostly
+agree, but not entirely -- PostgreSQL's flavor has no lookahead/lookbehind
+and no `(?P<name>...)` named groups. Stick to plain character classes
+(`\d`, `\w`, `\s`), quantifiers, alternation, groups, and anchors if the
+same query needs to run correctly against both backends.
+
 ## `is`, `is not`, and `not in`
 
 ```python
