@@ -69,7 +69,9 @@ does today.
 **Sorting / pagination**
 - `order_by` and keyset pagination (`after`) only work against flat SQL
   columns -- a `JsonPath` or `RelatedObject` field (`primary_name.surname_list[0].surname`,
-  `birth.date.sortval`) can be filtered on but not sorted by. (query.py)
+  `birth.date.sortval`) can be filtered on but not sorted by. (query.py) See
+  [Sortable JSON/relationship columns](#sortable-jsonrelationship-columns-order_bykeyset-on-jsonpathrelatedobject-item-k)
+  below for a scoped-out example of what closing this would take.
 - ~~The evaluator/proxied path (`proxied_query.py::run_query`) has no
   `order_by`/`limit`/`after` support at all~~ -- **Done**, see [Evaluator-path
   pagination/sort parity](#evaluator-path-paginationsort-parity-order_bylimitafterselect)
@@ -848,6 +850,113 @@ rather than inventing it from scratch. `any()` still goes last: it needs
 that same pattern *and* its own new no-target-table `EXISTS`-over-JSON-array
 rendering on top, the one piece neither `count()` nor `len()` needs.
 
+### Sortable JSON/relationship columns (`order_by`/keyset on `JsonPath`/`RelatedObject`) (item K)
+
+Motivated by: `order_by=birth.date.sortval` or
+`order_by=primary_name.surname_list[0].surname` -- both already resolve fine
+as a `where`/`select` field via `resolve_column_path`, but `OrderBy.column`
+today is a plain `str` checked against `spec.columns`, so neither can be
+sorted by (see the Current limitations bullet above).
+
+**The blocking question this section resolves:** `_render_json_path`'s
+`CAST` logic (`BOOLEAN`/`NUMERIC`/plain text, PostgreSQL only) is driven by
+the runtime comparison `value` a `where` clause always has in hand --
+`order_by` has no such value, so naively reusing that function for a sort
+column would leave every JSON-path sort ordering PostgreSQL text
+lexicographically (`"10" < "9"`), silently wrong for exactly the kind of
+numeric field (`sortval`) this is motivated by. **Confirmed live that this
+is solvable statically, not a hard blocker:** every `gramps.gen.lib` class
+already exposes `.get_schema()`, a plain JSON-schema dict --
+`Event.get_schema()["properties"]["date"]["properties"]["sortval"]` is
+`{"type": "integer", ...}` -- so a path's terminal type is knowable at
+compile time by walking the schema, the same walk
+`../addons-source/GrampyScript/stub_generator.py`'s `_pytype`/`_walk`
+already does (there, to render jedi type-stub annotations for
+autocompletion; here, to pick a `CAST` instead of a type annotation). No
+new dependency: `gramps.gen.lib` is already imported throughout query.py.
+
+**Difficulty:** medium, now scoped by actual layer-by-layer analysis (like
+`len()`/`any()` above), not an estimate by analogy.
+
+**What it would take, layer by layer:**
+
+1. **A schema-walk type resolver (new, small)** -- given a root class and a
+   segment list (mirrors `resolve_column_path`'s own `(str | int)`
+   segments), descend `schema["properties"][segment]` for a `str` segment,
+   or `schema["items"]` for an `int` segment on an `array`-typed field,
+   returning a terminal JSON-schema type string (`"string"`/`"integer"`/
+   `"number"`/`"boolean"`, else a fallback -- see risk below). Only the
+   traversal is needed, not `stub_generator.py`'s registry-building or
+   stub-source-rendering machinery around it.
+2. **`ObjectTypeSpec` needs a `cls` field** (query.py:59-64 currently
+   carries only `table`/`columns`/`text_columns`) so a `JsonPath`'s or
+   `RelatedObject`'s target class is resolvable back to a real
+   `gramps.gen.lib` class to call `.get_schema()` on -- for a
+   `RelatedObject` chain (`birth.place.title`), the walk needs to follow
+   the same relationship hops `resolve_column_path` does, switching root
+   classes at each hop.
+3. **`query.py` core:**
+   - Widen `OrderBy.column: str` to `OrderBy.column: ColumnRef` (query.py:1273-1276).
+   - `_check_column` (query.py:1538-1539) skips its whitelist check for a
+     non-`str` column -- a `JsonPath` already self-validates
+     (`__post_init__`) and a `RelatedObject` is already only constructible
+     via `resolve_column_path`.
+   - `_column_expr` (query.py:1335-1353) dispatches to
+     `_render_json_path`/`_render_related_object` instead of
+     `_quote_column` for a non-`str` column; `COLLATE` applies only when
+     the static schema type is `"string"` -- the `JsonPath`/`RelatedObject`
+     equivalent of the existing `spec.text_columns` check for flat columns.
+   - `_render_json_path`'s `CAST` branch (query.py:596-608) switches from
+     being driven by the runtime `value` argument to being driven by the
+     static schema type from step 1 -- a strict improvement for `where`
+     too, not just `order_by`: today a field-vs-field comparison
+     (`a.sortval < b.sortval`) has no literal `value` to inspect at all, so
+     it silently skips the numeric `CAST` it should get.
+   - `_compile_keyset`/`after_columns` (query.py:1297-1304, 1405-1461)
+     mostly fall out for free once `_column_expr` handles the new column
+     shapes, since both already funnel every column reference through it.
+4. **`object_query.py` (wiring layer)** -- wherever a client-supplied
+   `after=<handle>` cursor gets resolved into the tuple `after_columns()`
+   names (per this module's own docstring, "resolving a client-supplied
+   handle into that tuple... is the caller's job"), that resolution
+   currently assumes each name is a real column it can select directly.
+   Once `after_columns()` can return a `JsonPath`/`RelatedObject`, that
+   lookup needs to render through the same path `select` already uses
+   (`_render_column`), not a raw column-name `SELECT`.
+5. **Evaluator-path parity (item L's cap, proxied_query.py)** -- simpler
+   than the SQL half: `evaluator.py`'s `resolve_column_ref` already
+   resolves a `JsonPath`/`RelatedObject` for `where`, and Python's own
+   `<`/`>` don't need a `CAST` hint the way SQL does, so once `order_by`
+   accepts non-flat columns structurally, the evaluator path likely needs
+   no schema-walk of its own at all -- just widening the one
+   `check_columns` whitelist call proxied_query.py's docstring already
+   flags as the sole flat-columns-only assumption.
+6. **Docs + tests** -- README-query-language.md's `order_by` examples,
+   `test_query.py` (both dialects -- new SQL-shape assertions, per existing
+   pattern), `test_proxied_query.py`, plus a new unit test file for the
+   schema-walk resolver itself.
+
+**Risk / open decisions:**
+
+- **Ambiguous schema types.** A handful of fields have a JSON-schema `type`
+  that's a *list*, not a single string (e.g. `Date.dateval`'s items are
+  `["integer", "boolean"]`) -- `stub_generator.py`'s own `_pytype` already
+  falls back to `"object"` for this shape. Sorting on one of these would
+  fall back to plain-text rendering (no `CAST`, no `COLLATE`) -- a known,
+  narrow limitation to document rather than a blocker for v1.
+- **Multi-hop `RelatedObject` chains** need the schema walk to switch root
+  classes at each relationship hop, using the same `_RELATIONSHIPS`
+  registry `resolve_column_path` already threads through -- not a new
+  registry, just a second consumer of the existing one.
+
+**Recommended scope for a v1:** `OrderBy.column` accepts any `ColumnRef`
+already resolvable by `resolve_column_path` (i.e. anything `where`/`select`
+already support); static schema-walk types drive `CAST`/`COLLATE`
+selection; the rare ambiguous-type fields sort as plain text, documented as
+a known limitation rather than blocking the rest. Evaluator-path parity
+(closing item L's remaining cap) is small enough to land in the same
+change rather than a separate follow-up.
+
 ### Other gaps (not yet scoped to this level of detail)
 
 - **`exists(...)`/`count(...)` condition referencing the *outer* row** (e.g.
@@ -858,10 +967,6 @@ rendering on top, the one piece neither `count()` nor `len()` needs.
   render `ILIKE` on PostgreSQL for `like(...)`/substring-`in`, or apply a
   case-insensitive collation. Needs a test that actually runs both dialects
   and compares results, since nothing currently catches this gap.
-- **Sortable JSON/relationship columns** -- `order_by`/keyset pagination
-  would need to accept a `JsonPath`/`RelatedObject` the way `where` already
-  does, plus decide how keyset comparison and `COLLATE` selection behave
-  for a column whose type isn't known until runtime.
 - **Duplicate `RelatedObject` subqueries across `And` legs** -- a chained
   comparison against the same relationship path
   (`Date(...) < mother.birth.sortval < Date(...)`) renders the *entire*
@@ -882,10 +987,11 @@ rendering on top, the one piece neither `count()` nor `len()` needs.
 
 A quick-reference table (informal 1-5 scale, 1 = easy, 5 = hard) gathering
 gaps described elsewhere in this document into one place for planning
-purposes. Only `len()` and `any()` have difficulty ratings arrived at
-through actual layer-by-layer scoping (see their sections above); the rest
-are estimates by analogy to those two and to `count()`'s actual
-implementation cost, not independently measured the same way. (LIKE
+purposes. Only `len()`, `any()`, and K (sortable JSON/relationship
+`order_by` columns) have difficulty ratings arrived at through actual
+layer-by-layer scoping (see their sections above); the rest are estimates
+by analogy to those two and to `count()`'s actual implementation cost, not
+independently measured the same way. (LIKE
 case-sensitivity parity is deliberately not in this table -- it's a
 database/collation concern, not a `where_expr` language gap.)
 
@@ -907,7 +1013,7 @@ here, struck through, so that history stays legible.
 | H | `upper(surname) == 'SMITH'`, string concatenation, arithmetic | no general function calls -- only `like()`/`Date()` are whitelisted | 3-4 |
 | I | `any(primary_name.surname_list, surname == 'Doyle')` | see `any()` section above | 5 |
 | J | `exists(children, surname == father.surname)` | `exists`/`count` conditions can't see the outer row | 4 |
-| K | `order_by=primary_name.surname_list[0].surname` | `order_by`/keyset pagination only works on flat SQL columns | 3 |
+| K | `order_by=birth.date.sortval`, `order_by=primary_name.surname_list[0].surname` | see [Sortable JSON/relationship columns](#sortable-jsonrelationship-columns-order_bykeyset-on-jsonpathrelatedobject-item-k) above | 3 |
 | ~~L~~ | ~~any `order_by`/`limit`/`after` under a proxy (e.g. `PrivateProxyDb`)~~ | **Done** -- see [Evaluator-path pagination/sort parity](#evaluator-path-paginationsort-parity-order_bylimitafterselect) above | ~~3-4~~ |
 
 Difficulty here means "distance from today's code," not "priority" -- a low
@@ -1026,16 +1132,27 @@ each other cheaper:
   anything else in this list, which is exactly what made "just a registry
   entry" an incomplete prediction. J extends `exists`/`count`'s
   already-Done machinery to see two rows at once -- orthogonal to A-I. K
-  lives entirely in `order_by`/keyset pagination, a different subsystem
-  from `where_expr` compilation -- touches neither `_translate_compare`
-  nor `evaluator.py`'s comparison logic at all.
+  lives mostly in `order_by`/keyset pagination, a different subsystem from
+  `where_expr` compilation -- touches neither `_translate_compare` nor
+  `evaluator.py`'s comparison logic. **Update, now that K is scoped:** its
+  one piece of overlap with `where_expr` compilation is
+  `_render_json_path`'s `CAST` selection, which K's static schema-walk type
+  (rather than a runtime comparison value) would drive for *both* code
+  paths once built -- a shared improvement, not new coupling, since a
+  field-vs-field `where` comparison already has no `value` to drive that
+  logic from today.
 - **L shipped downstream of K, capped rather than independent, exactly as
   predicted.** L's own recommended v1 scope (flat columns only) landed
   deliberately capped at whatever K still supports today, so the evaluator
   path didn't leapfrog the SQL path's own `order_by` capability -- L shares
   no rendering code with K at all (K is pure SQL generation in `query.py`,
   L is a pure Python sort/seek pass in `proxied_query.py`), but its scope
-  boundary is a direct function of K's. If K ever ships (SQL path gains
+  boundary is a direct function of K's. **Update, now that K is scoped:**
+  closing L's cap turns out to need none of K's schema-walk machinery --
+  Python's `<`/`>` don't need a `CAST` hint the way SQL does, so L can
+  likely widen its one `check_columns` call as soon as K's structural
+  change (`OrderBy.column: ColumnRef`) lands, without waiting on K's
+  schema-walk type resolver at all. If K ever ships (SQL path gains
   `JsonPath`/`RelatedObject` sort columns), L's cap is free to move with it
   -- nothing about L's implementation assumes flat-columns-only beyond the
   one `check_columns` whitelist call, so widening it later is additive, not
