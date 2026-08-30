@@ -34,7 +34,11 @@ import sqlite3
 import pytest
 
 from gramps_object_query_language.query import Dialect, Query, compile_query
-from gramps_object_query_language.query_lang import compile_expr
+from gramps_object_query_language.query_lang import (
+    compile_expr,
+    parse_select,
+    resolve_namespace,
+)
 
 
 def _regexp(expr, value):
@@ -949,3 +953,46 @@ def test_chained_comparison_readme_example(db):
         "birth.date.sortval < Date('Jan 1, 1950')",
     )
     assert chained == anded == [("dad1",), ("mom1",)]
+
+
+# --- selecting values --------------------------------------------------------
+#
+# Mirrors docs/where_expr.md's "Selecting values" section: the same path
+# grammar used for filtering, used to say which values come back.
+
+
+def test_select_path_string_crossing_a_relationship(db):
+    # birth.place.title in a `select` returns the same value the identical
+    # path filters on in a `where_expr`.
+    assert run(db, "Person", "surname == 'Doyle'", select=("handle", "birth.place.title")) == [
+        ("grandma1", "Philadelphia, Philadelphia, Pennsylvania, USA"),
+    ]
+
+
+def test_select_parse_select_keys_and_refs(db):
+    parsed = parse_select(
+        resolve_namespace("Person"),
+        ["handle", "birth.place.title as birthplace"],
+    )
+    spec, where = compile_expr("Person", "surname == 'Doyle'")
+    sql, params = compile_query(
+        spec, Query(select=[ref for ref, _ in parsed], where=where), dialect=Dialect.SQLITE
+    )
+    rows = db.execute(sql, params).fetchall()
+    keys = [key for _, key in parsed]
+    assert [dict(zip(keys, row)) for row in rows] == [
+        {
+            "handle": "grandma1",
+            "birthplace": "Philadelphia, Philadelphia, Pennsylvania, USA",
+        }
+    ]
+
+
+def test_select_path_matches_where_expr_resolution(db):
+    """One grammar, one meaning: the `select` ref and the `where_expr`
+    comparison's column are the same object.
+    """
+    spec = resolve_namespace("Person")
+    [(select_ref, _key)] = parse_select(spec, ["birth.place.title"])
+    _spec, where = compile_expr("Person", "birth.place.title == 'x'")
+    assert select_ref == where.column

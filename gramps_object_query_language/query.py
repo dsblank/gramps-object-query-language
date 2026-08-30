@@ -37,8 +37,9 @@ the caller's job; see `after_columns()`.
 from __future__ import annotations
 
 import enum
+import re
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional, Sequence, Tuple, Union
+from typing import Any, Iterable, List, Optional, Sequence, Tuple, Union
 
 from gramps.gen.lib import (
     Citation,
@@ -57,11 +58,19 @@ from gramps.gen.lib.tableobj import TableObject
 
 @dataclass(frozen=True)
 class ObjectTypeSpec:
-    """Table + whitelist for one Gramps object type's flat secondary columns."""
+    """Table + whitelist for one Gramps object type's flat secondary columns,
+    plus the Gramps class itself, whose `get_schema()` describes the *JSON*
+    side of the same object (see `walk_schema`).
+
+    `cls` is what makes a `JsonPath` checkable rather than trusted: the
+    flat columns are whitelisted by `columns`, and everything reachable
+    inside `json_data` is whitelisted by the class's own JSON Schema.
+    """
 
     table: str
     columns: frozenset[str]
     text_columns: frozenset[str]
+    cls: type[TableObject]
 
 
 def _spec_for(
@@ -86,6 +95,7 @@ def _spec_for(
         table=cls.__name__.lower(),
         columns=columns,
         text_columns=text_columns,
+        cls=cls,
     )
 
 
@@ -101,6 +111,132 @@ CITATION = _spec_for(Citation)
 MEDIA = _spec_for(Media)
 NOTE = _spec_for(Note)
 TAG = _spec_for(Tag)
+
+
+# --- JSON schema: whitelisting the `json_data` side --------------------------
+
+
+#: Fields Gramps *serializes* into `json_data` but omits from the matching
+#: class's `get_schema()`. Verified against Gramps 6.0.8 by round-tripping a
+#: real instance of all 45 schema-carrying classes in `gramps.gen.lib`
+#: against its own schema -- these three were the only mismatches, and each
+#: is a genuine, queryable stored field, not a serialization artifact.
+#:
+#: Without this table a path like `birth.date.format` -- real data, present
+#: in every serialized `Date` -- would be rejected as unknown. The test
+#: `test_schema_gaps_are_still_gaps` re-derives this set from live Gramps
+#: and fails if a gap closes upstream (or a new one opens), so this can't
+#: quietly rot into a stale hardcoded list.
+_SCHEMA_GAPS: dict = {
+    "Date": {"format": {"type": ["integer", "null"], "title": "Format"}},
+    "Family": {"complete": {"type": "integer", "title": "Complete"}},
+    "Media": {"thumb": {"type": ["string", "null"], "title": "Thumbnail"}},
+}
+
+
+def _schema_properties(schema: dict) -> dict:
+    """`schema`'s own properties, plus any `_SCHEMA_GAPS` entries for the
+    class it describes. Keyed off the schema's `title`, which is how a
+    nested schema node names its class (`{"type": "object", "title":
+    "Date", ...}`) -- there's no class reference to follow at that depth.
+    """
+    properties = dict(schema.get("properties", {}))
+    properties.update(_SCHEMA_GAPS.get(schema.get("title", ""), {}))
+    return properties
+
+
+def _describe_schema(schema: dict) -> str:
+    return schema.get("title") or schema.get("type") or "value"
+
+
+def walk_schema(spec: ObjectTypeSpec, segments: Sequence[Union[str, int]]) -> dict:
+    """Walk `segments` through `spec`'s Gramps JSON Schema, returning the
+    schema node for the value the path lands on. Raises `QueryError` -- with
+    the field names that *would* have worked -- if the path doesn't exist.
+
+    This is what makes a `JsonPath` a checked reference rather than a
+    hopeful one. `json_data`'s contents are not arbitrary: every Gramps
+    primary object class publishes a complete, recursive `get_schema()`
+    (no `$ref`s, fully inlined), so `primary_name.surname_list[0].surname`
+    can be verified statically, exactly like a flat column name is verified
+    against `spec.columns`. A path that doesn't exist is a mistake, and
+    saying so at compile time beats returning `NULL` for every row.
+
+    A string segment indexes an object's properties; an integer segment
+    indexes an array's `items`. Mismatches (a key into a scalar, an index
+    into an object) are errors too, not just unknown names.
+    """
+    schema = spec.cls.get_schema()
+    walked: List[str] = []
+    for segment in segments:
+        if isinstance(segment, int):
+            if schema.get("type") != "array":
+                raise QueryError(
+                    f"{'.'.join(walked) or spec.table!r} is "
+                    f"{_describe_schema(schema)}, not a list -- "
+                    f"[{segment}] doesn't apply to it"
+                )
+            schema = schema.get("items", {})
+            walked.append(f"[{segment}]")
+            continue
+        properties = _schema_properties(schema)
+        if not properties:
+            raise QueryError(
+                f"{'.'.join(walked) or spec.table!r} is "
+                f"{_describe_schema(schema)}, which has no fields -- "
+                f"{segment!r} doesn't apply to it"
+            )
+        if segment not in properties:
+            known = sorted(name for name in properties if not name.startswith("_"))
+            raise QueryError(
+                f"unknown field {segment!r} on "
+                f"{_describe_schema(schema)} -- known fields: "
+                f"{', '.join(known)}"
+            )
+        schema = properties[segment]
+        walked.append(segment)
+    return schema
+
+
+def path_value_type(spec: ObjectTypeSpec, segments: Sequence[Union[str, int]]) -> Any:
+    """The JSON type a path resolves to (`"string"`, `"integer"`, `"object"`,
+    `"array"`, or a list of them for a nullable field), or `None` if the
+    schema doesn't say.
+
+    Callers use this to know a value's shape *before* running the query --
+    in particular whether it's a composite (`"object"`/`"array"`), which is
+    the case a SQLite caller has to JSON-decode on the way back out, since
+    `json_extract` hands those back as JSON text while PostgreSQL's `jsonb`
+    hands back a parsed value.
+    """
+    return walk_schema(spec, segments).get("type")
+
+
+def ref_value_type(spec: ObjectTypeSpec, ref: "ColumnRef") -> Any:
+    """The JSON type a whole `ColumnRef` lands on, following a
+    `RelatedObject` chain into its target type's schema.
+
+    `None` for a flat column: those are real SQL columns whose type the
+    database already knows, so nothing here needs to say it.
+    """
+    if isinstance(ref, RelatedObject):
+        return ref_value_type(ref.target, ref.field)
+    if isinstance(ref, JsonPath):
+        return path_value_type(spec, ref.segments)
+    if isinstance(ref, CollectionCount):
+        return "integer"
+    return None
+
+
+def is_composite_type(value_type: Any) -> bool:
+    """Does `value_type` (from `path_value_type`) denote an object/array --
+    a value that arrives JSON-encoded from SQLite and parsed from
+    PostgreSQL? A nullable field's type is a list, hence the membership
+    test rather than an equality check.
+    """
+    if isinstance(value_type, list):
+        return any(item in ("object", "array") for item in value_type)
+    return value_type in ("object", "array")
 
 
 class QueryError(ValueError):
@@ -202,21 +338,30 @@ class ColumnIndex:
 class JsonPath:
     """A path into a JSON-blob secondary column (default: `json_data`).
 
-    Not whitelisted against a fixed column list the way a plain column name
-    is -- `json_data` is a real column on every table, but its *content* is
-    arbitrary. Safety instead comes from every path segment being
-    individually type-checked (`str` keys, non-bool `int` array indices, or
-    a `ColumnIndex` -- see there) and, for `str`/`int` segments, always
-    bound as a query parameter, never interpolated into SQL text -- see
-    `_render_json_path`. (A `ColumnIndex` segment is inherently a raw SQL
+    Whitelisted, like a plain column name -- just against a different
+    list. `json_data`'s content is *not* arbitrary: every Gramps class
+    publishes a complete recursive JSON Schema, so `resolve_column_path`
+    checks each path against it (`walk_schema`) before building a
+    `JsonPath` at all. A path this class can be constructed with directly,
+    bypassing that resolver, is trusted the way any hand-built AST node is.
+
+    Two further guarantees hold regardless of where the path came from:
+    every segment is individually type-checked (`str` keys, non-bool `int`
+    array indices, or a `ColumnIndex` -- see there), and `str`/`int`
+    segments are always bound as query parameters, never interpolated into
+    SQL text -- see `_render_json_path`. (A `ColumnIndex` segment is inherently a raw SQL
     column reference, not a bindable value -- see `_render_handle_ref`,
     the only place a `JsonPath` containing one is ever rendered; its
     `column` always comes from the fixed internal `_RELATIONSHIPS`
     registry, never from parsed user input, so this is safe.)
 
-    Not (yet) usable in `order_by`/keyset pagination -- only `select` and
-    `where`. `ObjectTypeSpec.text_columns`-based `COLLATE` selection also
-    doesn't apply to it: the JSON value's type isn't known ahead of time.
+    Usable in `order_by`/keyset pagination as well as `select`/`where`.
+    That needed a static type for the value, which the class's own JSON
+    Schema now supplies (`path_value_type`): PostgreSQL casts a numeric
+    path so it doesn't sort lexicographically, and `COLLATE` is applied
+    only when the schema says the value is text -- `text_columns` can't
+    answer that for a path, which is why sorting on one was previously out
+    of scope. No index backs the extraction, so this is a real scan.
     """
 
     segments: Tuple[Union[str, int, ColumnIndex], ...]
@@ -260,10 +405,11 @@ class RelatedObject:
         (whitelisted) column name, a `JsonPath` into its `json_data`, or
         another `RelatedObject` to keep chaining.
 
-    Not (yet) usable in `order_by`/keyset pagination: `handle_ref` may be
-    a per-row dynamic index, fine for a one-off extraction but not
-    threaded through machinery that assumes every comparable value lives
-    in the base table.
+    Usable in `order_by`/keyset pagination too. A per-row dynamic
+    `handle_ref` is no obstacle: the sort and seek predicates re-render the
+    whole correlated subquery wherever the value is needed, rather than
+    assuming it lives in the base table. Correct, but a subquery per row
+    per comparison -- the slowest thing this compiler emits.
     """
 
     name: str
@@ -512,7 +658,111 @@ def resolve_column_path(
         return RelatedObject(name=head, target=target_spec, handle_ref=handle_ref, field=field)
     if len(segments) == 1 and isinstance(head, str) and head in spec.columns:
         return head
+    # Not a flat column and not a relationship -- so it's a path into
+    # `json_data`, checked against the type's own Gramps JSON Schema
+    # before it's built (see `walk_schema`). An unknown path is a mistake,
+    # and this is the one place every JsonPath-producing surface
+    # (`select`, `where`, `where_expr`) funnels through, so checking here
+    # covers all of them at once.
+    walk_schema(spec, segments)
     return JsonPath(tuple(segments))
+
+
+_PATH_SEGMENT_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)((?:\[[0-9]+\])*)\Z")
+_PATH_INDEX_RE = re.compile(r"\[([0-9]+)\]")
+
+
+def parse_path_string(text: str) -> Tuple[Union[str, int], ...]:
+    """Parse a dotted/bracketed path string into `resolve_column_path`
+    segments -- `"primary_name.surname_list[0].surname"` becomes
+    `("primary_name", "surname_list", 0, "surname")`.
+
+    The string equivalent of `query_lang.py`'s `_translate_path` (which
+    walks a real Python `ast` instead), kept here rather than there because
+    `compile_query` itself needs it and `query_lang` imports *this* module,
+    not the other way round. The two grammars are deliberately identical,
+    so a path means the same thing typed into `select` as typed into
+    `where_expr`:
+
+    - segments are separated by `.`, each an identifier
+      (`[A-Za-z_][A-Za-z0-9_]*`)
+    - a segment may be followed by one or more `[<int>]` subscripts
+    - the index must be a non-negative integer literal. Negative indices
+      are rejected for parity with `_translate_path` (Python's `ast` makes
+      `[-1]` a `UnaryOp`, not the `Constant` it requires) *and* because
+      PostgreSQL's `->` reads a negative index as "count from the end"
+      while SQLite's JSONPath rejects it outright -- a silently
+      dialect-dependent meaning, which is exactly the trap `ColumnIndex`
+      already documents guarding against.
+
+    Raises `QueryError` on anything else: this parses raw, untrusted input
+    (a client-supplied `select` entry), so a malformed path has to fail
+    loudly rather than degrade into a path that quietly matches nothing.
+    """
+    if not text or not text.strip():
+        raise QueryError("empty column path")
+    segments: List[Union[str, int]] = []
+    for part in text.split("."):
+        match = _PATH_SEGMENT_RE.match(part)
+        if not match:
+            raise QueryError(
+                f"invalid path segment {part!r} in {text!r} -- expected a name, "
+                f"optionally followed by [<index>]"
+            )
+        name, subscripts = match.group(1), match.group(2)
+        segments.append(name)
+        segments.extend(int(index) for index in _PATH_INDEX_RE.findall(subscripts))
+    return tuple(segments)
+
+
+def resolve_ref_string(spec: ObjectTypeSpec, text: str) -> "ColumnRef":
+    """Resolve a bare string column reference against `spec`.
+
+    One code path for every spelling: `"gramps_id"`, `"primary_name"`, and
+    `"birth.place.title"` all go through `parse_path_string` and then
+    `resolve_column_path`, so a string means exactly what the same text
+    means in `where_expr` -- a flat column, a schema-checked `JsonPath`, or
+    a `RelatedObject` crossing a relationship. There is no special case for
+    a single segment: `gendr` is rejected because the Gramps schema has no
+    such field, not because of any rule about dots.
+    """
+    return resolve_column_path(spec, parse_path_string(text))
+
+
+def default_ref_key(ref: "ColumnRef") -> str:
+    """The canonical response key for a column reference -- the dotted/
+    bracketed string that would resolve back to it.
+
+    `primary_name.surname_list[0]` for a plain `JsonPath`, `birth.date.sortval`
+    for a `RelatedObject` chain (recursing through `.field`, prefixing each
+    hop's `.name`), the name itself for a flat column. Round-trips with
+    `resolve_ref_string` for every reference either can express, which is
+    what lets a caller spell a `select` entry either way (a path string or
+    a resolved ref) and get the same response key for it.
+
+    A `CollectionCount` has no path to derive a name from, so it has no
+    default key -- callers must supply one (see `query_lang.parse_select`,
+    which requires an explicit alias for `count(...)`).
+    """
+    if isinstance(ref, str):
+        return ref
+    if isinstance(ref, FlatColumnRef):
+        return ref.name
+    if isinstance(ref, RelatedObject):
+        return f"{ref.name}.{default_ref_key(ref.field)}"
+    if isinstance(ref, JsonPath):
+        parts: List[str] = []
+        for segment in ref.segments:
+            if isinstance(segment, ColumnIndex):
+                raise QueryError(
+                    "a ColumnIndex path segment has no response-key spelling"
+                )
+            if isinstance(segment, int):
+                parts.append(f"[{segment}]")
+            else:
+                parts.append(f".{segment}" if parts else str(segment))
+        return "".join(parts)
+    raise QueryError(f"no default response key for {ref!r} -- supply one explicitly")
 
 
 @dataclass(frozen=True)
@@ -801,6 +1051,36 @@ def _render_related_object(
     return subquery, field_params + where_params
 
 
+def _check_bindings(sql: str, params: Sequence[Any], what: str) -> None:
+    """Every `?` in `sql` must have exactly one value in `params`.
+
+    A structural invariant, checked rather than assumed. SQL text and bound
+    values are assembled as two separate lists that are matched up by
+    position at execution time, so any drift between them is a real class
+    of bug -- and one that only *sometimes* announces itself: a count
+    mismatch is caught by the driver, but a same-length mis-ordering can
+    execute happily and return plausible, wrong rows.
+
+    This can't catch a mis-ordering (both lists still have the same
+    length); it catches the drift that causes most of them, at the moment
+    it happens, naming the fragment rather than surfacing as the driver's
+    context-free "Incorrect number of bindings supplied" later on. The
+    semantic half of this guard is the SQL-vs-evaluator parity matrix in
+    `test_proxied_query.py`, which re-derives every result a second way.
+
+    Safe as written because no literal `?` is ever emitted into SQL text:
+    every value reaches the query as a bound parameter, and the only
+    inlined literals are internally-generated JSONPath fragments (see
+    `_sqlite_handle_ref_path_sql`).
+    """
+    expected = sql.count("?")
+    if expected != len(params):
+        raise QueryError(
+            f"internal error: {what} has {expected} placeholder(s) but "
+            f"{len(params)} bound value(s) -- SQL: {sql!r} params: {params!r}"
+        )
+
+
 def _render_column(
     column: ColumnRef,
     spec: ObjectTypeSpec,
@@ -819,15 +1099,22 @@ def _render_column(
     tree-scoping independent of the outer query's.
     """
     if isinstance(column, RelatedObject):
-        return _render_related_object(column, spec.table, dialect, treeid, value)
-    if isinstance(column, JsonPath):
-        return _render_json_path(column, _require_dialect(dialect, column), value)
-    if isinstance(column, CollectionCount):
-        return _render_collection_count(column, spec.table, dialect, treeid)
-    if isinstance(column, FlatColumnRef):
-        column = column.name
-    _check_column(column, spec.columns)
-    return _quote_column(column, dialect), []
+        sql, params = _render_related_object(column, spec.table, dialect, treeid, value)
+    elif isinstance(column, JsonPath):
+        sql, params = _render_json_path(column, _require_dialect(dialect, column), value)
+    elif isinstance(column, CollectionCount):
+        sql, params = _render_collection_count(column, spec.table, dialect, treeid)
+    else:
+        if isinstance(column, FlatColumnRef):
+            column = column.name
+        _check_column(column, spec.columns)
+        sql, params = _quote_column(column, dialect), []
+    # Checked per fragment, not only on the finished query: a column
+    # reference is re-rendered in up to four places for a paged sort
+    # (select list, both seek branches, ORDER BY), so catching drift here
+    # names the reference that caused it.
+    _check_bindings(sql, params, f"column reference {order_by_key(column)}")
+    return sql, params
 
 
 # --- WHERE: comparison leaves -----------------------------------------------
@@ -1342,12 +1629,55 @@ class Exists:
 
 @dataclass(frozen=True)
 class OrderBy:
-    column: str
+    """One sort column and its direction.
+
+    `column` is any `ColumnRef`: a flat column name, a path string
+    (`"birth.date.sortval"`, resolved by `compile_query`/`run_query` the
+    same way a `select` entry is), or an already-resolved
+    `JsonPath`/`RelatedObject`/`CollectionCount`. Sorting on a non-flat
+    column costs what selecting one costs -- a JSON extraction or a
+    correlated subquery per row, with no index behind it -- so it is
+    materially slower than sorting on a real SQL column, not merely
+    different.
+    """
+
+    column: Any = "handle"
     direction: str = "asc"
 
     def __post_init__(self) -> None:
         if self.direction not in ("asc", "desc"):
             raise QueryError(f"invalid sort direction: {self.direction!r}")
+
+
+def order_by_key(column: "ColumnRef") -> str:
+    """A readable name for a sort column, for error messages and for
+    `after_columns`' own reporting -- `default_ref_key` where one exists,
+    `repr` otherwise (a `CollectionCount` has no path spelling).
+    """
+    try:
+        return default_ref_key(column)
+    except QueryError:
+        return repr(column)
+
+
+def resolve_order_by(
+    spec: ObjectTypeSpec, order_by: Sequence[OrderBy]
+) -> Tuple[OrderBy, ...]:
+    """`order_by` with every string column resolved to a `ColumnRef`, the
+    same way `compile_query` resolves a `select` entry -- so
+    `OrderBy("birth.date.sortval")` means what it says, and a typo is
+    caught here rather than sorting every row by NULL.
+
+    Applied by both `compile_query` and `run_query`, so the two paths sort
+    on the same resolved references.
+    """
+    return tuple(
+        OrderBy(
+            resolve_ref_string(spec, ob.column) if isinstance(ob.column, str) else ob.column,
+            ob.direction,
+        )
+        for ob in order_by
+    )
 
 
 def effective_order_by(order_by: Sequence[OrderBy]) -> Tuple[OrderBy, ...]:
@@ -1364,14 +1694,48 @@ def effective_order_by(order_by: Sequence[OrderBy]) -> Tuple[OrderBy, ...]:
     return tuple(order_by) + (OrderBy("handle", "asc"),)
 
 
-def after_columns(order_by: Sequence[OrderBy]) -> Tuple[str, ...]:
-    """Columns, in order, that a resolved `after` cursor tuple must supply.
+def after_columns(order_by: Sequence[OrderBy]) -> Tuple[Any, ...]:
+    """Column references, in order, that a resolved `after` cursor tuple
+    must supply.
 
     Wiring code turns a client-supplied `after=<handle>` into a `Query.after`
     tuple by looking up these columns for that row (one extra lookup) before
     compiling -- this module does no database access itself.
+
+    Entries are `ColumnRef`s, not necessarily plain names: a sort on
+    `birth.date.sortval` needs that path's value for the cursor row, which
+    can't be read by interpolating a column name into SQL. Pass them
+    straight to `compile_query` as a `select` against the cursor row's
+    handle -- `compile_after_lookup` does exactly that.
     """
     return tuple(ob.column for ob in effective_order_by(order_by))
+
+
+def compile_after_lookup(
+    spec: ObjectTypeSpec,
+    order_by: Sequence[OrderBy],
+    handle: str,
+    *,
+    dialect: Optional[Dialect] = None,
+    treeid: Optional[int] = None,
+) -> Tuple[str, list]:
+    """Compile the one-row lookup that turns a client-supplied
+    `after=<handle>` cursor into the value tuple `Query.after` wants.
+
+    Returns `(sql, params)` selecting `after_columns(order_by)` for that
+    handle -- the row's own sort values, in sort order. Exists because a
+    non-flat sort column can't be read by interpolating its name into a
+    `SELECT`: `birth.date.sortval` is a correlated subquery with bound
+    params, so resolving the cursor has to go through the same compiler the
+    query itself does.
+    """
+    resolved = resolve_order_by(spec, order_by)
+    return compile_query(
+        spec,
+        Query(select=list(after_columns(resolved)), where=Eq("handle", handle), limit=1),
+        dialect=dialect,
+        treeid=treeid,
+    )
 
 
 def check_columns(columns: Iterable[str], spec: ObjectTypeSpec) -> None:
@@ -1391,6 +1755,22 @@ def check_columns(columns: Iterable[str], spec: ObjectTypeSpec) -> None:
 
 @dataclass(frozen=True)
 class Query:
+    """A structured query: what to return, which rows, in what order.
+
+    `select` entries are `SelectRef`s -- a plain flat column name, an
+    already-resolved `JsonPath`/`RelatedObject`/`CollectionCount`, or a
+    dotted/bracketed *path string* (`"birth.place.title"`,
+    `"primary_name.surname_list[0].surname"`), resolved by `compile_query`
+    through the same `resolve_column_path` a `where_expr` path goes
+    through. A single-segment string stays a strict flat-column reference
+    -- see `resolve_ref_string`. Omitting `select` returns every flat
+    column, sorted.
+
+    `default_ref_key` gives each entry its canonical response key, and
+    `query_lang.parse_select` parses a list of entry strings (with optional
+    `as <key>` aliases) into `(ref, key)` pairs.
+    """
+
     select: Optional[Sequence[SelectRef]] = None
     where: Optional[Any] = None
     order_by: Sequence[OrderBy] = ()
@@ -1402,41 +1782,99 @@ class Query:
             raise QueryError(f"limit must be positive: {self.limit!r}")
 
 
+#: Cast hints for `_render_json_path`, keyed by the JSON type the schema
+#: says a path lands on. `_render_json_path` picks PostgreSQL's cast from a
+#: comparison's right-hand *value* (`Gt(path, 5)` -> `NUMERIC`), which works
+#: because a comparison always has one in hand. An `ORDER BY` has no such
+#: value, so the schema supplies a stand-in of the right Python type -- the
+#: value itself is never bound, only its type is read. Without this,
+#: PostgreSQL sorts `jsonb_extract_path_text`'s TEXT result
+#: lexicographically, putting 10 before 9.
+_CAST_HINT_BY_TYPE = {"boolean": False, "integer": 0, "number": 0.0}
+
+
+def _cast_hint(value_type: Any) -> Any:
+    """A representative value of `value_type`, for `_render_json_path`'s
+    cast selection. `None` (no cast hint) for text and for anything the
+    schema doesn't pin down -- including a nullable field, whose type is a
+    list: `["integer", "null"]` is not reliably numeric, and guessing wrong
+    is worse than sorting it as text.
+    """
+    if isinstance(value_type, str):
+        return _CAST_HINT_BY_TYPE.get(value_type)
+    return None
+
+
+def _is_text_ref(ref: "ColumnRef", spec: ObjectTypeSpec) -> bool:
+    """Is `ref` a text value, and so eligible for a locale `COLLATE` clause?
+
+    Applying `COLLATE` to a non-text value is a SQL error on PostgreSQL, so
+    this has to be right rather than permissive. A flat column is checked
+    against `spec.text_columns` as before; a `JsonPath`/`RelatedObject` is
+    checked against the schema type it lands on -- which is exactly what
+    used to be unavailable, and why `JsonPath` sort columns were previously
+    out of scope for collation.
+    """
+    value_type = ref_value_type(spec, ref)
+    if value_type is not None:
+        return value_type == "string"
+    if isinstance(ref, FlatColumnRef):
+        ref = ref.name
+    return isinstance(ref, str) and ref in spec.text_columns
+
+
 def _column_expr(
-    column: str,
+    column: "ColumnRef",
     spec: ObjectTypeSpec,
     collation: Optional[str],
     dialect: Optional[Dialect] = None,
-) -> str:
-    """Column reference, with a locale `COLLATE` clause when applicable.
+    treeid: Optional[int] = None,
+) -> Tuple[str, list]:
+    """A sort/seek column reference: SQL expression + bound params, with a
+    locale `COLLATE` clause when the value is text (`_is_text_ref`).
 
-    Only columns in `spec.text_columns` are collatable -- applying `COLLATE`
-    to a non-text column (e.g. an integer) is a SQL error on PostgreSQL, so
-    this is deliberately narrower than "every ORDER BY column". `dialect` is
-    forwarded to `_quote_column` -- an `ORDER BY`/keyset reference to a
-    column in `_POSTGRESQL_PHYSICAL_COLUMN_OVERRIDES` (e.g. `Media.desc`)
-    needs the same physical-name mapping a `SELECT`/`WHERE` reference does.
+    Any `ColumnRef` works here, not just a flat column name -- a `JsonPath`
+    or `RelatedObject` renders through the same `_render_column` a `SELECT`
+    or `WHERE` reference does, so `ORDER BY birth.date.sortval` emits the
+    identical expression selecting it would. The one thing sorting needs
+    that comparing doesn't is a cast hint, since there's no right-hand
+    value to infer one from -- see `_cast_hint`.
+
+    `dialect` is forwarded to `_quote_column` -- an `ORDER BY`/keyset
+    reference to a column in `_POSTGRESQL_PHYSICAL_COLUMN_OVERRIDES` (e.g.
+    `Media.desc`) needs the same physical-name mapping a `SELECT`/`WHERE`
+    reference does.
     """
-    quoted = _quote_column(column, dialect)
-    if collation and column in spec.text_columns:
-        return f'{quoted} COLLATE "{collation}"'
-    return quoted
+    sql, params = _render_column(
+        column, spec, dialect, value=_cast_hint(ref_value_type(spec, column)), treeid=treeid
+    )
+    if collation and _is_text_ref(column, spec):
+        return f'{sql} COLLATE "{collation}"', params
+    return sql, params
 
 
-def _keyset_tie_sql(column_expr: str, value: Any) -> Tuple[str, list]:
+def _keyset_tie_sql(
+    column_expr: str, column_params: Sequence[Any], value: Any
+) -> Tuple[str, list]:
     """NULL-safe "ties with the cursor" fragment for an earlier-in-order
     `order_by` column. A bound `NULL` parameter makes plain `col = ?`
     `UNKNOWN` (never `TRUE`), so a cursor value of `None` needs `col IS NULL`
     instead, to correctly express "this row's earlier columns match the
     cursor row's" when the cursor row itself had a `NULL` there.
+
+    `column_params` are `column_expr`'s own bound values (a sort column may
+    be a JSON path or a correlated subquery, not a bare name). They're
+    emitted here, once per occurrence of `column_expr` in the fragment
+    returned -- the count of those occurrences is this function's business,
+    not the caller's. See `_keyset_leg_sql` for why that matters.
     """
     if value is None:
-        return f"{column_expr} IS NULL", []
-    return f"{column_expr} = ?", [value]
+        return f"{column_expr} IS NULL", list(column_params)
+    return f"{column_expr} = ?", list(column_params) + [value]
 
 
 def _keyset_leg_sql(
-    column_expr: str, direction: str, value: Any
+    column_expr: str, column_params: Sequence[Any], direction: str, value: Any
 ) -> Optional[Tuple[str, list]]:
     """NULL-safe "ranks strictly after the cursor" fragment for the one
     `order_by` column a seek's OR-term actually advances past, matching
@@ -1462,14 +1900,27 @@ def _keyset_leg_sql(
     value `None` -- nothing ranks after the minimum value already), so the
     caller can drop this leg from the `OR` entirely instead of emitting a
     fragment that's always false.
+
+    `column_params` are `column_expr`'s own bound values, emitted once per
+    occurrence of `column_expr` below. The `desc` branch is why this has to
+    live here rather than in the caller: it is the one fragment that names
+    the column *twice* (`col IS NULL OR col < ?`), so a caller adding those
+    params once -- the obvious thing to do, and what this originally did --
+    leaves the SQL a placeholder short. That drift is caught by
+    `_check_bindings`; the same mistake between two *same-length* fragments
+    would not be, which is why the count is derived here from the fragment
+    itself instead of assumed anywhere.
     """
     if direction == "asc":
         if value is None:
-            return f"{column_expr} IS NOT NULL", []
-        return f"{column_expr} > ?", [value]
+            return f"{column_expr} IS NOT NULL", list(column_params)
+        return f"{column_expr} > ?", list(column_params) + [value]
     if value is None:
         return None
-    return f"({column_expr} IS NULL OR {column_expr} < ?)", [value]
+    return (
+        f"({column_expr} IS NULL OR {column_expr} < ?)",
+        list(column_params) + list(column_params) + [value],
+    )
 
 
 def _compile_keyset(
@@ -1478,6 +1929,7 @@ def _compile_keyset(
     spec: ObjectTypeSpec,
     collation: Optional[str],
     dialect: Optional[Dialect] = None,
+    treeid: Optional[int] = None,
 ) -> Tuple[str, list]:
     """Seek-method WHERE fragment for keyset pagination.
 
@@ -1500,22 +1952,28 @@ def _compile_keyset(
     if len(after) != len(effective_order_by):
         raise QueryError(
             f"after cursor has {len(after)} values, expected "
-            f"{len(effective_order_by)} ({', '.join(ob.column for ob in effective_order_by)})"
+            f"{len(effective_order_by)} "
+            f"({', '.join(order_by_key(ob.column) for ob in effective_order_by)})"
         )
     or_terms = []
     params: list = []
     for i, ob in enumerate(effective_order_by):
-        leg = _keyset_leg_sql(
-            _column_expr(ob.column, spec, collation, dialect), ob.direction, after[i]
-        )
+        # A non-flat sort column's expression carries its own bound params
+        # (a JSONPath string, a subquery's segments), and it's re-emitted
+        # once per OR-term it appears in -- so its params are collected
+        # alongside each occurrence, in the same left-to-right order the
+        # placeholders are rendered, not once up front.
+        leg_expr, leg_expr_params = _column_expr(ob.column, spec, collation, dialect, treeid)
+        leg = _keyset_leg_sql(leg_expr, leg_expr_params, ob.direction, after[i])
         if leg is None:
             continue
         and_terms = []
         and_params: list = []
         for j in range(i):
-            tie_sql, tie_params = _keyset_tie_sql(
-                _column_expr(effective_order_by[j].column, spec, collation, dialect), after[j]
+            tie_expr, tie_expr_params = _column_expr(
+                effective_order_by[j].column, spec, collation, dialect, treeid
             )
+            tie_sql, tie_params = _keyset_tie_sql(tie_expr, tie_expr_params, after[j])
             and_terms.append(tie_sql)
             and_params.extend(tie_params)
         leg_sql, leg_params = leg
@@ -1528,7 +1986,9 @@ def _compile_keyset(
         # whose cursor value is already `None`, the minimum -- nothing can
         # rank after it). Correctly means "no further rows", not an error.
         return "0 = 1", []
-    return " OR ".join(or_terms), params
+    keyset_sql = " OR ".join(or_terms)
+    _check_bindings(keyset_sql, params, "keyset seek predicate")
+    return keyset_sql, params
 
 
 def _where_clauses(
@@ -1592,6 +2052,12 @@ def compile_query(
     and is applied to every text-typed `ORDER BY` column (and the matching
     keyset comparisons) via `COLLATE "<collation>"`.
 
+    A `select` entry given as a dotted/bracketed path string is resolved
+    here (via `resolve_ref_string`) before rendering, so the same text
+    means the same thing in `select` as it does in a `where_expr` -- a
+    `QueryError` from an unknown column or a malformed path surfaces from
+    this call, not from the database.
+
     `dialect` selects which backend-specific SQL to render for any `select`
     or `where` entry that's a `JsonPath` or a `RelatedObject` (see
     `_render_json_path`/`_render_related_object`), and also which physical
@@ -1602,11 +2068,12 @@ def compile_query(
     that touches none of the above (plain columns not in that override
     table, no `JsonPath`/`RelatedObject`); it is not safe in general.
     """
-    columns = list(query.select) if query.select else sorted(spec.columns)
+    columns = [
+        resolve_ref_string(spec, entry) if isinstance(entry, str) else entry
+        for entry in (query.select if query.select else sorted(spec.columns))
+    ]
 
-    ordering = effective_order_by(query.order_by)
-    for ob in ordering:
-        _check_column(ob.column, spec.columns)
+    ordering = effective_order_by(resolve_order_by(spec, query.order_by))
 
     select_parts = []
     params: list = []
@@ -1619,21 +2086,30 @@ def compile_query(
     params.extend(where_params)
 
     if query.after is not None:
-        sql, p = _compile_keyset(ordering, query.after, spec, collation, dialect)
+        sql, p = _compile_keyset(ordering, query.after, spec, collation, dialect, treeid)
         where_clauses.append(f"({sql})")
         params.extend(p)
+
+    # Built before assembly, not inline: a non-flat sort column contributes
+    # bound params of its own, and they belong after the WHERE/keyset params
+    # and before `LIMIT`'s -- the order the placeholders appear in the SQL.
+    order_parts = []
+    order_params: list = []
+    for ob in ordering:
+        order_sql, p = _column_expr(ob.column, spec, collation, dialect, treeid)
+        order_parts.append(f"{order_sql} {ob.direction.upper()}")
+        order_params.extend(p)
 
     sql = f"SELECT {', '.join(select_parts)} FROM {spec.table}"
     if where_clauses:
         sql += " WHERE " + " AND ".join(where_clauses)
-    sql += " ORDER BY " + ", ".join(
-        f"{_column_expr(ob.column, spec, collation, dialect)} {ob.direction.upper()}"
-        for ob in ordering
-    )
+    sql += " ORDER BY " + ", ".join(order_parts)
+    params.extend(order_params)
     if query.limit is not None:
         sql += " LIMIT ?"
         params.append(query.limit)
 
+    _check_bindings(sql, params, "compiled query")
     return sql, params
 
 
@@ -1656,4 +2132,5 @@ def compile_count_query(
     sql = f"SELECT COUNT(*) FROM {spec.table}"
     if where_clauses:
         sql += " WHERE " + " AND ".join(where_clauses)
+    _check_bindings(sql, params, "compiled count query")
     return sql, params

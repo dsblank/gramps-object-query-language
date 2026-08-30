@@ -650,6 +650,149 @@ give you at all:
 Person "birth.date.dateval[6] == 1970"
 ```
 
+## Selecting values: the same paths in `select`
+
+Everything above describes *which rows* come back. The same path grammar
+also says *which values* -- a `select` entry is a column reference written
+exactly as it would be on the left of a comparison:
+
+```python
+from gramps_object_query_language.query_lang import parse_select
+
+parse_select(PERSON, [
+    "handle",
+    "birth.place.title as birthplace",
+    "primary_name.surname_list[0].surname",
+    "count(events) as n_events",
+])
+```
+
+Each entry returns a `(column_ref, response_key)` pair: the ref goes into
+`Query(select=[...])`, and the keys line up positionally with each result
+row, so a caller can zip them into a dict. `birth.place.title` in a
+`select` resolves to the identical `RelatedObject` that `birth.place.title
+== 'Chicago'` resolves to in a `where_expr` -- one grammar, one meaning,
+wherever a path is written.
+
+Three details are specific to `select`:
+
+- **`as <key>` renames the response key.** Without it the key is the path
+  text itself (`"birth.place.title"`). An alias must be a plain name.
+- **`count(...)` requires an alias.** Unlike a path, it has no text to
+  derive a name from.
+- **Paths are checked, in `select` and `where` alike.** See
+  [Every path is checked](#every-path-is-checked) below.
+
+`Query.select` also accepts a path string on its own, without going through
+`parse_select`, if you don't need aliases or response keys:
+
+```python
+compile_query(PERSON, Query(select=["handle", "birth.place.title"]), dialect=Dialect.SQLITE)
+```
+
+Paths work in `order_by` too:
+
+```python
+Query(select=["handle", "birth.date.sortval"],
+      order_by=[OrderBy("birth.date.sortval", "asc")])
+```
+
+Keyset pagination (`after`) works with it, but the cursor row's values can't
+be read by interpolating a column name into SQL; use `compile_after_lookup`
+to resolve them.
+
+Sorting on a path is substantially more expensive than sorting on a flat
+column. That difference is worth understanding before putting one behind a
+UI control -- see below.
+
+## What sorting costs
+
+Reproduce these numbers with `python benchmarks/sort_cost.py`; the table
+below is its output for 20,000 people, first page of 20:
+
+| sort column | | ms | SQLite's query plan |
+|---|---|---|---|
+| `surname` | flat, indexed | ~0 | `SCAN person USING INDEX person_surname` |
+| `given_name` | flat, indexed | ~0 | `SCAN person USING INDEX person_given_name` |
+| `primary_name.first_name` | JSON path | 4 | `SCAN person` + `USE TEMP B-TREE FOR ORDER BY` |
+| `birth.date.sortval` | relationship hop | 14 | `SCAN person` + `CORRELATED SCALAR SUBQUERY` + `USE TEMP B-TREE FOR ORDER BY` |
+
+**An index is a pre-sorted copy of one column.** Gramps creates them for
+`surname`, `given_name` and `gramps_id`. "First 20 by surname" walks the
+first 20 entries of an already-sorted list and stops -- the other 19,980
+rows are never read.
+
+**Nothing indexes the inside of `json_data`.** It is one text blob per row.
+Sorting by `primary_name.first_name` means opening all 20,000 blobs,
+parsing each, extracting the field, sorting the lot in a temporary
+structure, then keeping 20. `LIMIT` saves nothing: you cannot know which 20
+sort first without looking at all of them. This is a property of the data
+layout, not of this compiler -- no query formulation avoids it, and it is
+why a path can be filtered and sorted but never sorted *cheaply*.
+
+**A relationship hop adds a lookup per row.** `birth.date.sortval` isn't on
+the person: for each row, find the birth event's handle, fetch that row from
+`event`, parse its JSON, read `sortval`. That's `CORRELATED SCALAR
+SUBQUERY`, run once per person, and it is why the hop costs roughly three
+times the plain JSON path.
+
+### Paging multiplies it
+
+Each page is a fresh query, so the scan doesn't amortize across pages:
+
+| sort column | per page | to walk all 20,000 |
+|---|---|---|
+| `surname` | 3.9 ms | ~4 s |
+| `primary_name.first_name` | 6.1 ms | ~6 s |
+| `birth.date.sortval` | 24.9 ms | ~25 s |
+
+Walking the whole tree by `birth.date.sortval` re-scans all 20,000 rows and
+re-runs 20,000 subqueries on *every one* of the 1,000 pages. The cost grows
+with the square of the tree.
+
+**Reasonable:** sorting a result set a `where` clause has already narrowed;
+a report someone waits a moment for.
+
+**Unreasonable:** a default sort order on a browse view of a large shared
+tree, or anything that pages through everything.
+
+**Caveats on the numbers.** They come from in-memory SQLite with short
+synthetic strings, so a real disk-backed tree is slower in absolute terms.
+The ratios are the point, not the milliseconds. PostgreSQL's plans differ in
+detail (and a numeric path is additionally cast -- see above), but the same
+three-way shape holds: indexed column, full scan, full scan plus a lookup
+per row.
+
+## Every path is checked
+
+A path that doesn't exist is an error, not an empty result. Flat columns are
+checked against the type's real SQL columns, as they always were; everything
+inside `json_data` is checked against the Gramps class's own
+`get_schema()` -- a complete, recursive JSON Schema that Gramps publishes
+for every object type:
+
+```
+"primary_name.frist_name"   ->  unknown field 'frist_name' on Given name -- known fields: ...
+"gendr"                     ->  unknown field 'gendr' on Person -- known fields: ...
+"gender.value"              ->  'gender' is Gender, which has no fields
+"primary_name[0]"           ->  'primary_name' is Name, not a list
+```
+
+`father.surname` written against a `Person` is caught the same way --
+`father` is a relationship on `Family`, not on `Person`, and `Person` has no
+such JSON field either.
+
+This applies wherever a path is written: `select`, a `where` leaf's
+`column`, and `where_expr`. The error names the fields that *would* have
+worked, so a typo is a one-line fix rather than a debugging session over an
+all-null column.
+
+Three fields are serialized by Gramps but missing from its published schema
+(`Date.format`, `Family.complete`, `Media.thumb`, as of Gramps 6.0.8). They
+are real, queryable data, so the library patches them back in rather than
+rejecting them; a test re-derives the list from live Gramps and fails if it
+changes.
+
 ## What's *not* supported
 
 - Arbitrary function calls, lambdas, f-strings, imports -- the parser

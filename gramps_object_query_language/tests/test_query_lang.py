@@ -27,7 +27,10 @@ from gramps_object_query_language.query_lang import (
     compile_expr,
     compile_expr_for_spec,
     parse_expr,
+    parse_select,
+    parse_select_entry,
     resolve_namespace,
+    where_list_to_ast,
 )
 from gramps_object_query_language.query import (
     PERSON,
@@ -44,6 +47,11 @@ from gramps_object_query_language.query import (
     Or,
     RelatedObject,
     Regex,
+    QueryError,
+    Query,
+    Dialect,
+    compile_query,
+    resolve_column_path,
 )
 
 
@@ -1666,3 +1674,179 @@ def test_compile_expr_self_referencing_collection_end_to_end_sqlite_execution():
     spec, where = compile_expr("person", "exists(associations, given_name == 'Bob')")
     sql, params = compile_query(spec, Query(select=["handle"], where=where), dialect=Dialect.SQLITE)
     assert conn.execute(sql, params).fetchall() == [("alice",)]
+
+
+# --- select entries -----------------------------------------------------------
+#
+# `parse_select` is the `select` counterpart to `parse_expr`'s `where_expr`:
+# the same "almost Python" column grammar, one entry per string, with an
+# optional `as <key>` alias. The invariant these tests defend is that a path
+# spelled into `select` resolves to exactly what the same path spelled into
+# `where_expr` resolves to.
+
+
+def test_parse_select_flat_column():
+    assert parse_select(PERSON, ["gramps_id"]) == [("gramps_id", "gramps_id")]
+
+
+def test_parse_select_relationship_path():
+    [(ref, key)] = parse_select(PERSON, ["birth.place.title"])
+    assert ref == resolve_column_path(PERSON, ["birth", "place", "title"])
+    assert key == "birth.place.title"
+
+
+def test_parse_select_json_path_with_index():
+    [(ref, key)] = parse_select(PERSON, ["primary_name.surname_list[0].surname"])
+    assert ref == JsonPath(("primary_name", "surname_list", 0, "surname"))
+    assert key == "primary_name.surname_list[0].surname"
+
+
+def test_parse_select_resolves_same_ref_as_where_expr():
+    """The whole point of sharing one grammar: `birth.date.sortval` in a
+    `select` entry and in a `where_expr` comparison have to resolve to the
+    identical `ColumnRef`.
+    """
+    [(select_ref, _key)] = parse_select(PERSON, ["birth.date.sortval"])
+    where = compile_expr_for_spec(PERSON, "birth.date.sortval > 0")
+    assert select_ref == where.column
+
+
+def test_parse_select_alias():
+    [(ref, key)] = parse_select(PERSON, ["birth.place.title as birthplace"])
+    assert isinstance(ref, RelatedObject)
+    assert key == "birthplace"
+
+
+def test_parse_select_count_call_with_alias():
+    [(ref, key)] = parse_select(PERSON, ["count(events) as n_events"])
+    assert isinstance(ref, CollectionCount)
+    assert key == "n_events"
+
+
+def test_parse_select_count_call_with_condition():
+    [(ref, _key)] = parse_select(
+        FAMILY, ["count(children, gender == 1) as n_sons"]
+    )
+    assert isinstance(ref, CollectionCount)
+    assert ref.condition == Eq("gender", 1)
+
+
+def test_parse_select_count_call_without_alias_uses_its_own_text():
+    """`count(...)` has no path to derive a key from, so it falls back to
+    the entry's own text rather than erroring.
+    """
+    [(ref, key)] = parse_select(PERSON, ["count(events)"])
+    assert isinstance(ref, CollectionCount)
+    assert key == "count(events)"
+
+
+def test_parse_select_count_fallback_keys_stay_distinct():
+    """Two counts over the same collection differ only by condition -- a
+    derived name (`events_count`) would collide; the source text doesn't.
+    """
+    keys = [key for _, key in parse_select(
+        PERSON, ["count(events)", "count(events, private == True)"]
+    )]
+    assert keys == ["count(events)", "count(events, private == True)"]
+
+
+def test_parse_select_rejects_unknown_field():
+    """Checked against Gramps' own JSON Schema for Person -- no flat-column
+    whitelist involved, and no special rule for single-segment names.
+    """
+    with pytest.raises(QueryLangError, match="unknown field 'gendr'"):
+        parse_select(PERSON, ["gendr"])
+
+
+def test_parse_select_allows_top_level_json_struct():
+    """`primary_name` is a real Person field (an object), so selecting the
+    whole struct is allowed -- it just isn't a *flat* column.
+    """
+    [(ref, key)] = parse_select(PERSON, ["primary_name"])
+    assert ref == JsonPath(("primary_name",))
+    assert key == "primary_name"
+
+
+def test_parse_select_rejects_relationship_from_the_wrong_type():
+    with pytest.raises(QueryLangError, match="unknown field 'father' on Person"):
+        parse_select(PERSON, ["father.surname"])
+
+
+def test_where_expr_rejects_unknown_field():
+    """The same check applies to filtering: a typo'd `where_expr` path used
+    to compile fine and match nothing. Surfaces as `QueryError` (raised
+    during translation) rather than `QueryLangError` (raised during
+    parsing) -- both are already caught at the same call sites.
+    """
+    with pytest.raises(QueryError, match="unknown field"):
+        compile_expr_for_spec(PERSON, "primary_name.frist_name == 'x'")
+
+
+def test_parse_select_rejects_bare_relationship_name():
+    with pytest.raises(QueryLangError):
+        parse_select(PERSON, ["birth"])
+
+
+def test_parse_select_rejects_duplicate_keys():
+    with pytest.raises(QueryLangError):
+        parse_select(PERSON, ["gramps_id", "birth.place.title as gramps_id"])
+
+
+def test_parse_select_rejects_duplicate_keys_from_identical_paths():
+    with pytest.raises(QueryLangError):
+        parse_select(PERSON, ["birth.place.title", "birth.place.title"])
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "",
+        "   ",
+        "gender == 1",
+        "gramps_id as",
+        "as key",
+        "gramps_id as 2bad",
+        "gramps_id as a b",
+        "surname_list[0",
+        "upper(surname) as u",
+    ],
+)
+def test_parse_select_rejects_malformed_entry(entry):
+    with pytest.raises(QueryLangError):
+        parse_select(PERSON, [entry])
+
+
+def test_parse_select_entry_is_the_single_entry_form():
+    assert parse_select_entry(PERSON, "gramps_id") == ("gramps_id", "gramps_id")
+
+
+def test_parse_select_output_feeds_compile_query():
+    """`parse_select`'s refs go straight into `Query.select`, and its keys
+    line up positionally with the compiled row.
+    """
+    parsed = parse_select(PERSON, ["handle", "birth.place.title as birthplace"])
+    sql, params = compile_query(
+        PERSON, Query(select=[ref for ref, _ in parsed]), dialect=Dialect.SQLITE
+    )
+    assert [key for _, key in parsed] == ["handle", "birthplace"]
+    assert sql.startswith("SELECT handle, (SELECT (SELECT title FROM place")
+
+
+# --- dotted strings in a `where` leaf's column --------------------------------
+
+
+def test_where_leaf_column_accepts_path_string():
+    """`where`'s JSON form takes the same dotted string, via
+    `json_column_to_ref` -- previously only `{"json_path": [...]}` worked.
+    """
+    where = where_list_to_ast(
+        [{"column": "birth.place.title", "op": "eq", "value": "Chicago"}], PERSON
+    )
+    assert where == Eq(resolve_column_path(PERSON, ["birth", "place", "title"]), "Chicago")
+
+
+def test_where_leaf_column_still_rejects_unknown_flat_column():
+    with pytest.raises(QueryError):
+        where_list_to_ast(
+            [{"column": "gendr", "op": "eq", "value": 1}], PERSON
+        )

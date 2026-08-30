@@ -67,12 +67,23 @@ does today.
   [`len()` / array-length comparisons](#len--array-length-comparisons) below
   for a scoped-out example of what closing that part of the gap would take.
 
+- ~~A `JsonPath` is trusted rather than checked -- an unknown path
+  compiles fine and returns NULL for every row~~ -- **Done**: every path is
+  now checked against the Gramps class's own `get_schema()`
+  (`walk_schema`), in `select`, `where`, and `where_expr` alike.
+- ~~`select` takes flat column names only; a path (`birth.place.title`) has
+  to be pre-resolved or spelled as `{"json_path": [...]}` JSON~~ --
+  **Done**, see [Path expressions in `select`](#path-expressions-in-select-birthplacetitle-countevents-as-n)
+  below. A `select` entry (and a `where` leaf's `column`) can now be a
+  dotted/bracketed path string, resolved through the same
+  `resolve_column_path` a `where_expr` path uses.
+
 **Sorting / pagination**
-- `order_by` and keyset pagination (`after`) only work against flat SQL
-  columns -- a `JsonPath` or `RelatedObject` field (`primary_name.surname_list[0].surname`,
-  `birth.date.sortval`) can be filtered on but not sorted by. (query.py) See
-  [Sortable JSON/relationship columns](#sortable-jsonrelationship-columns-order_bykeyset-on-jsonpathrelatedobject-item-k)
-  below for a scoped-out example of what closing this would take.
+- ~~`order_by` and keyset pagination (`after`) only work against flat SQL
+  columns~~ -- **Done** (item K), see [Sortable JSON/relationship columns](#sortable-jsonrelationship-columns-order_bykeyset-on-jsonpathrelatedobject-item-k)
+  below. `order_by` takes any `ColumnRef`, on both the SQL and evaluator
+  paths. What remains true is the cost: no index backs a JSON extraction or
+  a correlated subquery, so sorting on one is a scan.
 - ~~The evaluator/proxied path (`proxied_query.py::run_query`) has no
   `order_by`/`limit`/`after` support at all~~ -- **Done**, see [Evaluator-path
   pagination/sort parity](#evaluator-path-paginationsort-parity-order_bylimitafterselect)
@@ -566,6 +577,84 @@ Building either later item just means adding an `else` branch to the
 existing `any`/`len` dispatch in `_ComprehensionDesugarer.visit_Call` for
 "argument wasn't a comprehension," not renaming anything.
 
+### Path expressions in `select` (`birth.place.title`, `count(events) as n`)
+
+Implemented -- a `select` entry can now be written in the same path grammar
+`where_expr` already uses, not just as a flat column name or a
+pre-resolved `JsonPath`/`RelatedObject`.
+
+**What the gap actually was, and where it wasn't.** The AST and both
+backends already supported this in full: `SelectRef = ColumnRef`, so
+`compile_query` would happily render a `RelatedObject` chain in a `SELECT`
+list, and `run_query` would project one via `resolve_column_ref`. The
+entire gap was the *entry surface* -- there was no way to say
+`birth.place.title` in a `select` without hand-building the ref, because a
+bare string was always and only a flat column name. Worth remembering as a
+pattern: "the feature is missing" and "the feature has no spelling" look
+identical from the outside and have very different diffs.
+
+**What landed:**
+- `query.py`: `parse_path_string` (the string counterpart to
+  `query_lang`'s `ast`-based `_translate_path` -- deliberately the same
+  grammar, kept in `query.py` because `compile_query` needs it and
+  `query_lang` imports this module, not the reverse), `resolve_ref_string`,
+  and `default_ref_key` (the canonical response key for a ref, which
+  round-trips with `resolve_ref_string`). `compile_query` resolves string
+  `select` entries through it.
+- `query_lang.py`: `parse_select`/`parse_select_entry`, returning
+  `(ref, key)` pairs, with `as <key>` aliases. `json_column_to_ref` also
+  resolves dotted strings now, which incidentally closes the same gap for
+  a `where` leaf's `column` -- that surface had exactly the same
+  string-means-flat-column-only restriction, and got fixed for free.
+- `proxied_query.py`: `run_query` resolves string entries identically
+  instead of whitelist-checking them, so both paths agree.
+
+**The design took one wrong turn worth recording.** The first cut assumed
+`json_data`'s contents were unwhitelistable ("a JSON blob is arbitrary"),
+and worked around the resulting silent-null risk with a rule about
+spelling: a *dotted* string resolved as a path, a *bare* one had to be a
+flat column. That bought partial typo safety at the cost of real
+backward incompatibility (`primary_name`, a legitimate whole-struct
+selection, became unselectable) and an asymmetry between `select` and
+`where_expr` for identical text.
+
+The premise was simply wrong. Gramps publishes a complete, recursive
+`get_schema()` for every object class -- fully inlined, no `$ref`s -- so a
+`JsonPath` can be whitelisted exactly like a flat column, and the whole
+special case disappears:
+
+- `walk_schema`/`path_value_type`/`is_composite_type` (query.py) check any
+  path against the type's own schema and report the value type it lands on.
+- `resolve_column_path` validates every `JsonPath` it builds, so `select`,
+  `where`, and `where_expr` all get the check from one place.
+- `resolve_ref_string` has no special case left: `"gramps_id"`,
+  `"primary_name"`, and `"birth.place.title"` take one code path.
+
+This catches strictly more than the spelling rule did, including the case
+that rule explicitly could not: `father.surname` written against a
+`Person` (`father` is a relationship on `Family`) used to compile to a
+`JsonPath` that returned NULL for every row, and is now an error naming
+the fields that exist. Of the 534 tests passing beforehand, exactly one
+had to change -- the one that asserted the old fall-through was harmless.
+
+**`_SCHEMA_GAPS`: three fields Gramps serializes but doesn't publish.**
+Round-tripping a real instance of all 45 schema-carrying classes in
+`gramps.gen.lib` against its own schema found exactly three mismatches
+(`Date.format`, `Family.complete`, `Media.thumb`, on Gramps 6.0.8). These
+are genuine stored data, so they're patched back in rather than rejected.
+`test_schema_gaps_are_still_gaps` re-derives the set from live Gramps and
+fails if a gap closes upstream or a new one opens, so the table can't rot.
+Worth reporting upstream.
+
+**This also unblocks item K, and more.** K's scoping pass concluded that
+sorting on a `JsonPath` needed a "static schema-walk type" to drive
+`_render_json_path`'s `CAST` selection, and treated that as the expensive
+part. That machinery now exists (`path_value_type`), built for a different
+reason. The same call also answers "does this path land on an object or
+array?" -- the question a client needs in order to know whether a SQLite
+value arrives JSON-encoded, which `is_composite_type` now answers before
+the query is even run.
+
 ### Evaluator-path pagination/sort parity (`order_by`/`limit`/`after`/`select`)
 
 Implemented -- `run_query` (proxied_query.py) accepts `order_by`, `limit`,
@@ -933,6 +1022,77 @@ rendering on top, the one piece neither `count()` nor `len()` needs.
 
 ### Sortable JSON/relationship columns (`order_by`/keyset on `JsonPath`/`RelatedObject`) (item K)
 
+**Implemented.** `OrderBy.column` is now any `ColumnRef` -- a flat column, a
+path string resolved like a `select` entry, or a pre-resolved
+`JsonPath`/`RelatedObject`/`CollectionCount` -- on the SQL path and the
+evaluator path alike.
+
+The scoping pass below called the static type resolver the expensive part.
+It was, and it already existed by the time this was built: `path_value_type`
+came out of the schema-checking work for `select`, and drives both things
+sorting needed that filtering didn't --
+
+- **the PostgreSQL cast.** `jsonb_extract_path_text` returns TEXT, so an
+  unsorted-by-type numeric path puts 10 before 9. `_render_json_path` picks
+  its cast from a comparison's right-hand *value*, which an `ORDER BY`
+  doesn't have; `_cast_hint` supplies a stand-in of the schema's type
+  instead (the value is never bound, only its type read).
+- **collation.** `COLLATE` on a non-text value is an error on PostgreSQL,
+  and `text_columns` can't classify a path. `_is_text_ref` asks the schema.
+
+Two structural notes worth keeping:
+
+- **Params, not just SQL.** A non-flat sort column carries bound params, and
+  the seek predicate re-emits the whole expression once per OR-term. So the
+  parameter list is assembled in placeholder order (`select`, `where`,
+  keyset, `ORDER BY`, `LIMIT`), and each occurrence collects its own params
+  alongside itself. **This is the part that actually broke**, and it's worth
+  recording how: the `desc` seek branch is the one fragment that names its
+  column *twice* (`col IS NULL OR col < ?`), so adding that column's params
+  once -- the obvious thing, and what the first version did -- left the
+  query one placeholder short. It shipped past a full green test run and was
+  found only by the parity matrix. Two guards came out of it:
+  - `_check_bindings` asserts `sql.count("?") == len(params)` for every
+    rendered column reference, the assembled keyset predicate, and the
+    finished query. This is what turned the bug from "wrong rows on page 2
+    of a descending sort" into a named error at compile time.
+  - Each keyset fragment now emits its own column's params, once per
+    occurrence *it* decides to make (`_keyset_leg_sql`/`_keyset_tie_sql`),
+    rather than the caller guessing the count. The knowledge of how many
+    times the expression appears now lives in the one place that decides it.
+
+  Neither guard can catch a *same-length* mis-ordering; that's what the
+  SQL-vs-evaluator parity matrix in `test_proxied_query.py` is for --
+  `run_query` reaches the same answers with no SQL and no bound params at
+  all, so agreement across 11 query shapes, each also walked one page at a
+  time, is independent evidence the two lists line up.
+- **Cursor resolution moved.** `after_columns` now returns `ColumnRef`s, so
+  wiring code can no longer interpolate names into a `SELECT` to read a
+  cursor row. `compile_after_lookup` compiles that lookup properly. Flat
+  columns still come back as plain strings, so existing callers that only
+  sort on those are unaffected.
+
+**Cost, measured rather than assumed.** `benchmarks/sort_cost.py` (new)
+puts numbers on the three shapes: on 20,000 people, first page of 20, an
+indexed flat column is ~0 ms (`SCAN ... USING INDEX`), a JSON path is 4 ms
+(full scan + temp b-tree), and a relationship hop is 14 ms (full scan +
+20,000 correlated subqueries). Paging multiplies it -- walking the whole
+table is ~4 s by `surname` and ~25 s by `birth.date.sortval`, since no page
+amortizes any other's scan. Nothing about this is fixable in the compiler:
+`json_data` is one text blob with no index into its contents, so a path
+sort is inherently a full scan. That's the argument for exposing it
+deliberately (a narrowed result set, a report) rather than wiring it to a
+browse view's default order. See `docs/where_expr.md`'s "What sorting
+costs".
+
+L's cap is closed as predicted: `run_query` needed no CAST machinery at all
+(Python's `<`/`>` compare by type already) -- just its one `check_columns`
+call widened into `resolve_order_by`.
+
+---
+
+*Original scoping pass, kept for the record:*
+
 Motivated by: `order_by=birth.date.sortval` or
 `order_by=primary_name.surname_list[0].surname` -- both already resolve fine
 as a `where`/`select` field via `resolve_column_path`, but `OrderBy.column`
@@ -1178,7 +1338,7 @@ here, struck through, so that history stays legible.
 | H | `upper(surname) == 'SMITH'`, string concatenation, arithmetic | no general function calls -- only `like()`/`Date()` are whitelisted | 3-4 |
 | I | `any(primary_name.surname_list, surname == 'Doyle')` | see `any()` section above | 5 |
 | J | `exists(children, surname == father.surname)` | `exists`/`count` conditions can't see the outer row | 4 |
-| K | `order_by=birth.date.sortval`, `order_by=primary_name.surname_list[0].surname` | see [Sortable JSON/relationship columns](#sortable-jsonrelationship-columns-order_bykeyset-on-jsonpathrelatedobject-item-k) above | 3 |
+| ~~K~~ | ~~`order_by=birth.date.sortval`, `order_by=primary_name.surname_list[0].surname`~~ | **Done** -- see [Sortable JSON/relationship columns](#sortable-jsonrelationship-columns-order_bykeyset-on-jsonpathrelatedobject-item-k) above | ~~3~~ |
 | ~~L~~ | ~~any `order_by`/`limit`/`after` under a proxy (e.g. `PrivateProxyDb`)~~ | **Done** -- see [Evaluator-path pagination/sort parity](#evaluator-path-paginationsort-parity-order_bylimitafterselect) above | ~~3-4~~ |
 
 Difficulty here means "distance from today's code," not "priority" -- a low

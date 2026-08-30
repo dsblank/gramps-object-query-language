@@ -84,7 +84,16 @@ from gramps.gen.filters import GenericFilterFactory
 from gramps.gen.filters.rules import Rule
 
 from .evaluator import GETTER_BY_TABLE, evaluate_where, resolve_column_ref
-from .query import ColumnRef, ObjectTypeSpec, OrderBy, QueryError, check_columns, effective_order_by
+from .query import (
+    ColumnRef,
+    ObjectTypeSpec,
+    OrderBy,
+    QueryError,
+    effective_order_by,
+    order_by_key,
+    resolve_order_by,
+    resolve_ref_string,
+)
 
 # Core `Filter` namespace for each `ObjectTypeSpec.table` that has one.
 # `Tag` is deliberately absent: `GenericFilterFactory("Tag")` returns `None`
@@ -258,15 +267,20 @@ def run_query(
             if handle in rule.matched_objects
         ]
 
-    ordering = effective_order_by(order_by)
-    check_columns([ob.column for ob in ordering], spec)
+    # Resolved, not whitelist-checked: `order_by` takes the same
+    # `ColumnRef`s `select` does, and `_sort_key_row` already resolves
+    # whatever it's given via `resolve_column_ref`. The Python sort needs
+    # no CAST hint the way the SQL path does -- `<`/`>` on the extracted
+    # values already compare by their own types.
+    ordering = effective_order_by(resolve_order_by(spec, order_by))
     keyed = _sort_matches(db, matches, ordering, spec)
 
     if after is not None:
         if len(after) != len(ordering):
             raise QueryError(
                 f"after cursor has {len(after)} values, expected "
-                f"{len(ordering)} ({', '.join(ob.column for ob in ordering)})"
+                f"{len(ordering)} "
+                f"({', '.join(order_by_key(ob.column) for ob in ordering)})"
             )
         keyed = [(key, obj) for key, obj in keyed if _matches_keyset(key, after, ordering)]
 
@@ -275,9 +289,18 @@ def run_query(
         matches = matches[:limit]
 
     if select is not None:
-        check_columns([column for column in select if isinstance(column, str)], spec)
+        # Resolve exactly as the SQL path's `compile_query` does, rather
+        # than whitelist-checking strings here: a path entry
+        # ("birth.place.title") has to mean the same thing on both paths.
+        # `resolve_ref_string` still rejects everything `check_columns`
+        # rejected -- a flat column against `spec.columns`, a JSON path
+        # against the type's own Gramps schema -- just with a better error.
+        columns = [
+            resolve_ref_string(spec, column) if isinstance(column, str) else column
+            for column in select
+        ]
         return [
-            tuple(resolve_column_ref(db, obj, column, spec) for column in select)
+            tuple(resolve_column_ref(db, obj, column, spec) for column in columns)
             for obj in matches
         ]
     return matches

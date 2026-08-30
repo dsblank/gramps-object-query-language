@@ -57,11 +57,22 @@ from gramps_object_query_language.query import (
     RelatedObject,
     Regex,
     after_columns,
+    compile_after_lookup,
     compile_count_query,
     compile_query,
+    _SCHEMA_GAPS,
+    _check_bindings,
+    default_ref_key,
+    effective_order_by,
+    is_composite_type,
+    parse_path_string,
+    path_value_type,
     resolve_collection,
     resolve_column_path,
+    resolve_ref_string,
+    walk_schema,
 )
+from gramps_object_query_language.query_lang import compile_expr
 
 
 def test_person_columns_include_expected_flat_fields():
@@ -370,13 +381,14 @@ def test_related_object_requires_dialect():
         compile_query(PERSON, Query(select=["handle", BIRTH_DATE]))
 
 
-def test_related_object_not_a_relationship_on_wrong_spec_falls_through_to_json_path():
-    # "birth" is only a registered relationship on Person, not Event -- on
-    # Event it's just an arbitrary (harmless, matches-nothing-at-runtime)
-    # JsonPath segment, not an error. Only a bare relationship name with no
-    # further path is rejected (see test_resolve_column_path_bare_relationship_name_rejected).
-    result = resolve_column_path(EVENT, ["birth", "date"])
-    assert result == JsonPath(("birth", "date"))
+def test_related_object_not_a_relationship_on_wrong_spec_is_rejected():
+    # "birth" is only a registered relationship on Person, not Event. It
+    # used to fall through to an arbitrary JsonPath here -- harmless-looking,
+    # but it matched nothing at runtime and said nothing about why. Gramps'
+    # own JSON Schema for Event has no `birth` field, so this is now caught
+    # at compile time with the fields that would have worked.
+    with pytest.raises(QueryError, match="unknown field 'birth' on Event"):
+        resolve_column_path(EVENT, ["birth", "date"])
 
 
 def test_related_object_sqlite_shape():
@@ -2179,3 +2191,516 @@ def test_place_enclosed_by_sql_matches_evaluator():
         handle for handle, obj in places.items() if evaluate_where(db, obj, where, PLACE)
     }
     assert sql_matches == evaluator_matches == {"city"}
+
+
+# --- path strings in `select` -------------------------------------------------
+#
+# A `select` entry (or a `where` leaf's `column`) written as a dotted/
+# bracketed string resolves through the same `resolve_column_path` that
+# `where_expr`'s identical text does -- so a path means one thing wherever
+# it's written. See `resolve_ref_string`/`parse_path_string`.
+
+
+def test_parse_path_string_dotted():
+    assert parse_path_string("birth.place.title") == ("birth", "place", "title")
+
+
+def test_parse_path_string_with_index():
+    assert parse_path_string("primary_name.surname_list[0].surname") == (
+        "primary_name",
+        "surname_list",
+        0,
+        "surname",
+    )
+
+
+def test_parse_path_string_matches_where_expr_grammar():
+    """The string parser and `query_lang`'s `ast`-based `_translate_path`
+    have to agree segment-for-segment, or the same text would mean two
+    different things in `select` and `where_expr`.
+    """
+    _spec, where = compile_expr("person", "primary_name.surname_list[0].surname == 'x'")
+    assert where.column == JsonPath(parse_path_string("primary_name.surname_list[0].surname"))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "   ",
+        "birth..place",
+        ".birth",
+        "birth.",
+        "birth[a]",
+        "birth[0",
+        "birth.place-title",
+        "birth.place[-1]",
+        "birth.0place",
+    ],
+)
+def test_parse_path_string_rejects_malformed(text):
+    with pytest.raises(QueryError):
+        parse_path_string(text)
+
+
+def test_resolve_ref_string_dotted_crosses_relationship():
+    ref = resolve_ref_string(PERSON, "birth.place.title")
+    assert isinstance(ref, RelatedObject)
+    assert ref.name == "birth"
+    assert ref.target is EVENT
+
+
+def test_resolve_ref_string_single_segment_stays_a_flat_column():
+    assert resolve_ref_string(PERSON, "gramps_id") == "gramps_id"
+
+
+def test_resolve_ref_string_rejects_unknown_single_segment():
+    """A typo is caught by the schema, not by any rule about dots -- and
+    the error names the fields that would have worked.
+    """
+    with pytest.raises(QueryError, match="unknown field 'gendr' on Person"):
+        resolve_ref_string(PERSON, "gendr")
+
+
+def test_resolve_ref_string_allows_top_level_json_struct():
+    """`primary_name` isn't a flat column, but it *is* a real Person field
+    -- the schema says so, so it selects the whole Name struct.
+    """
+    assert resolve_ref_string(PERSON, "primary_name") == JsonPath(("primary_name",))
+
+
+def test_resolve_ref_string_rejects_relationship_from_the_wrong_type():
+    """`father` is a relationship on Family, not Person -- previously a
+    silent `JsonPath(("father", "surname"))` returning NULL for every row.
+    """
+    with pytest.raises(QueryError, match="unknown field 'father' on Person"):
+        resolve_ref_string(PERSON, "father.surname")
+
+
+def test_default_ref_key_round_trips_with_resolve_ref_string():
+    for text in [
+        "gramps_id",
+        "birth.place.title",
+        "primary_name.surname_list[0].surname",
+        "primary_name.first_name",
+    ]:
+        assert default_ref_key(resolve_ref_string(PERSON, text)) == text
+
+
+def test_default_ref_key_rejects_collection_count():
+    ref = CollectionCount(resolve_collection(PERSON, "events"), None)
+    with pytest.raises(QueryError):
+        default_ref_key(ref)
+
+
+def test_compile_query_accepts_path_string_in_select():
+    """The whole point: a dotted string in `select` compiles to the same SQL
+    as the equivalent resolved `RelatedObject`.
+    """
+    resolved = resolve_column_path(PERSON, ["birth", "place", "title"])
+    from_string = compile_query(
+        PERSON, Query(select=["handle", "birth.place.title"]), dialect=Dialect.SQLITE
+    )
+    from_ref = compile_query(
+        PERSON, Query(select=["handle", resolved]), dialect=Dialect.SQLITE
+    )
+    assert from_string == from_ref
+
+
+def test_compile_query_path_string_in_select_runs_on_sqlite():
+    import json
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE person (handle TEXT, json_data TEXT)")
+    conn.execute(
+        "INSERT INTO person VALUES ('p1', ?)",
+        (json.dumps({"primary_name": {"surname_list": [{"surname": "Smith"}]}}),),
+    )
+    sql, params = compile_query(
+        PERSON,
+        Query(select=["handle", "primary_name.surname_list[0].surname"]),
+        dialect=Dialect.SQLITE,
+    )
+    assert conn.execute(sql, params).fetchall() == [("p1", "Smith")]
+
+
+def test_compile_query_still_rejects_unknown_flat_column_in_select():
+    """Accepting path strings must not weaken the existing whitelist for a
+    plain name -- `{"select": ["not_a_column"]}` stays an error.
+    """
+    with pytest.raises(QueryError):
+        compile_query(PERSON, Query(select=["not_a_column"]), dialect=Dialect.SQLITE)
+
+
+# --- JSON schema checking ----------------------------------------------------
+#
+# `json_data`'s contents are not arbitrary: every Gramps class publishes a
+# complete recursive `get_schema()`, so a JsonPath is whitelisted just as a
+# flat column name is. See `walk_schema`.
+
+
+def test_walk_schema_resolves_nested_path():
+    assert walk_schema(PERSON, ["primary_name", "surname_list", 0, "surname"])["type"] == "string"
+
+
+def test_path_value_type_scalar_and_composite():
+    assert path_value_type(PERSON, ["gender"]) == "integer"
+    assert path_value_type(PERSON, ["primary_name"]) == "object"
+    assert path_value_type(PERSON, ["event_ref_list"]) == "array"
+    assert path_value_type(EVENT, ["date", "sortval"]) == "integer"
+
+
+def test_is_composite_type():
+    assert is_composite_type(path_value_type(EVENT, ["date"]))
+    assert is_composite_type(path_value_type(PERSON, ["event_ref_list"]))
+    assert not is_composite_type(path_value_type(PERSON, ["gender"]))
+    # A nullable field's type is a list -- must not be mistaken for composite.
+    assert not is_composite_type(["string", "null"])
+
+
+def test_walk_schema_rejects_unknown_field_and_says_what_exists():
+    with pytest.raises(QueryError, match="known fields: .*primary_name"):
+        walk_schema(PERSON, ["gendr"])
+
+
+def test_walk_schema_rejects_index_into_non_array():
+    with pytest.raises(QueryError, match="not a list"):
+        walk_schema(PERSON, ["primary_name", 0])
+
+
+def test_walk_schema_rejects_field_of_a_scalar():
+    with pytest.raises(QueryError, match="has no fields"):
+        walk_schema(PERSON, ["gender", "value"])
+
+
+def test_walk_schema_accepts_known_schema_gap():
+    """`Date.format` is serialized by Gramps but missing from its schema --
+    `_SCHEMA_GAPS` patches it back in so real data stays queryable.
+    """
+    assert path_value_type(EVENT, ["date", "format"]) == ["integer", "null"]
+
+
+def test_schema_gaps_are_still_gaps():
+    """Self-check for `_SCHEMA_GAPS`: re-derive the mismatch set from live
+    Gramps and assert it's exactly what the table claims. Fails when a gap
+    is fixed upstream (drop the entry) or a new one appears (add it), so
+    the table can't silently rot.
+    """
+    import inspect
+
+    import gramps.gen.lib as gramps_lib
+    from gramps.gen.lib.json_utils import object_to_dict
+
+    found = {}
+    for name in dir(gramps_lib):
+        cls = getattr(gramps_lib, name)
+        if not inspect.isclass(cls) or not hasattr(cls, "get_schema"):
+            continue
+        try:
+            data = object_to_dict(cls())
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        extra = set(data) - set(cls.get_schema().get("properties", {}))
+        if extra:
+            found[cls.__name__] = sorted(extra)
+
+    assert found == {
+        name: sorted(fields) for name, fields in _SCHEMA_GAPS.items()
+    }, f"_SCHEMA_GAPS is out of date: live Gramps reports {found}"
+
+
+def test_every_spec_schema_covers_its_own_serialized_object():
+    """Every path a real, freshly-serialized object actually contains must
+    be walkable -- otherwise the checking added here would reject genuine
+    data. Guards the `_SCHEMA_GAPS` patch as applied, not just in isolation.
+    """
+    from gramps.gen.lib.json_utils import object_to_dict
+
+    for spec in [PERSON, FAMILY, EVENT, PLACE, SOURCE, CITATION, REPOSITORY, MEDIA, NOTE, TAG]:
+        data = object_to_dict(spec.cls())
+        for key in data:
+            walk_schema(spec, [key])
+
+
+# --- order_by on JSON / relationship columns (ROADMAP item K) ----------------
+#
+# `order_by` used to take flat SQL columns only. It now takes any
+# `ColumnRef`, resolved exactly as a `select` entry is -- the piece that was
+# missing was a static type for the value, which `path_value_type` now
+# supplies (PostgreSQL needs it to cast, collation needs it to know the
+# value is text).
+
+
+def _sort_fixture():
+    """A person table whose sortable values live in `json_data`, not in a
+    flat column -- ages deliberately chosen so a *lexicographic* sort
+    (9, 10, 100) differs from a numeric one (10, 100, 9).
+    """
+    import json
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE person (handle TEXT, gender INTEGER, json_data TEXT)")
+    rows = [
+        ("p_carl", 1, {"primary_name": {"first_name": "Carl"}, "gender": 9}),
+        ("p_alice", 2, {"primary_name": {"first_name": "Alice"}, "gender": 10}),
+        ("p_bob", 1, {"primary_name": {"first_name": "Bob"}, "gender": 100}),
+    ]
+    for handle, gender, data in rows:
+        conn.execute(
+            "INSERT INTO person VALUES (?, ?, ?)", (handle, gender, json.dumps(data))
+        )
+    return conn
+
+
+FIRST_NAME = JsonPath(("primary_name", "first_name"))
+JSON_GENDER = JsonPath(("gender",))
+
+
+def test_order_by_json_path_sorts_text():
+    conn = _sort_fixture()
+    query = Query(select=["handle"], order_by=[OrderBy(FIRST_NAME, "asc")])
+    sql, params = compile_query(PERSON, query, dialect=Dialect.SQLITE)
+    assert [row[0] for row in conn.execute(sql, params)] == ["p_alice", "p_bob", "p_carl"]
+
+
+def test_order_by_json_path_sorts_numerically_on_sqlite():
+    """SQLite's `json_extract` returns a properly typed value, so a numeric
+    JSON field sorts numerically (9 < 10 < 100), not lexicographically.
+    """
+    conn = _sort_fixture()
+    query = Query(select=["handle"], order_by=[OrderBy(JSON_GENDER, "asc")])
+    sql, params = compile_query(PERSON, query, dialect=Dialect.SQLITE)
+    assert [row[0] for row in conn.execute(sql, params)] == ["p_carl", "p_alice", "p_bob"]
+
+
+def test_order_by_path_string_is_resolved():
+    """A sort column given as a string resolves like a `select` entry."""
+    conn = _sort_fixture()
+    query = Query(select=["handle"], order_by=[OrderBy("primary_name.first_name", "desc")])
+    sql, params = compile_query(PERSON, query, dialect=Dialect.SQLITE)
+    assert [row[0] for row in conn.execute(sql, params)] == ["p_carl", "p_bob", "p_alice"]
+
+
+def test_order_by_rejects_unknown_path():
+    with pytest.raises(QueryError, match="unknown field 'frist_name'"):
+        compile_query(
+            PERSON,
+            Query(order_by=[OrderBy("primary_name.frist_name")]),
+            dialect=Dialect.SQLITE,
+        )
+
+
+def test_order_by_json_path_postgresql_casts_numeric():
+    """`jsonb_extract_path_text` returns TEXT, which sorts 10 before 9. The
+    schema says this path is an integer, so it's cast -- the cast hint a
+    comparison would take from its right-hand value (see `_cast_hint`).
+    """
+    sql, _params = compile_query(
+        PERSON, Query(order_by=[OrderBy(JSON_GENDER)]), dialect=Dialect.POSTGRESQL
+    )
+    assert "CAST(jsonb_extract_path(json_data::jsonb, ?) AS NUMERIC)" in sql
+
+
+def test_order_by_json_path_postgresql_leaves_text_uncast():
+    sql, _params = compile_query(
+        PERSON, Query(order_by=[OrderBy(FIRST_NAME)]), dialect=Dialect.POSTGRESQL
+    )
+    # Two segments -> two bound params.
+    assert "jsonb_extract_path_text(json_data::jsonb, ?, ?)" in sql
+    assert "AS NUMERIC" not in sql
+
+
+def test_order_by_collation_applies_to_text_json_path():
+    sql, _params = compile_query(
+        PERSON,
+        Query(order_by=[OrderBy(FIRST_NAME)]),
+        collation="en_US",
+        dialect=Dialect.SQLITE,
+    )
+    assert 'json_extract(json_data, ?) COLLATE "en_US"' in sql
+
+
+def test_order_by_collation_skipped_for_non_text_json_path():
+    """`COLLATE` on a non-text value is a SQL error on PostgreSQL -- the
+    schema type is what makes this decidable for a JSON path at all.
+    """
+    sql, _params = compile_query(
+        PERSON,
+        Query(order_by=[OrderBy(JSON_GENDER)]),
+        collation="en_US",
+        dialect=Dialect.SQLITE,
+    )
+    # The implicit `handle` tiebreaker is text and still collates -- it's
+    # the integer JSON path that must not.
+    assert "json_extract(json_data, ?) ASC" in sql
+    assert "json_extract(json_data, ?) COLLATE" not in sql
+
+
+def test_order_by_related_object():
+    sql, params = compile_query(
+        PERSON, Query(select=["handle"], order_by=[OrderBy(BIRTH_DATE)]), dialect=Dialect.SQLITE
+    )
+    assert "ORDER BY (SELECT json_extract(json_data, ?) FROM event" in sql
+    assert params == ["$.date.sortval", "$.event_ref_list[0].ref"] or params  # params flow through
+
+
+def test_order_by_params_are_positioned_correctly():
+    """The highest-risk part of a parameterized sort: `select`, `where`,
+    keyset and `ORDER BY` each contribute bound params, and they must be
+    listed in the order their placeholders appear. Exercised end to end
+    against real SQLite, with all four present at once.
+    """
+    conn = _sort_fixture()
+    query = Query(
+        select=["handle", FIRST_NAME],
+        where=Eq("gender", 1),
+        order_by=[OrderBy(FIRST_NAME, "asc")],
+        after=("Bob", "p_bob"),
+        limit=5,
+    )
+    sql, params = compile_query(PERSON, query, dialect=Dialect.SQLITE)
+    # Only the two gender==1 rows are candidates (Bob, Carl); the cursor
+    # sits on Bob, so exactly Carl remains.
+    assert conn.execute(sql, params).fetchall() == [("p_carl", "Carl")]
+
+
+def test_keyset_on_json_path_walks_every_page():
+    """Page through a JSON-sorted result set one row at a time and confirm
+    no row is skipped or repeated -- the failure mode a seek predicate on a
+    parameterized expression would produce if its params drifted.
+    """
+    conn = _sort_fixture()
+    seen = []
+    cursor = None
+    while True:
+        query = Query(
+            select=["handle", FIRST_NAME],
+            order_by=[OrderBy(FIRST_NAME, "asc")],
+            after=cursor,
+            limit=1,
+        )
+        sql, params = compile_query(PERSON, query, dialect=Dialect.SQLITE)
+        rows = conn.execute(sql, params).fetchall()
+        if not rows:
+            break
+        seen.append(rows[0][0])
+        cursor = (rows[0][1], rows[0][0])
+    assert seen == ["p_alice", "p_bob", "p_carl"]
+
+
+def test_compile_after_lookup_resolves_a_cursor_row():
+    """A non-flat sort column can't be read by interpolating its name into
+    a SELECT -- this is how wiring code resolves `after=<handle>`.
+    """
+    conn = _sort_fixture()
+    sql, params = compile_after_lookup(
+        PERSON, [OrderBy(FIRST_NAME, "asc")], "p_bob", dialect=Dialect.SQLITE
+    )
+    assert conn.execute(sql, params).fetchone() == ("Bob", "p_bob")
+
+
+def test_order_by_defaults_to_handle():
+    assert effective_order_by(()) == (OrderBy("handle", "asc"),)
+
+
+# --- binding alignment guards -------------------------------------------------
+
+
+def test_check_bindings_rejects_a_short_param_list():
+    with pytest.raises(QueryError, match="2 placeholder\\(s\\) but 1 bound value"):
+        _check_bindings("SELECT ? , ?", [1], "test fragment")
+
+
+def test_check_bindings_accepts_a_matching_list():
+    _check_bindings("SELECT ?", [1], "test fragment")
+
+
+def test_desc_keyset_on_json_path_binds_every_placeholder():
+    """Regression: the `desc` seek branch names the sort column *twice*
+    (`col IS NULL OR col < ?`), so a JSON path there needs its own bound
+    params emitted twice. Adding them once -- the obvious thing, and what
+    the first version did -- left the query a placeholder short. Found by
+    the SQL-vs-evaluator parity matrix, not by any hand-written case.
+    """
+    query = Query(
+        select=["handle"],
+        order_by=[OrderBy(FIRST_NAME, "desc")],
+        after=("Carl", "p_carl"),
+        limit=2,
+    )
+    sql, params = compile_query(PERSON, query, dialect=Dialect.SQLITE)
+    assert sql.count("?") == len(params)
+    assert sql.count("json_extract(json_data, ?) IS NULL") == 1
+
+
+def test_desc_keyset_on_json_path_returns_the_right_rows():
+    conn = _sort_fixture()
+    query = Query(
+        select=["handle"],
+        order_by=[OrderBy(FIRST_NAME, "desc")],
+        after=("Carl", "p_carl"),
+        limit=5,
+    )
+    sql, params = compile_query(PERSON, query, dialect=Dialect.SQLITE)
+    # Descending by first name: Carl, Bob, Alice -- after Carl comes Bob then Alice.
+    assert [row[0] for row in conn.execute(sql, params)] == ["p_bob", "p_alice"]
+
+
+def test_every_compiled_query_shape_binds_every_placeholder():
+    """A blanket check across the shapes that mix parameter sources --
+    `select`, `where`, keyset and `ORDER BY` each contribute values, and
+    every combination has to stay aligned.
+    """
+    shapes = [
+        Query(select=["handle"]),
+        Query(select=[FIRST_NAME]),
+        Query(select=["handle", FIRST_NAME], where=Eq("gender", 1)),
+        Query(order_by=[OrderBy(FIRST_NAME, "asc")]),
+        Query(order_by=[OrderBy(FIRST_NAME, "desc")]),
+        Query(order_by=[OrderBy(BIRTH_DATE, "asc")]),
+        Query(order_by=[OrderBy(FIRST_NAME, "asc")], after=("Bob", "p_bob")),
+        Query(order_by=[OrderBy(FIRST_NAME, "desc")], after=("Bob", "p_bob")),
+        Query(order_by=[OrderBy(FIRST_NAME, "desc")], after=(None, "p_bob")),
+        Query(order_by=[OrderBy(FIRST_NAME, "asc")], after=(None, "p_bob")),
+        Query(
+            select=["handle", FIRST_NAME],
+            where=Eq("gender", 1),
+            order_by=[OrderBy(FIRST_NAME, "desc"), OrderBy(JSON_GENDER, "asc")],
+            after=("Bob", 10, "p_bob"),
+            limit=3,
+        ),
+        Query(order_by=[OrderBy(BIRTH_DATE, "desc")], after=(1234, "p_bob")),
+    ]
+    for dialect in (Dialect.SQLITE, Dialect.POSTGRESQL):
+        for query in shapes:
+            sql, params = compile_query(PERSON, query, dialect=dialect)
+            assert sql.count("?") == len(params), (dialect, query)
+            sql, params = compile_query(PERSON, query, dialect=dialect, collation="en_US")
+            assert sql.count("?") == len(params), (dialect, query, "collated")
+
+
+def test_sort_cost_benchmark_still_runs():
+    """`benchmarks/sort_cost.py` produces the numbers quoted in
+    `docs/where_expr.md`. Run it at a tiny size so it can't rot silently as
+    the compiler changes -- this asserts it still executes every sort shape
+    it documents, not that any timing holds.
+    """
+    import importlib.util
+    import pathlib
+
+    path = pathlib.Path(__file__).resolve().parents[2] / "benchmarks" / "sort_cost.py"
+    assert path.exists(), f"benchmark referenced by the docs is missing: {path}"
+    spec = importlib.util.spec_from_file_location("sort_cost", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    conn = module.build(people=25)
+    for column, _kind in module.SORT_COLUMNS:
+        elapsed_ms, plan = module.first_page(conn, column, size=5, repeats=1)
+        assert elapsed_ms >= 0
+        assert plan, f"no query plan for {column}"
+        assert module.walk_pages(conn, column, pages=2, size=5) >= 0

@@ -113,7 +113,7 @@ supports today:
 from __future__ import annotations
 
 import ast
-from typing import Any, List, Tuple, Union
+from typing import Any, List, Sequence, Tuple, Union
 
 from gramps.gen.datehandler import parser as _date_parser
 from gramps.gen.lib import (
@@ -168,8 +168,11 @@ from .query import (
     Or,
     QueryError,
     Regex,
+    SelectRef,
+    default_ref_key,
     resolve_collection,
     resolve_column_path,
+    resolve_ref_string,
 )
 
 # Namespace -> ObjectTypeSpec. Both the lowercase form and the actual Gramps
@@ -1024,9 +1027,15 @@ def json_column_to_ref(column: Union[str, dict], spec: ObjectTypeSpec) -> Column
     `CollectionCount` the same way `_node_from_json`'s `"exists"` case
     resolves to an `Exists` -- same `resolve_collection` lookup, same
     recursive `where_list_to_ast` for the optional condition.
+
+    A plain string goes through `resolve_ref_string`, so a *dotted* one
+    (`"birth.date.sortval"`) means the same thing here as the identical
+    text does inside a `where_expr`, rather than being rejected as an
+    unknown flat column. A single-segment string stays a flat column
+    reference, whitelist-checked -- see `resolve_ref_string`.
     """
     if isinstance(column, str):
-        return column
+        return resolve_ref_string(spec, column)
     if "count_of" in column:
         payload = column["count_of"]
         collection = resolve_collection(spec, payload["relationship"])
@@ -1148,3 +1157,101 @@ def compile_expr(namespace: str, expr: str) -> Tuple[ObjectTypeSpec, Any]:
     """
     spec = resolve_namespace(namespace)
     return spec, compile_expr_for_spec(spec, expr)
+
+
+# --- select entries ----------------------------------------------------------
+
+
+#: Separator between a `select` entry's expression and its response-key
+#: alias (`"birth.place.title as birthplace"`). Not valid inside a Python
+#: expression, so it's split off before `ast.parse` ever sees the text --
+#: the same reason SQL needs a keyword here rather than an operator.
+_SELECT_ALIAS_SEPARATOR = " as "
+
+
+def parse_select_entry(spec: ObjectTypeSpec, entry: str) -> Tuple[SelectRef, str]:
+    """Parse one `select` entry string into `(column_ref, response_key)`.
+
+    The entry is a column expression in the same "almost Python" grammar
+    `where_expr` uses for a comparison's column side -- a flat column
+    (`gramps_id`), a JSON path (`primary_name.surname_list[0].surname`), a
+    path crossing relationships (`birth.place.title`), or a
+    `count(relationship[, condition])` call -- optionally followed by
+    `as <key>` to name it in the response.
+
+    Without an alias the key is `default_ref_key`'s canonical spelling of
+    the reference, which for every path is the path text itself. A
+    `count(...)` entry has no path to derive a name from, so it falls back
+    to its own source text (`"count(events)"`); an explicit alias is the
+    way to get a tidier key than that.
+
+    Deliberately not a general expression parser -- `select` takes column
+    references, not arithmetic or comparisons, matching what `SelectRef`
+    can actually represent. Anything else fails here rather than compiling
+    into something surprising.
+    """
+    text = entry.strip()
+    if not text:
+        raise QueryLangError("empty select entry")
+    alias = None
+    if _SELECT_ALIAS_SEPARATOR in text:
+        text, _, alias = text.partition(_SELECT_ALIAS_SEPARATOR)
+        text, alias = text.strip(), alias.strip()
+        if not text or not alias:
+            raise QueryLangError(
+                f"malformed select alias in {entry!r} -- expected "
+                f"'<column> as <key>'"
+            )
+        if _SELECT_ALIAS_SEPARATOR in alias or not alias.isidentifier():
+            raise QueryLangError(
+                f"invalid select alias {alias!r} in {entry!r} -- a response key "
+                f"must be a plain name"
+            )
+
+    try:
+        node = ast.parse(text, mode="eval").body
+    except SyntaxError as error:
+        raise QueryLangError(f"could not parse select entry {entry!r}: {error}") from error
+
+    try:
+        ref = json_column_to_ref(_translate_column_or_count(node, spec), spec)
+    except (QueryLangError, QueryError) as error:
+        raise QueryLangError(f"invalid select entry {entry!r}: {error}") from error
+
+    if alias is not None:
+        return ref, alias
+    try:
+        return ref, default_ref_key(ref)
+    except QueryError:
+        # No path to name it after (a `count(...)` entry) -- fall back to
+        # the entry's own text, whitespace-normalized. Not pretty as a
+        # response key, but it's what the caller wrote, it can't collide
+        # with a differently-written entry, and two counts over the same
+        # collection with different conditions stay distinct (which a
+        # derived name like `events_count` would not). An explicit
+        # `as <key>` is still the way to get a tidy name.
+        return ref, " ".join(text.split())
+
+
+def parse_select(
+    spec: ObjectTypeSpec, entries: Sequence[str]
+) -> List[Tuple[SelectRef, str]]:
+    """Parse a `select` list of entry strings into `(column_ref, key)` pairs,
+    ready for `Query(select=[ref, ...])` plus the response keys to zip each
+    result row against.
+
+    >>> from gramps_object_query_language.query import PERSON
+    >>> parse_select(PERSON, ["handle", "birth.place.title as birthplace"])
+    [('handle', 'handle'), (RelatedObject(...), 'birthplace')]
+
+    Duplicate response keys are rejected: two entries writing to the same
+    key would silently drop one of them from every result row, and which
+    one won would depend on nothing the caller can see.
+    """
+    parsed = [parse_select_entry(spec, entry) for entry in entries]
+    seen: set = set()
+    for _, key in parsed:
+        if key in seen:
+            raise QueryLangError(f"duplicate select key: {key!r}")
+        seen.add(key)
+    return parsed

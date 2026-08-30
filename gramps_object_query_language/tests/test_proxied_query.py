@@ -43,6 +43,7 @@ from gramps_object_query_language.query import (
     OrderBy,
     Query,
     QueryError,
+    compile_after_lookup,
     compile_query,
     resolve_column_path,
 )
@@ -406,3 +407,214 @@ def test_run_query_default_return_shape_is_unchanged_without_select(paging_handl
     assert len(matches) == 1
     assert matches[0].handle == handles["Alice"]
     assert matches[0].primary_name.first_name == "Alice"
+
+
+def test_run_query_select_path_string_matches_sql(paging_handles):
+    """A dotted `select` entry has to project identically on both paths --
+    the SQL side resolves it in `compile_query`, the evaluator side in
+    `run_query`, and they must agree on both the values and their order.
+    """
+    db, _handles = paging_handles
+    select = ["handle", "father.given_name"]
+    query = Query(select=select, limit=100)
+    expected = _sql_rows(db, FAMILY, query)
+    actual = run_query(db, FAMILY, None, select=select, limit=100)
+    assert actual == expected
+    # Not vacuous: at least one real father name, and at least one NULL
+    # (the fixture's father-less family) came back.
+    names = {row[1] for row in actual}
+    assert None in names
+    assert names - {None}
+
+
+def test_run_query_select_path_string_matches_resolved_ref(paging_handles):
+    """The string and the resolved `RelatedObject` are two spellings of one
+    reference on the evaluator path too, not just in the SQL compiler.
+    """
+    db, _handles = paging_handles
+    resolved = resolve_column_path(FAMILY, ["father", "given_name"])
+    assert run_query(db, FAMILY, None, select=["father.given_name"], limit=100) == run_query(
+        db, FAMILY, None, select=[resolved], limit=100
+    )
+
+
+def test_run_query_select_still_rejects_unknown_flat_column(paging_handles):
+    db, _handles = paging_handles
+    with pytest.raises(QueryError):
+        run_query(db, PERSON, None, select=["not_a_column"], limit=100)
+
+
+# --- order_by on JSON / relationship columns, both paths ---------------------
+
+
+def test_run_query_order_by_json_path_matches_sql(paging_handles):
+    """Sorting on a JSON path has to give the same order on both paths --
+    SQLite sorts via `json_extract`, `run_query` via Python `<`.
+    """
+    db, _handles = paging_handles
+    order_by = [OrderBy("primary_name.first_name", "asc")]
+    query = Query(select=["handle"], order_by=order_by, limit=100)
+    expected = _sql_rows(db, PERSON, query)
+    actual = run_query(db, PERSON, None, order_by=order_by, limit=100, select=["handle"])
+    assert actual == expected
+    assert len(actual) == 5
+
+
+def test_run_query_order_by_json_path_desc_matches_sql(paging_handles):
+    db, _handles = paging_handles
+    order_by = [OrderBy("primary_name.first_name", "desc")]
+    query = Query(select=["handle"], order_by=order_by, limit=100)
+    assert run_query(
+        db, PERSON, None, order_by=order_by, limit=100, select=["handle"]
+    ) == _sql_rows(db, PERSON, query)
+
+
+def test_run_query_keyset_on_json_path_matches_sql(paging_handles):
+    """Keyset pagination over a JSON sort column: the seek predicate re-emits
+    the column's own bound params on both sides of every OR-term, so this is
+    the test that would catch a parameter-ordering slip.
+    """
+    db, _handles = paging_handles
+    order_by = [OrderBy("primary_name.first_name", "asc")]
+
+    page1 = _sql_rows(db, PERSON, Query(select=["handle"], order_by=order_by, limit=2))
+    cursor_handle = page1[-1][0]
+    lookup_sql, lookup_params = compile_after_lookup(
+        PERSON, order_by, cursor_handle, dialect=Dialect.SQLITE
+    )
+    db.dbapi.execute(lookup_sql, lookup_params)
+    cursor = tuple(db.dbapi.fetchone())
+
+    query = Query(select=["handle"], order_by=order_by, limit=10, after=cursor)
+    expected = _sql_rows(db, PERSON, query)
+    actual = run_query(
+        db, PERSON, None, order_by=order_by, limit=10, after=cursor, select=["handle"]
+    )
+    assert actual == expected
+    assert len(actual) == 3
+
+
+def test_run_query_order_by_related_object_matches_sql(paging_handles):
+    """A relationship hop as a sort column -- a correlated subquery on the
+    SQL side, a per-object fetch through `db` on the evaluator side.
+    """
+    db, _handles = paging_handles
+    order_by = [OrderBy("father.given_name", "asc")]
+    query = Query(select=["handle"], order_by=order_by, limit=100)
+    assert run_query(
+        db, FAMILY, None, order_by=order_by, limit=100, select=["handle"]
+    ) == _sql_rows(db, FAMILY, query)
+
+
+def test_run_query_order_by_rejects_unknown_path(paging_handles):
+    db, _handles = paging_handles
+    with pytest.raises(QueryError, match="unknown field"):
+        run_query(db, PERSON, None, order_by=[OrderBy("primary_name.frist_name")])
+
+
+# --- SQL-vs-evaluator parity matrix ------------------------------------------
+#
+# The structural guard in `query.py` (`_check_bindings`) catches SQL text and
+# bound values drifting *in length*. It cannot catch a same-length
+# mis-ordering, which is the case that executes happily and returns
+# plausible, wrong rows. This matrix is that half of the guard: `run_query`
+# reaches the same answer with no SQL and no bound parameters at all, so if
+# the two agree across every shape below, the parameter list lines up with
+# the SQL that consumes it.
+#
+# The shapes deliberately mix flat columns (contribute no params), JSON paths
+# (one param each), and relationship hops (a correlated subquery), in both
+# directions, with and without paging -- since a mis-ordering only shows up
+# when two slots of compatible type sit next to each other.
+
+_PARITY_SHAPES = [
+    ("flat asc", PERSON, ["handle"], [OrderBy("given_name", "asc")]),
+    ("flat desc", PERSON, ["handle"], [OrderBy("given_name", "desc")]),
+    ("json path asc", PERSON, ["handle"], [OrderBy("primary_name.first_name", "asc")]),
+    ("json path desc", PERSON, ["handle"], [OrderBy("primary_name.first_name", "desc")]),
+    (
+        "two json paths, mixed directions",
+        PERSON,
+        ["handle"],
+        [
+            OrderBy("primary_name.surname_list[0].surname", "asc"),
+            OrderBy("primary_name.first_name", "desc"),
+        ],
+    ),
+    (
+        "flat then json path",
+        PERSON,
+        ["handle"],
+        [OrderBy("gender", "asc"), OrderBy("primary_name.first_name", "asc")],
+    ),
+    (
+        "json path selected AND sorted",
+        PERSON,
+        ["handle", "primary_name.first_name"],
+        [OrderBy("primary_name.first_name", "asc")],
+    ),
+    (
+        "two different json paths selected, one sorted",
+        PERSON,
+        ["handle", "primary_name.first_name", "primary_name.surname_list[0].surname"],
+        [OrderBy("primary_name.surname_list[0].surname", "asc")],
+    ),
+    ("relationship hop asc", FAMILY, ["handle"], [OrderBy("father.given_name", "asc")]),
+    ("relationship hop desc", FAMILY, ["handle"], [OrderBy("father.given_name", "desc")]),
+    (
+        "relationship hop selected AND sorted",
+        FAMILY,
+        ["handle", "father.given_name"],
+        [OrderBy("father.given_name", "asc")],
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "label,spec,select,order_by", _PARITY_SHAPES, ids=[s[0] for s in _PARITY_SHAPES]
+)
+def test_sql_and_evaluator_agree(paging_handles, label, spec, select, order_by):
+    db, _handles = paging_handles
+    query = Query(select=select, order_by=order_by, limit=100)
+    assert run_query(db, spec, None, order_by=order_by, limit=100, select=select) == _sql_rows(
+        db, spec, query
+    )
+
+
+@pytest.mark.parametrize(
+    "label,spec,select,order_by", _PARITY_SHAPES, ids=[s[0] for s in _PARITY_SHAPES]
+)
+def test_sql_and_evaluator_agree_page_by_page(paging_handles, label, spec, select, order_by):
+    """The same shapes, walked one row at a time. Paging is where a
+    parameter-ordering bug does its real damage: the seek predicate re-emits
+    every sort column's expression once per OR-term, so a paged query has
+    several times as many bound values as an unpaged one, in an order that
+    interleaves sort paths with cursor values. Asserts the pages reassemble
+    into the unpaged answer -- a row silently skipped or repeated fails here,
+    where a row-count check would not.
+    """
+    db, _handles = paging_handles
+    whole = _sql_rows(db, spec, Query(select=select, order_by=order_by, limit=100))
+
+    for runner in ("sql", "evaluator"):
+        walked = []
+        cursor = None
+        for _ in range(len(whole) + 2):  # +2: must terminate, not just fill
+            query = Query(select=select, order_by=order_by, limit=1, after=cursor)
+            if runner == "sql":
+                rows = _sql_rows(db, spec, query)
+            else:
+                rows = run_query(
+                    db, spec, None, order_by=order_by, limit=1, after=cursor, select=select
+                )
+            if not rows:
+                break
+            walked.append(rows[0])
+            lookup_sql, lookup_params = compile_after_lookup(
+                spec, order_by, rows[0][0], dialect=Dialect.SQLITE
+            )
+            db.dbapi.execute(lookup_sql, lookup_params)
+            cursor = tuple(db.dbapi.fetchone())
+
+        assert walked == whole, f"{runner} paging diverged for {label!r}"
+        assert len(walked) == len(set(walked)), f"{runner} repeated a row for {label!r}"

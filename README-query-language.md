@@ -508,9 +508,34 @@ In the Person view:
 
 birth.place.title reaches from the person to their birth event to that event's place, to the place's full name.
 
+#### Showing a value, not just filtering on it
+
+The same path works in `select`, which is what decides the columns you get
+back rather than which rows:
+
+> select: ["handle", "birth.place.title as birthplace"]
+
+Paths are checked before the query runs: `primary_name.frist_name` is an
+error that lists the fields that do exist, not a column of blanks.
+
+You can sort by a path too (`order_by` on `birth.date.sortval`), but it's
+much slower than sorting by a flat field like surname -- Gramps keeps a
+sorted index for surname and none for anything inside a person's record, so
+sorting by birth date means reading every person in the tree. Fine for a
+list you've already narrowed down; slow as the default order of a big
+shared tree. See [What sorting costs](docs/where_expr.md#what-sorting-costs)
+for measurements.
+
+Every path you can filter on, you can also return — `father.surname`,
+`primary_name.surname_list[0].surname`, `birth.date.sortval`. Add `as
+<name>` to choose what the column is called in the result; without it, the
+column is named by the path itself. `count(events) as n_events` returns a
+count per row the same way (the alias is required there, since a count has
+no path to be named after).
+
 The "show me where they're buried" half needs a bit more care, for two reasons:
 
-1. where_expr is a filter language — every query it writes is a true/false test per person, not a report that hands back a value like "here's their burial place." So it can narrow down to people buried somewhere specific, but it can't display an unknown burial place for each match in the same query.
+1. where_expr is a filter language — every query it writes is a true/false test per person, not a report that hands back a value. Handing values back is `select`'s job instead, and `select` takes the *same* paths (see [Showing a value, not just filtering on it](#showing-a-value-not-just-filtering-on-it) above) — so "show me their birth place" is one query. Burial is the harder half, for reason 2 below: there's no path that reaches it, so there's nothing for `select` to name.
 2. Burial isn't a shortcut field the way birth/death are — birth/death reach a person's event directly by name, but a person's other events (burial included) are reached through the general events collection instead, using exists(events, ...).
 
 #### If you already know the cemetery
