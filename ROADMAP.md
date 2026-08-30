@@ -1038,6 +1038,77 @@ a known limitation rather than blocking the rest. Evaluator-path parity
 (closing item L's remaining cap) is small enough to land in the same
 change rather than a separate follow-up.
 
+### `event(EventType.X)` -- generic one-to-many "first matching event" relationship
+
+Motivated by a query that can't be answered in one shot today: "find
+everyone born in Chicago, and show me where they're buried." `birth`/
+`death` are the only two events registered as one-to-one `_RELATIONSHIPS`
+entries, because Gramps itself maintains `birth_ref_index`/`death_ref_index`
+on `Person` (see [`Place.enclosed_by`](#placeenclosed_by----one-to-one-self-reference-item-e)
+above, Done, which already established those six -- now seven -- are the
+*complete* genuine one-to-one set). Every other event type -- `Burial`,
+`Cremation`, `Marriage` on `Family`, all 45 of Gramps' standard `EventType`
+values -- is reachable today only as a boolean/count check via the existing
+`events` collection (`exists(events, type.value == EventType.BURIAL)`,
+`count(events, ...)`), never as a value that can be projected in `select`
+or chained further (`....place.title`).
+
+**Difficulty:** comparable to item K above, but not yet layer-by-layer
+verified against the code the way K/`len()`/`any()` were -- treat the
+sketch below as a first pass, not a scoped estimate.
+
+**Why this isn't just "register `burial` like the other seven":** every
+existing `_RELATIONSHIPS` entry resolves to exactly one related row,
+unconditionally, either via a real FK column (`father_handle`) or Gramps'
+own maintained ref-index (`birth_ref_index`). There is no `burial_ref_index`
+(or any per-type ref-index) for Gramps to point at -- a person can have
+zero, one, or several `Burial` events recorded (reburial, disputed
+records), so reaching "the" burial event needs a filter-and-pick-one
+operation, not a lookup. That's a materially different shape (a correlated
+subquery with `WHERE`/`ORDER BY`/`LIMIT 1`, sibling to `Exists`/
+`CollectionCount`'s existing `_collection_subquery_body` machinery) from
+every current `RelatedObject` hop (an unconditional handle lookup).
+
+**What it would take, sketched (not yet layer-by-layer verified):**
+1. `query_lang.py` -- a new whitelisted call form, e.g.
+   `event(EventType.BURIAL)`, usable as a path *root* -- unlike `exists`/
+   `count`, which are terminal, this one needs a trailing `.path` to keep
+   chaining (`event(EventType.BURIAL).place.title`). New grammar, not a
+   `Call`-in-leaf-position case like the other three whitelisted calls.
+2. `query.py` -- a new `ColumnRef` variant (parallel to `RelatedObject`,
+   reusing `_collection_subquery_body`'s `WHERE`-filtered shape instead of
+   an index lookup), rendering `... ORDER BY <tiebreak> LIMIT 1`. Needs a
+   documented tie-break -- list position in `event_ref_list` (matching how
+   `exists`/`count` already treat the array) is the simplest default;
+   sorting by the event's own date is tempting but adds real complexity for
+   no clearly-better semantics (a missing/estimated date, multiple
+   same-date events).
+3. Wiring into `select` (should follow the same path `birth`/`death`
+   already take, since `SelectRef = ColumnRef`) and `evaluator.py` (a
+   matching branch: filter the person's own `event_ref_list` in Python,
+   take the first match).
+4. Docs (README-query-language.md cookbook entry, docs/where_expr.md
+   technical writeup) + tests, per the usual four-file pattern.
+
+**Performance note (resolved, not a blocker):** an index on `Event.type`
+(the field is nested JSON, `type.value`, not a flat SQL column today) would
+*not* speed this up -- the correlated subquery it needs is already scoped
+to one person's own small `event_ref_list` via `handle` (primary key)
+lookups before `type` is ever checked, the same bounded-scan shape
+`exists(events, ...)`/`count(events, ...)` already use (confirmed by
+reading `_collection_subquery_body`'s
+`json_each(<outer_table>.json_data, ...)` rendering). An `Event.type` index
+would matter for a *different*, already-shippable case instead: a direct,
+person-unscoped `Event "type.value == EventType.BURIAL"` filter across the
+whole table, which has no index behind it today.
+
+**Recommended scope for a v1:** `event(EventType.X)` as a `Person`/`Family`
+relationship root (mirrors where `events` is already a registered
+collection on both), tie-broken by list position, usable in both `where`
+and `select`; reject at parse time if nothing follows the call with a
+`.path` (mirrors `exists`'s own "relationship name needs something after
+it" rule).
+
 ### Other gaps (not yet scoped to this level of detail)
 
 - **`exists(...)`/`count(...)` condition referencing the *outer* row** (e.g.
@@ -1063,6 +1134,19 @@ change rather than a separate follow-up.
   `WITH` CTE or binding the subquery's result once), a general
   optimization rather than anything specific to chaining or operand
   ordering.
+- **Reverse relationships** (e.g. "which `Person` references this
+  `Event`") -- not supported at all today; every relationship/collection
+  here only reaches *outward* from the owning record (`Person` -> `events`
+  -> `Event`), never the other direction. Gramps core (`find_backlink_handles`)
+  already maintains a general `reference(ref_handle, obj_class, ...)` table
+  for exactly this, and [gramps-project/gramps#2324](https://github.com/gramps-project/gramps/pull/2324)
+  added a composite index on `(ref_handle, obj_class)` plus SQL-pushdown for
+  the `obj_class` filter, making that table efficiently queryable by class.
+  This project doesn't touch `find_backlink_handles`/the `reference` table
+  anywhere today (checked -- no references in the codebase), so adopting it
+  would be a genuinely new query *direction*, not a speedup of anything that
+  exists here now -- and a separate design effort from the
+  `event(EventType.X)` item above, which stays a forward-only relationship.
 
 ### Rough difficulty survey of unsupported `where_expr` shapes
 

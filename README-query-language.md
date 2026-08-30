@@ -498,7 +498,73 @@ matching spelling too, as a list comprehension inside `len(...)`:
 `len([c for c in children if c.given_name == 'Robert']) == 1` means the
 same thing as `count(children, given_name == 'Robert') == 1`.
 
-## Things this can't do (yet)
+### Goal: Find everyone born in Chicago – and show me where they're buried
+
+The "born in Chicago" half is straightforward:
+
+In the Person view:
+
+> "birth.place.title == 'Chicago, Cook, Illinois, USA'"
+
+birth.place.title reaches from the person to their birth event to that event's place, to the place's full name.
+
+The "show me where they're buried" half needs a bit more care, for two reasons:
+
+1. where_expr is a filter language — every query it writes is a true/false test per person, not a report that hands back a value like "here's their burial place." So it can narrow down to people buried somewhere specific, but it can't display an unknown burial place for each match in the same query.
+2. Burial isn't a shortcut field the way birth/death are — birth/death reach a person's event directly by name, but a person's other events (burial included) are reached through the general events collection instead, using exists(events, ...).
+
+#### If you already know the cemetery
+
+in the Person view:
+> "birth.place.title == 'Chicago, Cook, Illinois, USA' and exists(events, type.value == EventType.BURIAL and place.title == 'Rosehill Cemetery, Chicago, Cook, Illinois, USA')"
+
+This matches everyone born in Chicago whose recorded burial event's place is exactly Rosehill Cemetery. The `type.value == EventType.BURIAL and place.title == '...'` part has to stay inside the exists(events, ...) parentheses — it's a condition checked against each of that person's events, not against the person directly.
+
+#### If you don't know the cemetery — the two-part scan version
+
+When you want each person's burial place reported back, not filtered against a name you already know, there's no single where_expr that does it. As a gramps-connect Gramplet, the workaround is: let people(where, ...) do the part it's good at, then walk each match's own events by hand for the rest — the same technique the plugins/events.py/plugins/children.py examples use, since a burial event has no birth_ref_index-style shortcut to jump straight to it:
+
+```
+# To use this, in the Gramps Connect Gramplet Editor:
+# 1. Enter a title, like "Born in Chicago"
+# 2. Select View: Person
+# 3. Place the following as Code:
+#
+# Like plugins/filter.py, this is a tree-wide search, not reactive to the
+# selected person, so "Re-run automatically" isn't needed.
+
+from gramps.gen.lib import EventType
+
+# where= can filter on birth place directly -- "birth.place.title" crosses
+# person -> birth event -> place in one hop.
+
+chicago_born = people(
+    "birth.place.title == 'Chicago, Cook, Illinois, USA'",
+    order=[{"column": "surname", "direction": "asc"}],
+    limit=200,
+)
+
+# There's no equivalent shortcut for burial, though -- Gramps only keeps a
+# ref_index for birth/death (person.birth_ref_index/death_ref_index), so a
+# where= condition can only ask "does a Burial event exist" (true/false),
+# never hand back *where*. Getting the actual place means walking
+# event_ref_list by hand, stopping at the first Burial event found.
+
+columns("Person", "Burial place")
+for person in chicago_born:
+    burial_place = None
+    for event_ref in person.event_ref_list:
+        event = db.get_event_from_handle(event_ref.ref)
+        if event.type == EventType.BURIAL:
+            burial_place = db.get_place_from_handle(event.place) if event.place else None
+            break
+    row(person, burial_place)
+```
+
+This is a "scan" in the sense that the inner loop isn't indexed or query-optimized — it's a plain walk over each matched person's own event list, run once per person. For a typical personal genealogy tree (a few hundred to a few thousand people), that's negligible. It only becomes noticeably slow on a large shared tree with tens of thousands of people, where doing this per-row lookup for every match adds up.
+
+
+## Things GOQL can't do (yet)
 
 - Anything beyond the patterns shown above -- this is a small, fixed set of
   building blocks, not a full programming language, so anything outside it
@@ -511,3 +577,7 @@ same thing as `count(children, given_name == 'Robert') == 1`.
   record type.
 - [`gramps_object_query_language/tests/test_where_expr_examples.py`](gramps_object_query_language/tests/test_where_expr_examples.py)
   is the test file that proves every example above actually works.
+[quote="GeorgeWilmes, post:26, topic:9915"]
+3. Find everyone born in Chicago – and show me where they’re buried.
+[/quote]
+
