@@ -690,9 +690,12 @@ Sort/seek/limit landed exactly as the scoping pass laid out:
   directions, so `DESC` is the exact reverse of `ASC`, NULLs included --
   matches this section's own "pin down against SQLite's real, verified
   default" requirement.
-- **Collation** -- ASCII/codepoint only (plain Python `<`/`>`), exactly the
-  documented gap this section anticipated; no attempt at locale-aware
-  `COLLATE` parity.
+- **Collation** -- ASCII/codepoint only (plain Python `<`/`>`) as originally
+  shipped here, exactly the documented gap this section anticipated; no
+  attempt at locale-aware `COLLATE` parity. Later given an ASCII-`NOCASE`
+  case fold (`_null_safe_cmp`/`_nocase_key`) to match the SQL path's own
+  `NOCASE` default -- see "Default `NOCASE` collation on the SQL path"
+  below for why. Locale-aware `COLLATE` parity is still not attempted.
 - **`order_by` stays flat-columns-only** -- `OrderBy.column` is already
   structurally a plain string (no `JsonPath`/`RelatedObject` shape exists
   for it), so this path was never at risk of leapfrogging past item K's own
@@ -753,6 +756,46 @@ cursor and one confirming a `desc` page doesn't drop a `NULL` row after an
 ordinary cursor. `test_query.py` additionally covers the fixed SQL shape and
 a real end-to-end SQLite execution directly, independent of the Gramps
 fixture.
+
+### Default `NOCASE` collation on the SQL path
+
+Implemented -- `compile_query`'s `_column_expr` (query.py) now falls back to
+`COLLATE "NOCASE"` on text `ORDER BY`/keyset columns when the caller passes
+no explicit `collation`, but only on SQLite (`dialect` is `Dialect.SQLITE`
+or omitted, since SQLite is the default target). PostgreSQL has no built-in
+`NOCASE` collation, so that dialect is unaffected -- an explicit `collation`
+is still required there.
+
+**Motivation:** without any `COLLATE` clause, SQLite compares text by raw
+codepoint, so every lowercase letter sorts after every uppercase one. A
+surname stored with an uncapitalized prefix ("de Vos", "von Hebel", "zum
+Walde" -- common in Dutch/German naming) sorted after every "Z..." surname
+instead of interleaving with the rest of the alphabet the way Gramps
+Desktop's own sort does. Desktop never special-cases prefixes for this --
+its sort key always goes through `GrampsLocale.sort_key()`/`strcoll()`
+(ICU collator or `locale.strxfrm`), which fold case as Desktop's own SQLite
+connection's registered collation does too (`sqlite.py`'s `check_collation`,
+via `connection.create_collation(name, locale.strcoll)`). This project has
+no live connection to register a real locale collation against -- it's a
+pure SQL compiler (see this module's own docstring) -- so full locale parity
+stays the caller's job (`resources/object_query.py`'s `_resolve_collation`
+in `gramps-web-api`, which already does this). `NOCASE` is a much smaller
+claim: it's built into SQLite, needs no connection setup, and is ASCII-only
+case folding (it won't fold accented letters), but that's exactly what's
+needed to fix the reported symptom with zero caller-side changes.
+
+The **evaluator/proxied path** (`proxied_query.py:run_query`, used when `db`
+is a proxy -- the path a Gramplet or any privacy-filtered caller goes
+through) got a matching fix in the same change, for a concrete reason: it
+broke `gramps-web-api`'s own `TestObjectQuerySqlProxiedEquivalence` parity
+test, which asserts the SQL and evaluator paths return byte-identical
+results for the same query -- exactly the guard that exists to catch this
+kind of divergence. `_null_safe_cmp` (this module) now ASCII-case-folds any
+`str` operand via `_nocase_key` before comparing, deliberately mirroring
+SQLite's `NOCASE` (only the 26 ASCII letters fold, not `str.lower()`'s full
+Unicode fold) rather than reaching for real locale parity, so the two paths
+stay in agreement. Full locale-aware collation remains an open gap on both
+paths -- neither has a live connection/ICU collator to draw one from.
 
 ### `regex(...)` -- a third whitelisted function-call form
 

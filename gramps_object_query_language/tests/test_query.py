@@ -1279,10 +1279,38 @@ def test_text_columns_exclude_non_string_fields():
     assert "change" not in PERSON.text_columns
 
 
-def test_no_collate_clause_without_collation_argument():
+def test_nocase_default_collation_without_collation_argument():
+    # No caller-supplied collation, SQLite (the default dialect) -- text
+    # columns still fall back to the built-in NOCASE collation, so an
+    # uncapitalized surname prefix ("de Vos") interleaves with "D..."
+    # surnames instead of sorting after every "Z...".
     query = Query(select=["handle"], order_by=[OrderBy("surname", "asc")])
     sql, _ = compile_query(PERSON, query)
+    assert 'surname COLLATE "NOCASE" ASC' in sql
+    assert 'handle COLLATE "NOCASE" ASC' in sql
+
+
+def test_no_default_collation_for_non_text_order_by_columns():
+    query = Query(select=["handle"], order_by=[OrderBy("gender", "asc")])
+    sql, _ = compile_query(PERSON, query)
+    assert "gender COLLATE" not in sql
+    assert "gender ASC" in sql
+
+
+def test_no_nocase_default_collation_on_postgresql():
+    # PostgreSQL has no built-in NOCASE collation -- the SQLite-only
+    # default fallback doesn't apply there, so an explicit `collation` is
+    # still required to fix the same case-ordering issue.
+    query = Query(select=["handle"], order_by=[OrderBy("surname", "asc")])
+    sql, _ = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
     assert "COLLATE" not in sql
+
+
+def test_explicit_collation_overrides_nocase_default():
+    query = Query(select=["handle"], order_by=[OrderBy("surname", "asc")])
+    sql, _ = compile_query(PERSON, query, collation="de_DE")
+    assert 'surname COLLATE "de_DE" ASC' in sql
+    assert "NOCASE" not in sql
 
 
 def test_collate_applied_to_text_order_by_columns():
@@ -1378,8 +1406,11 @@ def test_default_select_is_all_whitelisted_columns():
 
 
 def test_order_by_gets_trailing_handle_tiebreaker():
+    # PostgreSQL dialect: keeps the ORDER BY free of the SQLite-only NOCASE
+    # default (see test_nocase_default_collation_without_collation_argument),
+    # which isn't what this test is about.
     query = Query(select=["handle"], order_by=[OrderBy("surname", "asc")])
-    sql, _ = compile_query(PERSON, query)
+    sql, _ = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
     assert "ORDER BY surname ASC, handle ASC" in sql
 
 
@@ -1388,7 +1419,7 @@ def test_order_by_does_not_duplicate_explicit_handle():
         select=["handle"],
         order_by=[OrderBy("surname", "asc"), OrderBy("handle", "desc")],
     )
-    sql, _ = compile_query(PERSON, query)
+    sql, _ = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
     order_by_clause = sql.split("ORDER BY", 1)[1]
     assert order_by_clause.startswith(" surname ASC, handle DESC")
     assert order_by_clause.count("handle") == 1  # not duplicated
@@ -1396,7 +1427,7 @@ def test_order_by_does_not_duplicate_explicit_handle():
 
 def test_default_order_by_is_handle_only():
     query = Query(select=["handle"])
-    sql, _ = compile_query(PERSON, query)
+    sql, _ = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
     assert "ORDER BY handle ASC" in sql
 
 
@@ -1434,7 +1465,7 @@ def test_keyset_pagination_single_column_asc():
         order_by=[OrderBy("surname", "asc")],
         after=("Smith", "h123"),
     )
-    sql, params = compile_query(PERSON, query)
+    sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
     assert "surname > ?" in sql
     assert "Smith" in params
     assert "h123" in params
@@ -1446,7 +1477,7 @@ def test_keyset_pagination_mixed_directions_seek_expansion():
         order_by=[OrderBy("surname", "desc"), OrderBy("given_name", "asc")],
         after=("Smith", "Alice", "h123"),
     )
-    sql, params = compile_query(PERSON, query)
+    sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
     # OR-of-ANDs seek expansion, not a row-constructor comparison, so mixed
     # asc/desc directions stay correct.
     assert "surname < ?" in sql
@@ -1472,7 +1503,7 @@ def test_keyset_asc_null_cursor_uses_is_not_null_not_bound_comparison():
         order_by=[OrderBy("surname", "asc")],
         after=(None, "h123"),
     )
-    sql, params = compile_query(PERSON, query)
+    sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
     assert "surname IS NOT NULL" in sql
     # The `NULL` cursor value itself is never bound as a `?` param for this
     # leg -- `col > ?` against a bound `NULL` would just be `UNKNOWN` again.
@@ -1510,7 +1541,7 @@ def test_keyset_desc_non_null_cursor_still_includes_null_rows():
         order_by=[OrderBy("surname", "desc")],
         after=("Smith", "h123"),
     )
-    sql, params = compile_query(PERSON, query)
+    sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
     assert "surname IS NULL OR" in sql
     assert "surname < ?" in sql
 
@@ -2634,7 +2665,8 @@ def test_desc_keyset_on_json_path_binds_every_placeholder():
     )
     sql, params = compile_query(PERSON, query, dialect=Dialect.SQLITE)
     assert sql.count("?") == len(params)
-    assert sql.count("json_extract(json_data, ?) IS NULL") == 1
+    # FIRST_NAME is a text JSON path, so the SQLite NOCASE default applies.
+    assert sql.count('json_extract(json_data, ?) COLLATE "NOCASE" IS NULL') == 1
 
 
 def test_desc_keyset_on_json_path_returns_the_right_rows():

@@ -526,6 +526,15 @@ list you've already narrowed down; slow as the default order of a big
 shared tree. See [What sorting costs](docs/where_expr.md#what-sorting-costs)
 for measurements.
 
+Text `order_by` columns sort case-insensitively (ASCII only) by default, so
+an uncapitalized surname prefix like "de Vos" or "von Hebel" interleaves
+with the rest of the alphabet instead of sorting after every "Z...". This
+holds on both the SQL path (SQLite's built-in `NOCASE` collation) and the
+evaluator/proxied path used under privacy filtering (a matching ASCII case
+fold) -- see ROADMAP.md's "Default `NOCASE` collation on the SQL path".
+It's ASCII-only case folding, not full locale collation, so accented
+letters aren't folded on either path.
+
 Every path you can filter on, you can also return — `father.surname`,
 `primary_name.surname_list[0].surname`, `birth.date.sortval`. Add `as
 <name>` to choose what the column is called in the result; without it, the

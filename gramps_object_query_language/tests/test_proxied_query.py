@@ -214,6 +214,52 @@ def _sql_rows(db, spec, query):
     return db.dbapi.fetchall()
 
 
+@pytest.fixture(scope="module")
+def nocase_paging_handles():
+    """Surnames spanning an uncapitalized prefix ("de Vos") through a
+    capital "Z" ("Zeller") -- regression fixture for the ASCII-`NOCASE`
+    collation default (ROADMAP.md's "Default `NOCASE` collation on the SQL
+    path"). Plain codepoint order would sort "de Vos"/"von Hebel" after
+    every capital-letter surname; both the SQL path (SQLite's built-in
+    `NOCASE`) and this evaluator path (`_null_safe_cmp`'s `_nocase_key`)
+    need to interleave them instead, and agree with each other while doing
+    it -- this is exactly the shape that broke `gramps-web-api`'s
+    SQL-vs-proxied parity test before the evaluator path got the matching
+    fix.
+    """
+    dbman = CLIDbManager(DbState())
+    dirpath, db_name = dbman.create_new_db_cli("_test_proxied_query_nocase", dbid="sqlite")
+    db = make_database("sqlite")
+    db.load(dirpath)
+
+    handles = {}
+    with DbTxn("setup", db) as trans:
+        for surname in ["Adler", "de Vos", "Baumann", "von Hebel", "Curtis", "zum Walde", "Zeller"]:
+            person = Person()
+            person.set_primary_name(_name("Pat", surname))
+            handles[surname] = db.add_person(person, trans)
+
+    yield db, handles
+
+    db.close()
+    dbman.remove_database(db_name)
+
+
+def test_run_query_nocase_default_matches_sql(nocase_paging_handles):
+    db, _handles = nocase_paging_handles
+    order_by = [OrderBy("surname", "asc")]
+    query = Query(select=["handle", "surname"], order_by=order_by, limit=100)
+    expected = _sql_rows(db, PERSON, query)
+    actual = run_query(
+        db, PERSON, None, order_by=order_by, limit=100, select=["handle", "surname"]
+    )
+    assert actual == expected
+    # Confirm NOCASE (not plain codepoint order) was actually exercised: "de
+    # Vos" ranks strictly before "Zeller", not after it.
+    surnames = [row[1] for row in actual]
+    assert surnames.index("de Vos") < surnames.index("Zeller")
+
+
 def test_run_query_order_by_matches_sql_asc(paging_handles):
     db, _handles = paging_handles
     order_by = [OrderBy("given_name", "asc")]

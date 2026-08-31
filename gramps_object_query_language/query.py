@@ -1844,12 +1844,32 @@ def _column_expr(
     reference to a column in `_POSTGRESQL_PHYSICAL_COLUMN_OVERRIDES` (e.g.
     `Media.desc`) needs the same physical-name mapping a `SELECT`/`WHERE`
     reference does.
+
+    When `collation` isn't given, text columns on SQLite (`dialect` is
+    `Dialect.SQLITE` or omitted -- SQLite is the default target) fall back
+    to `COLLATE NOCASE` rather than no `COLLATE` clause at all. Plain
+    binary/codepoint comparison sorts every lowercase letter after every
+    uppercase one, so a surname stored with an uncapitalized prefix
+    ("de Vos", "von Hebel") sorts after every "Z..." surname instead of
+    interleaving with them the way Gramps Desktop's locale-aware collator
+    does -- see ROADMAP.md's "Default NOCASE collation" note. `NOCASE` is
+    ASCII-only case folding, not full locale parity (it won't fold
+    accented letters), but it's built into SQLite and needs no connection
+    setup, unlike a real locale collation (`resources/object_query.py`'s
+    `_resolve_collation`), so it's a safe default with no caller wiring
+    required. PostgreSQL has no built-in `NOCASE` collation, so this
+    fallback is SQLite-only; an explicit `collation` is still required
+    there for the same fix.
     """
     sql, params = _render_column(
         column, spec, dialect, value=_cast_hint(ref_value_type(spec, column)), treeid=treeid
     )
-    if collation and _is_text_ref(column, spec):
-        return f'{sql} COLLATE "{collation}"', params
+    if _is_text_ref(column, spec):
+        effective_collation = collation or (
+            "NOCASE" if dialect in (None, Dialect.SQLITE) else None
+        )
+        if effective_collation:
+            return f'{sql} COLLATE "{effective_collation}"', params
     return sql, params
 
 
@@ -2050,7 +2070,13 @@ def compile_query(
     `collation`, if given, names a locale collation already ensured to exist
     on the connection (see `resources/object_query.py`'s `_resolve_collation`)
     and is applied to every text-typed `ORDER BY` column (and the matching
-    keyset comparisons) via `COLLATE "<collation>"`.
+    keyset comparisons) via `COLLATE "<collation>"`. Omitted (the default),
+    text columns still get `COLLATE "NOCASE"` on SQLite (see `_column_expr`)
+    -- ASCII case-folding built into SQLite itself, not full locale parity,
+    but enough to keep an uncapitalized surname prefix ("de Vos") from
+    sorting after every "Z..." surname instead of interleaving with them.
+    PostgreSQL has no built-in `NOCASE`, so an explicit `collation` is still
+    needed there for the same fix.
 
     A `select` entry given as a dotted/bracketed path string is resolved
     here (via `resolve_ref_string`) before rendering, so the same text
