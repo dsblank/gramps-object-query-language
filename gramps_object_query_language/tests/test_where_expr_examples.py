@@ -996,3 +996,43 @@ def test_select_path_matches_where_expr_resolution(db):
     [(select_ref, _key)] = parse_select(spec, ["birth.place.title"])
     _spec, where = compile_expr("Person", "birth.place.title == 'x'")
     assert select_ref == where.column
+
+
+# --- reverse references: backlinks (README cookbook additions) --------------
+#
+# `backlinks` comes from Gramps' own `reference` table, not from a
+# `note`/`person`/etc. row's own json_data, so these use a standalone
+# connection (like the count(children) readme examples above) rather than
+# the shared `db` fixture, which has no `reference` table.
+
+
+def _backlinks_conn():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE note (handle TEXT, json_data TEXT)")
+    conn.execute(
+        "CREATE TABLE reference (obj_handle TEXT, obj_class TEXT, ref_handle TEXT, ref_class TEXT)"
+    )
+    conn.execute("INSERT INTO note VALUES ('note-orphan', '{}')")
+    conn.execute("INSERT INTO note VALUES ('note-on-person', '{}')")
+    conn.execute("INSERT INTO note VALUES ('note-on-source', '{}')")
+    conn.execute(
+        "INSERT INTO reference VALUES ('person-1', 'Person', 'note-on-person', 'Note')"
+    )
+    conn.execute(
+        "INSERT INTO reference VALUES ('source-1', 'Source', 'note-on-source', 'Note')"
+    )
+    return conn
+
+
+def test_backlinks_orphan_notes_readme_example():
+    conn = _backlinks_conn()
+    result = run(conn, "Note", "not exists(backlinks)")
+    assert result == [("note-orphan",)]
+
+
+def test_backlinks_not_referenced_by_person_readme_example():
+    conn = _backlinks_conn()
+    result = run(
+        conn, "Note", "exists(backlinks) and not exists(backlinks, _class == 'Person')"
+    )
+    assert result == [("note-on-source",)]

@@ -597,6 +597,30 @@ for person in chicago_born:
 
 This is a "scan" in the sense that the inner loop isn't indexed or query-optimized — it's a plain walk over each matched person's own event list, run once per person. For a typical personal genealogy tree (a few hundred to a few thousand people), that's negligible. It only becomes noticeably slow on a large shared tree with tens of thousands of people, where doing this per-row lookup for every match adds up.
 
+### Goal: Find notes that aren't attached to anything
+
+```
+Note "not exists(backlinks)"
+```
+
+Every collection covered above reaches *outward* from a record --
+`children`, `notes`, and the rest. `backlinks` is the one that reaches the
+other way, asking "does anything else point to this record at all" --
+useful here for finding orphaned notes left behind after whatever they were
+once attached to (a person, a source, an event) was deleted or edited.
+
+### Goal: Find notes that are only referenced by sources, not by people
+
+```
+Note "exists(backlinks) and not exists(backlinks, _class == 'Person')"
+```
+
+`_class` is the one field a `backlinks` condition can test -- the
+referrer's own type (`"Person"`, `"Source"`, ...), matching the same
+`_class` name every record's serialized JSON already carries. Combined
+with `count(backlinks)` (which works exactly like `count(...)` above),
+`count(backlinks) > 1` is another way to ask "is this note shared by more
+than one record."
 
 ## Things GOQL can't do (yet)
 
