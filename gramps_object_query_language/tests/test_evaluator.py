@@ -59,9 +59,11 @@ from gramps_object_query_language.evaluator import (
 from gramps_object_query_language.query import (
     CITATION,
     FAMILY,
+    NOTE,
     PERSON,
     PLACE,
     And,
+    BacklinkClassFilter,
     CollectionCount,
     Contains,
     Eq,
@@ -787,3 +789,133 @@ def test_evaluate_where_citation_source_relationship(assoc_db_handles):
     ref = resolve_column_path(CITATION, ["source", "title"])
     assert resolve_column_ref(db, citation, ref, CITATION) == "Census Records"
     assert evaluate_where(db, citation, Eq(ref, "Census Records"), CITATION) is True
+
+
+# --- Backlinks (reverse references, via db.find_backlink_handles) ------------
+#
+# Kept in its own small, dedicated fixture (mirroring assoc_db_handles above)
+# rather than added onto db_handles -- the private Person here is purpose-
+# built for the proxy test below, and isolating it avoids perturbing any of
+# db_handles' own privacy-sensitive assertions elsewhere in this file.
+
+
+@pytest.fixture(scope="module")
+def backlinks_db_handles():
+    dbman = CLIDbManager(DbState())
+    dirpath, db_name = dbman.create_new_db_cli("_test_evaluator_backlinks", dbid="sqlite")
+    db = make_database("sqlite")
+    db.load(dirpath)
+
+    handles = {}
+    with DbTxn("setup", db) as trans:
+        referenced_note = Note()
+        referenced_note.set("Referenced by a person and a family.")
+        handles["referenced_note"] = db.add_note(referenced_note, trans)
+
+        orphan_note = Note()
+        orphan_note.set("Nothing points here.")
+        handles["orphan_note"] = db.add_note(orphan_note, trans)
+
+        person = Person()
+        person.set_primary_name(_name("Fred", "Blank"))
+        person.add_note(handles["referenced_note"])
+        handles["person"] = db.add_person(person, trans)
+
+        family = Family()
+        family.add_note(handles["referenced_note"])
+        handles["family"] = db.add_family(family, trans)
+
+        privately_referenced_note = Note()
+        privately_referenced_note.set("Only a private Person points here.")
+        handles["privately_referenced_note"] = db.add_note(privately_referenced_note, trans)
+
+        private_person = Person()
+        private_person.set_primary_name(_name("Secret", "Person"))
+        private_person.set_privacy(True)
+        private_person.add_note(handles["privately_referenced_note"])
+        handles["private_person"] = db.add_person(private_person, trans)
+
+    yield db, handles
+
+    db.close()
+    dbman.remove_database(db_name)
+
+
+@pytest.fixture(scope="module")
+def backlinks_proxy(backlinks_db_handles):
+    db, _handles = backlinks_db_handles
+    return PrivateProxyDb(db)
+
+
+def test_exists_backlinks_true_for_referenced_note(backlinks_db_handles):
+    db, handles = backlinks_db_handles
+    note = db.get_note_from_handle(handles["referenced_note"])
+    assert evaluate_where(db, note, Exists(resolve_collection(NOTE, "backlinks")), NOTE) is True
+
+
+def test_exists_backlinks_false_for_orphan_note(backlinks_db_handles):
+    db, handles = backlinks_db_handles
+    note = db.get_note_from_handle(handles["orphan_note"])
+    assert evaluate_where(db, note, Exists(resolve_collection(NOTE, "backlinks")), NOTE) is False
+
+
+def test_not_exists_backlinks_for_orphan_note(backlinks_db_handles):
+    db, handles = backlinks_db_handles
+    note = db.get_note_from_handle(handles["orphan_note"])
+    where = Not(Exists(resolve_collection(NOTE, "backlinks")))
+    assert evaluate_where(db, note, where, NOTE) is True
+
+
+def test_exists_backlinks_class_filter(backlinks_db_handles):
+    db, handles = backlinks_db_handles
+    note = db.get_note_from_handle(handles["referenced_note"])
+    backlinks = resolve_collection(NOTE, "backlinks")
+    assert evaluate_where(db, note, Exists(backlinks, BacklinkClassFilter("eq", "Person")), NOTE) is True
+    assert (
+        evaluate_where(db, note, Exists(backlinks, BacklinkClassFilter("eq", "Repository")), NOTE)
+        is False
+    )
+
+
+def test_exists_backlinks_class_filter_ne(backlinks_db_handles):
+    # referenced_note is pointed to by both a Person and a Family -- "not
+    # Person" still matches via the Family backlink.
+    db, handles = backlinks_db_handles
+    note = db.get_note_from_handle(handles["referenced_note"])
+    backlinks = resolve_collection(NOTE, "backlinks")
+    assert evaluate_where(db, note, Exists(backlinks, BacklinkClassFilter("ne", "Person")), NOTE) is True
+
+
+def test_exists_backlinks_class_filter_in(backlinks_db_handles):
+    db, handles = backlinks_db_handles
+    note = db.get_note_from_handle(handles["referenced_note"])
+    backlinks = resolve_collection(NOTE, "backlinks")
+    condition = BacklinkClassFilter("in", ["Person", "Family"])
+    assert evaluate_where(db, note, Exists(backlinks, condition), NOTE) is True
+    condition = BacklinkClassFilter("in", ["Repository", "Source"])
+    assert evaluate_where(db, note, Exists(backlinks, condition), NOTE) is False
+
+
+def test_count_backlinks(backlinks_db_handles):
+    db, handles = backlinks_db_handles
+    note = db.get_note_from_handle(handles["referenced_note"])
+    backlinks = resolve_collection(NOTE, "backlinks")
+    assert evaluate_where(db, note, Gt(CollectionCount(backlinks), 1), NOTE) is True
+    assert evaluate_where(db, note, Gt(CollectionCount(backlinks), 2), NOTE) is False
+
+
+def test_proxy_excludes_backlink_from_a_private_referrer(backlinks_db_handles, backlinks_proxy):
+    """A note referenced *only* by a private Person must show no backlinks
+    through the proxy, even though the raw db reports one -- PrivateProxyDb's
+    own `find_backlink_handles` override (gramps/gen/proxy/private.py)
+    already excludes a referrer that is itself private, and this module's
+    Backlinks handling calls that method directly (no separate privacy
+    guard of its own needed -- see this file's own module docstring).
+    """
+    db, handles = backlinks_db_handles
+    raw_note = db.get_note_from_handle(handles["privately_referenced_note"])
+    assert evaluate_where(db, raw_note, Exists(resolve_collection(NOTE, "backlinks")), NOTE) is True
+
+    proxied_note = backlinks_proxy.get_note_from_handle(handles["privately_referenced_note"])
+    where = Not(Exists(resolve_collection(NOTE, "backlinks")))
+    assert evaluate_where(backlinks_proxy, proxied_note, where, NOTE) is True
