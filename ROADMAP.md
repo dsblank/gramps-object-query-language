@@ -867,6 +867,79 @@ against the fixture's real underlying Gramps SQLite backend -- the one that
 gets the core `regexp` UDF for free rather than needing to mirror it by
 hand, and the one that originally caught the NULL-safety bug above.
 
+### Backlinks -- reverse references (`exists(backlinks)`, `count(backlinks)`)
+
+Implemented -- basic reverse lookup ("does anything point to this
+record", optionally narrowed by the referrer's own class), the first item
+in this project reaching *inward* rather than outward. Every existing
+`Collection` (`children`, `notes`, ...) is a list living in the *current*
+row's own `json_data`, pointing at one fixed target type; a backlink is
+neither -- it lives in Gramps core's own `reference(obj_handle, obj_class,
+ref_handle, ref_class)` table (`gramps/plugins/db/dbapi/dbapi.py`), and
+the referrer can be any of the ten primary types at once. So it's a
+sibling type, `Backlinks`, registered as `"backlinks"` on every table
+(`query.py`'s `_COLLECTIONS`, injected uniformly after the dict literal --
+even `Tag`, which has no forward collections of its own at all), dispatched
+on separately everywhere a `Collection` is (`Exists.compile`,
+`_render_collection_count`, and both evaluator.py's `Exists`/
+`CollectionCount` handling).
+
+**SQL side turned out simpler than every ordinary `Collection`, not
+harder.** `_backlinks_subquery_body` needs no per-dialect source function
+and no `dialect` argument at all -- `reference` is a plain relational
+table, identical on SQLite and PostgreSQL, unlike a JSON array that needs
+`json_each`/`jsonb_array_elements` to unnest. `reference.treeid = ?` is
+still appended when `treeid` is given, matching every other `Collection` --
+confirmed against the `SharedPostgreSQL` addon's own `shareddbapi.py`,
+whose `reference` table (unlike the single-tree `dbapi` backend's) is
+itself tenant-scoped by a real `treeid` column, with `find_backlink_
+handles` there filtering `... AND treeid = ?` internally already.
+
+**Condition support is deliberately narrow: `_class` only, no richer field
+access.** `Backlinks` has no single target type to resolve a path like
+`primary_name.surname` against (see the "Reverse relationships" gap above,
+still open) -- so its condition is a new, self-contained
+`BacklinkClassFilter(op, value)` (`op` one of `"eq"`/`"ne"`/`"in"`),
+translated by a dedicated `_translate_backlinks_condition` in
+`query_lang.py` rather than routed through the general `_translate_top_
+level`/`resolve_column_path` machinery every other collection's condition
+uses. `_class` (not `obj_class`, the physical `reference` row's own column
+name) matches the field name every object's own serialized JSON already
+uses for its type, so `exists(backlinks, _class == "Person")` reads
+consistently with ordinary `where_expr` field access -- the `obj_class`
+naming is kept an implementation detail of `_backlinks_subquery_body`/
+`evaluator.py`'s `_backlink_handles`, never surfaced to a `where_expr`
+author. Comprehension sugar needed zero new code: `_ComprehensionDesugarer`
+already rewrites `any(elt for x in <bare-name> if ...)` into `exists(name,
+elt-and-ifs)` purely syntactically, before `resolve_collection` is ever
+consulted, so `any(obj for obj in backlinks if obj._class == "Person")`
+works the moment `"backlinks"` itself resolves.
+
+**Privacy needed no new design, only a second code path covered.**
+gramps-web-api separates by permission *before* either of this project's
+two execution paths ever runs (a caller with `PERM_VIEW_PRIVATE` gets
+`query.py`'s SQL compiler against the real db; everyone else gets
+`evaluator.py`'s pure-Python path against a `PrivateProxyDb`-wrapped one) --
+nothing in `query.py` filters privacy for any `Collection` either, by the
+same reasoning. `evaluator.py`'s new `_backlink_handles` calls
+`db.find_backlink_handles` directly, the same way every other relationship
+on that path calls its own `db.get_*` getter -- and inherits privacy
+filtering "for free" purely because `db` is already the proxy:
+`PrivateProxyDb.find_backlink_handles` (`gramps/gen/proxy/private.py`)
+already excludes a referrer that is itself private before this module ever
+sees it. (One pre-existing gap inherited from core Gramps, not introduced
+here: that override's own comment admits it doesn't check whether the
+*reference itself* is private, e.g. a private `MediaRef` on a non-private
+object -- only whether the referrer as a whole is.)
+
+Verified three ways: SQL-shape assertions including the no-dialect-required
+case and `treeid` scoping (`test_query.py`), real end-to-end SQLite
+execution against an actual `reference` table (`test_query.py`,
+`test_query_lang.py`), and an evaluator unit-test section against a real
+temporary Gramps database, including a `PrivateProxyDb` test confirming a
+privately-referenced Note shows no backlinks through the proxy while the
+raw db still reports one (`test_evaluator.py`).
+
 ## Possibilities
 
 ### `len()` / array-length comparisons
@@ -1337,19 +1410,20 @@ it" rule).
   `WITH` CTE or binding the subquery's result once), a general
   optimization rather than anything specific to chaining or operand
   ordering.
-- **Reverse relationships** (e.g. "which `Person` references this
-  `Event`") -- not supported at all today; every relationship/collection
-  here only reaches *outward* from the owning record (`Person` -> `events`
-  -> `Event`), never the other direction. Gramps core (`find_backlink_handles`)
-  already maintains a general `reference(ref_handle, obj_class, ...)` table
-  for exactly this, and [gramps-project/gramps#2324](https://github.com/gramps-project/gramps/pull/2324)
-  added a composite index on `(ref_handle, obj_class)` plus SQL-pushdown for
-  the `obj_class` filter, making that table efficiently queryable by class.
-  This project doesn't touch `find_backlink_handles`/the `reference` table
-  anywhere today (checked -- no references in the codebase), so adopting it
-  would be a genuinely new query *direction*, not a speedup of anything that
-  exists here now -- and a separate design effort from the
-  `event(EventType.X)` item above, which stays a forward-only relationship.
+- **Reverse relationships, reaching past the referrer's own class** (e.g.
+  "a Note referenced by a Person whose surname is Smith") -- basic reverse
+  lookup shipped (see "Backlinks" in Done below: `exists(backlinks)`,
+  `exists(backlinks, _class == "Person")`), but a condition still can't
+  reach *into* the referrer's own fields (`primary_name.surname`) the way
+  an ordinary `Collection`'s condition reaches into its target type's
+  fields. The physical `reference` table (`obj_handle, obj_class,
+  ref_handle, ref_class`) has no such fields to offer directly -- doing
+  this would mean a genuine two-hop join (confirm the class via
+  `reference`, then join again into that class's own table), and probably
+  wants to be per-class (`person_backlinks`, `family_backlinks`, ...)
+  rather than one polymorphic `backlinks`, so each has a single fixed
+  target type the same way every ordinary `Collection` already does. No
+  concrete consumer yet -- left as a separate, bigger design effort.
 
 ### Rough difficulty survey of unsupported `where_expr` shapes
 

@@ -390,6 +390,46 @@ verbatim, just wrapped as `(SELECT COUNT(*) FROM ...)` instead of
 at all) is `0`, not `NULL`, the same way `COUNT(*)` over zero matching rows
 always is in SQL.
 
+## Reverse references: `exists(backlinks)`
+
+Every collection above reaches *outward* -- a family's own `children`, a
+person's own `notes`. `backlinks` is the one collection that reaches the
+other way: "does anything else point to *this* record at all?" It's
+registered on every one of the ten record types the same way the
+collections above are -- even `Tag`, which (unlike every collection in the
+table above) has no *forward* collections of its own -- but it isn't a
+field on the row itself the way `note_list`/`child_ref_list`/etc. are; it
+comes from Gramps' own `reference` table, the same index
+`find_backlink_handles()` uses internally to answer "what points here":
+
+```python
+Note "not exists(backlinks)"
+Note "exists(backlinks, _class == 'Person')"
+Note "exists(backlinks) and count(backlinks) > 1"
+```
+
+`_class` is the one field a `backlinks` condition can test -- the
+referrer's own type (`"Person"`, `"Family"`, ...), matching the same field
+name every record's own serialized JSON already uses for its type. Unlike
+`children`/`notes`/every other collection above, `backlinks` has no single
+target type to reach further into -- a backlink's referrer can be any of
+the ten record types at once -- so `_class` can't be followed any deeper
+(`_class.primary_name` isn't supported): `==`/`!=`/`is`/`is not`/`in`
+against a class-name string (or a list of them, for `in`) is the whole
+vocabulary:
+
+```python
+Note "exists(backlinks, _class in ['Person', 'Family'])"
+Note "exists(backlinks, _class != 'Media')"
+```
+
+`count(backlinks)` works exactly like `count(...)` above -- `count(backlinks)
+== 0` is another way to spell `not exists(backlinks)`. Reaching into the
+referrer's own fields beyond its class (e.g. a Note referenced by a Person
+whose surname is Smith) isn't supported yet -- see `ROADMAP.md`'s "Reverse
+relationships" item for why that needs a genuinely different, per-class
+construct rather than a straightforward extension of this one.
+
 ## Comprehension sugar: `any(...)` and `len([...])`
 
 `exists(children, given_name == 'Steve')` reads reasonably close to plain

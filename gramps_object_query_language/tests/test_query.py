@@ -33,6 +33,8 @@ from gramps_object_query_language.query import (
     SOURCE,
     TAG,
     And,
+    BacklinkClassFilter,
+    Backlinks,
     Collection,
     CollectionCount,
     ColumnIndex,
@@ -1926,6 +1928,135 @@ def test_collection_count_end_to_end_sqlite_execution():
     assert conn.execute(sql, params).fetchall() == [("fam-3kids",)]
 
 
+# --- Backlinks (reverse references, via Gramps' own `reference` table) --------
+
+
+def test_backlinks_exists_no_dialect_required():
+    # Unlike every Collection's Exists (test_exists_requires_dialect above),
+    # a Backlinks EXISTS needs no dialect at all -- `reference` is a plain
+    # relational table, identical on both backends, so there's no JSON-array
+    # unnesting syntax to choose between.
+    backlinks = resolve_collection(NOTE, "backlinks")
+    sql, params = compile_query(NOTE, Query(select=["handle"], where=Exists(backlinks)))
+    assert "EXISTS (SELECT 1 FROM reference WHERE reference.ref_handle = note.handle)" in sql
+    assert params == [50]
+
+
+def test_backlinks_exists_class_filter_shape():
+    backlinks = resolve_collection(NOTE, "backlinks")
+    sql, params = compile_query(
+        NOTE,
+        Query(select=["handle"], where=Exists(backlinks, BacklinkClassFilter("eq", "Person"))),
+        dialect=Dialect.SQLITE,
+    )
+    assert (
+        "EXISTS (SELECT 1 FROM reference WHERE reference.ref_handle = note.handle "
+        "AND reference.obj_class = ?)" in sql
+    )
+    assert params == ["Person", 50]
+
+
+def test_backlinks_exists_class_filter_ne_and_in_shapes():
+    backlinks = resolve_collection(NOTE, "backlinks")
+    sql, params = compile_query(
+        NOTE,
+        Query(select=["handle"], where=Exists(backlinks, BacklinkClassFilter("ne", "Person"))),
+        dialect=Dialect.SQLITE,
+    )
+    assert "reference.obj_class != ?" in sql
+    assert params == ["Person", 50]
+
+    sql, params = compile_query(
+        NOTE,
+        Query(
+            select=["handle"],
+            where=Exists(backlinks, BacklinkClassFilter("in", ["Person", "Family"])),
+        ),
+        dialect=Dialect.SQLITE,
+    )
+    assert "reference.obj_class IN (?, ?)" in sql
+    assert params == ["Person", "Family", 50]
+
+
+def test_backlinks_treeid_scoping():
+    # Only meaningful under the SharedPostgreSQL addon, whose `reference`
+    # table (unlike the single-tree dbapi backend's) is itself tenant-scoped
+    # -- see _backlinks_subquery_body's own comment.
+    backlinks = resolve_collection(NOTE, "backlinks")
+    sql, params = compile_query(
+        NOTE, Query(select=["handle"], where=Exists(backlinks)), dialect=Dialect.SQLITE, treeid=7
+    )
+    assert "reference.treeid = ?" in sql
+    # 7 twice: once for the subquery's own reference.treeid, once for the
+    # outer note query's own treeid scoping (compile_query's own -- see its
+    # docstring: "AND treeid = ? is appended unconditionally whenever
+    # treeid is given").
+    assert params == [7, 7, 50]
+
+
+def test_backlinks_count_shape():
+    backlinks = resolve_collection(NOTE, "backlinks")
+    sql, params = compile_query(
+        NOTE,
+        Query(select=["handle"], where=Gt(CollectionCount(backlinks), 1)),
+        dialect=Dialect.SQLITE,
+    )
+    assert "(SELECT COUNT(*) FROM reference WHERE reference.ref_handle = note.handle)" in sql
+    assert params == [1, 50]
+
+
+def test_not_exists_backlinks_compiles():
+    backlinks = resolve_collection(NOTE, "backlinks")
+    sql, params = compile_query(
+        NOTE, Query(select=["handle"], where=Not(Exists(backlinks))), dialect=Dialect.SQLITE
+    )
+    assert "NOT (EXISTS (SELECT 1 FROM reference WHERE reference.ref_handle = note.handle))" in sql
+
+
+def test_backlinks_end_to_end_sqlite_execution():
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE note (handle TEXT, json_data TEXT)")
+    conn.execute(
+        "CREATE TABLE reference (obj_handle TEXT, obj_class TEXT, ref_handle TEXT, ref_class TEXT)"
+    )
+    conn.execute("INSERT INTO note VALUES ('note-referenced', '{}')")
+    conn.execute("INSERT INTO note VALUES ('note-orphan', '{}')")
+    conn.execute(
+        "INSERT INTO reference VALUES ('person-1', 'Person', 'note-referenced', 'Note')"
+    )
+    conn.execute(
+        "INSERT INTO reference VALUES ('family-1', 'Family', 'note-referenced', 'Note')"
+    )
+
+    backlinks = resolve_collection(NOTE, "backlinks")
+
+    sql, params = compile_query(
+        NOTE, Query(select=["handle"], where=Not(Exists(backlinks))), dialect=Dialect.SQLITE
+    )
+    assert conn.execute(sql, params).fetchall() == [("note-orphan",)]
+
+    sql, params = compile_query(
+        NOTE,
+        Query(select=["handle"], where=Exists(backlinks, BacklinkClassFilter("eq", "Person"))),
+        dialect=Dialect.SQLITE,
+    )
+    assert conn.execute(sql, params).fetchall() == [("note-referenced",)]
+
+    sql, params = compile_query(
+        NOTE,
+        Query(select=["handle"], where=Exists(backlinks, BacklinkClassFilter("eq", "Repository"))),
+        dialect=Dialect.SQLITE,
+    )
+    assert conn.execute(sql, params).fetchall() == []
+
+    sql, params = compile_query(
+        NOTE, Query(select=["handle"], where=Gt(CollectionCount(backlinks), 1)), dialect=Dialect.SQLITE
+    )
+    assert conn.execute(sql, params).fetchall() == [("note-referenced",)]
+
+
 # --- Expanded Collection registry (all ten primary types) ---------------------
 #
 # `children`/`notes` proved out the two `Collection` shapes (ref-object list
@@ -1989,7 +2120,12 @@ def test_expanded_collection_registry_shapes(spec_and_name, expected):
 def test_expanded_collection_registry_exhaustive():
     # Every table's registered names match _EXPECTED_COLLECTIONS exactly --
     # catches an accidental extra/missing registration that a per-name test
-    # above wouldn't (it only checks names it's told to look for).
+    # above wouldn't (it only checks names it's told to look for). "backlinks"
+    # is excluded here and checked separately (test_backlinks_registered_on_
+    # every_table below) -- it's a Backlinks, not a Collection, so it doesn't
+    # fit _EXPECTED_COLLECTIONS' (target, key, ref_field) shape, and it's
+    # registered on every table uniformly rather than varying per type the
+    # way every entry in _EXPECTED_COLLECTIONS does.
     import gramps_object_query_language.query as query_module
 
     actual = {
@@ -2006,20 +2142,34 @@ def test_expanded_collection_registry_exhaustive():
                 REPOSITORY.table: REPOSITORY,
                 MEDIA.table: MEDIA,
                 NOTE.table: NOTE,
+                TAG.table: TAG,
             }[table]
         ]
         for name in names
+        if name != "backlinks"
     }
     assert actual == set(_EXPECTED_COLLECTIONS)
 
 
-def test_tag_has_no_collections_registered():
+def test_backlinks_registered_on_every_table():
+    # Unlike every Collection above (which varies per type), "backlinks" is
+    # injected uniformly onto all ten primary types -- even Tag, which (see
+    # test_tag_has_only_backlinks_registered below) has no forward
+    # collections of its own at all.
+    for spec in (PERSON, FAMILY, EVENT, PLACE, SOURCE, CITATION, REPOSITORY, MEDIA, NOTE, TAG):
+        backlinks = resolve_collection(spec, "backlinks")
+        assert isinstance(backlinks, Backlinks)
+        assert backlinks.name == "backlinks"
+
+
+def test_tag_has_only_backlinks_registered():
     # Tag is the one primary type with no note_list/citation_list/media_list/
     # tag_list of its own (a tag doesn't tag itself) and no other one-to-many
-    # field -- confirm it's absent from the registry entirely, not just empty.
+    # field -- "backlinks" (registered on every type, see the test just
+    # above) is its only entry.
     import gramps_object_query_language.query as query_module
 
-    assert TAG.table not in query_module._COLLECTIONS
+    assert set(query_module._COLLECTIONS[TAG.table]) == {"backlinks"}
 
 
 # --- Citation.source (one-to-one, Citation -> Source) --------------------------

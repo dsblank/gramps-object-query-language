@@ -1676,6 +1676,160 @@ def test_compile_expr_self_referencing_collection_end_to_end_sqlite_execution():
     assert conn.execute(sql, params).fetchall() == [("alice",)]
 
 
+# --- backlinks (reverse references) ---------------------------------------------
+
+
+def test_backlinks_no_condition():
+    result = parse_expr("note", "not exists(backlinks)")
+    assert result == [{"not": {"exists": {"relationship": "backlinks"}}}]
+
+
+def test_backlinks_class_filter_eq():
+    result = parse_expr("note", 'exists(backlinks, _class == "Person")')
+    assert result == [
+        {
+            "exists": {
+                "relationship": "backlinks",
+                "where": [{"column": "_class", "op": "eq", "value": "Person"}],
+            }
+        }
+    ]
+
+
+def test_backlinks_class_filter_ne():
+    result = parse_expr("note", 'exists(backlinks, _class != "Person")')
+    assert result == [
+        {
+            "exists": {
+                "relationship": "backlinks",
+                "where": [{"column": "_class", "op": "ne", "value": "Person"}],
+            }
+        }
+    ]
+
+
+def test_backlinks_class_filter_in():
+    result = parse_expr("note", 'exists(backlinks, _class in ["Person", "Family"])')
+    assert result == [
+        {
+            "exists": {
+                "relationship": "backlinks",
+                "where": [{"column": "_class", "op": "in", "value": ["Person", "Family"]}],
+            }
+        }
+    ]
+
+
+def test_backlinks_class_filter_operand_order_flips():
+    # The literal happened to be written on the left -- same flip-order
+    # support every other comparison gets (see the operand-ordering tests
+    # above), for consistency, even though nobody's likely to write it this
+    # way in practice.
+    result = parse_expr("note", 'exists(backlinks, "Person" == _class)')
+    assert result == [
+        {
+            "exists": {
+                "relationship": "backlinks",
+                "where": [{"column": "_class", "op": "eq", "value": "Person"}],
+            }
+        }
+    ]
+
+
+def test_backlinks_class_filter_is_and_is_not_sugar():
+    result = parse_expr("note", 'exists(backlinks, _class is "Person")')
+    assert result == [
+        {
+            "exists": {
+                "relationship": "backlinks",
+                "where": [{"column": "_class", "op": "eq", "value": "Person"}],
+            }
+        }
+    ]
+    result = parse_expr("note", 'exists(backlinks, _class is not "Person")')
+    assert result == [
+        {
+            "exists": {
+                "relationship": "backlinks",
+                "where": [{"column": "_class", "op": "ne", "value": "Person"}],
+            }
+        }
+    ]
+
+
+def test_backlinks_count():
+    result = parse_expr("note", "count(backlinks) == 0")
+    assert result == [
+        {"column": {"count_of": {"relationship": "backlinks"}}, "op": "eq", "value": 0}
+    ]
+
+
+def test_backlinks_comprehension_sugar():
+    # Needs no dedicated support in _ComprehensionDesugarer -- it already
+    # rewrites any(elt for x in <bare-name> if ...) into exists(<name>,
+    # <condition>) purely syntactically, before resolve_collection is ever
+    # consulted, so this works the moment "backlinks" itself resolves.
+    result = parse_expr("note", 'any(obj for obj in backlinks if obj._class == "Person")')
+    assert result == [
+        {
+            "exists": {
+                "relationship": "backlinks",
+                "where": [{"column": "_class", "op": "eq", "value": "Person"}],
+            }
+        }
+    ]
+
+
+def test_backlinks_condition_must_be_single_comparison():
+    with pytest.raises(QueryLangError):
+        parse_expr("note", 'exists(backlinks, _class == "Person" or _class == "Family")')
+    with pytest.raises(QueryLangError):
+        parse_expr("note", "exists(backlinks, gender == 1)")
+
+
+def test_backlinks_condition_field_must_be_class():
+    with pytest.raises(QueryLangError):
+        parse_expr("note", 'exists(backlinks, text.string == "hello")')
+
+
+def test_backlinks_condition_only_supports_eq_ne_in():
+    with pytest.raises(QueryLangError):
+        parse_expr("note", 'exists(backlinks, _class < "Person")')
+
+
+def test_backlinks_condition_value_must_be_string():
+    with pytest.raises(QueryLangError):
+        parse_expr("note", "exists(backlinks, _class == 1)")
+
+
+def test_backlinks_in_requires_class_on_left():
+    with pytest.raises(QueryLangError):
+        parse_expr("note", 'exists(backlinks, "Person" in _class)')
+
+
+def test_compile_expr_backlinks_end_to_end_sqlite_execution():
+    import sqlite3
+
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE note (handle TEXT, json_data TEXT)")
+    conn.execute(
+        "CREATE TABLE reference (obj_handle TEXT, obj_class TEXT, ref_handle TEXT, ref_class TEXT)"
+    )
+    conn.execute("INSERT INTO note VALUES ('note-referenced', '{}')")
+    conn.execute("INSERT INTO note VALUES ('note-orphan', '{}')")
+    conn.execute("INSERT INTO reference VALUES ('person-1', 'Person', 'note-referenced', 'Note')")
+
+    spec, where = compile_expr("note", "not exists(backlinks)")
+    sql, params = compile_query(spec, Query(select=["handle"], where=where), dialect=Dialect.SQLITE)
+    assert conn.execute(sql, params).fetchall() == [("note-orphan",)]
+
+    spec, where = compile_expr("note", 'exists(backlinks, _class == "Person")')
+    sql, params = compile_query(spec, Query(select=["handle"], where=where), dialect=Dialect.SQLITE)
+    assert conn.execute(sql, params).fetchall() == [("note-referenced",)]
+
+
 # --- select entries -----------------------------------------------------------
 #
 # `parse_select` is the `select` counterpart to `parse_expr`'s `where_expr`:
