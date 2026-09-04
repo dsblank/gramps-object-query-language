@@ -710,6 +710,17 @@ def resolve_column_path(
     if not segments:
         raise QueryError("empty column path")
     head, *rest = segments
+    # Checked before the relationship branch below: a handful of names
+    # (`event.place`, `place.enclosed_by`) are *both* a real flat column
+    # (the raw handle, stored under that exact name -- see `_spec_for`'s
+    # `extra_columns` and each type's own secondary fields) and a
+    # relationship name reaching the same handle's target row. With
+    # nothing after it, `place` unambiguously means "the handle itself" --
+    # there's no other value it could mean -- so the flat-column reading
+    # wins outright rather than being rejected in favor of a `place.<field>`
+    # error message that ignores a valid answer sitting right there.
+    if len(segments) == 1 and isinstance(head, str) and head in spec.columns:
+        return head
     relationships = _RELATIONSHIPS.get(spec.table, {})
     if isinstance(head, str) and head in relationships:
         if not rest:
@@ -720,8 +731,6 @@ def resolve_column_path(
         target_spec, handle_ref = relationships[head]
         field = resolve_column_path(target_spec, rest)
         return RelatedObject(name=head, target=target_spec, handle_ref=handle_ref, field=field)
-    if len(segments) == 1 and isinstance(head, str) and head in spec.columns:
-        return head
     # Not a flat column and not a relationship -- so it's a path into
     # `json_data`, checked against the type's own Gramps JSON Schema
     # before it's built (see `walk_schema`). An unknown path is a mistake,

@@ -370,9 +370,25 @@ def test_resolve_column_path_two_hop_chain():
 
 
 def test_resolve_column_path_no_relationships_on_place():
-    # PLACE has no registered relationships -- a path through it just
-    # resolves as a flat column or JsonPath, same as any other type.
+    # PLACE's only registered relationship is the "enclosed_by"
+    # self-reference (see the Place.enclosed_by section below) -- a path
+    # through any other name just resolves as a flat column or JsonPath,
+    # same as any other type.
     assert resolve_column_path(PLACE, ["title"]) == "title"
+
+
+def test_resolve_column_path_bare_name_prefers_flat_column_over_relationship():
+    # "place" is both Event's real flat handle column and a registered
+    # relationship (Event -> Place) -- with nothing after it, there's only
+    # one sensible value ("the handle itself"), so the flat-column reading
+    # wins instead of being rejected the way a relationship-only name like
+    # "birth" is (see test_resolve_column_path_bare_relationship_name_rejected).
+    # Regression test: this used to always raise, even for the bare case,
+    # because the relationship check ran first.
+    assert resolve_column_path(EVENT, ["place"]) == "place"
+    # Same collision, same fix, on Place.enclosed_by (see the dedicated
+    # section below for its two-hop/self-reference behavior).
+    assert resolve_column_path(PLACE, ["enclosed_by"]) == "enclosed_by"
 
 
 # --- RelatedObject rendering (select) -------------------------------------------
