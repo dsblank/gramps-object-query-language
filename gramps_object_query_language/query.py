@@ -70,6 +70,7 @@ class ObjectTypeSpec:
     table: str
     columns: frozenset[str]
     text_columns: frozenset[str]
+    bool_columns: frozenset[str]
     cls: type[TableObject]
 
 
@@ -80,10 +81,12 @@ def _spec_for(
 
     Kept in sync with core rather than hardcoded, since this *is* the set of
     columns that exist as real SQL columns on the table. `text_columns` (the
-    subset eligible for a locale `COLLATE` clause -- see `compile_query`) is
-    derived the same way: every `extra_columns` entry is text today
-    (`given_name`/`surname`/`enclosed_by`), and `get_secondary_fields()`
-    already tags each field's SQL type.
+    subset eligible for a locale `COLLATE` clause -- see `compile_query`) and
+    `bool_columns` (the subset needing a bool->int literal coercion -- see
+    `_needs_bool_to_int_coercion`) are derived the same way: every
+    `extra_columns` entry is text today (`given_name`/`surname`/
+    `enclosed_by`), and `get_secondary_fields()` already tags each field's
+    SQL type.
     """
     fields = list(cls.get_secondary_fields())
     columns = frozenset(field for field, _, _ in fields) | extra_columns
@@ -91,10 +94,14 @@ def _spec_for(
         frozenset(field for field, schema_type, _ in fields if schema_type == "string")
         | extra_columns
     )
+    bool_columns = frozenset(
+        field for field, schema_type, _ in fields if schema_type == "boolean"
+    )
     return ObjectTypeSpec(
         table=cls.__name__.lower(),
         columns=columns,
         text_columns=text_columns,
+        bool_columns=bool_columns,
         cls=cls,
     )
 
@@ -1210,6 +1217,29 @@ _ORDERING_OPS = frozenset({"<", "<=", ">", ">="})
 _NULL_SAFE_OPS = {"=": "IS NOT DISTINCT FROM", "!=": "IS DISTINCT FROM"}
 
 
+def _coerce_bool_literal(column: ColumnRef, value: Any, spec: ObjectTypeSpec) -> Any:
+    """`value`, with a Python `bool` converted to `int` if `column` is a flat
+    (non-JSON) secondary column of `boolean` schema type -- e.g. `private`.
+
+    Those columns are physically `INTEGER` (0/1) on every backend (Gramps'
+    own SQLite dbapi backend and every other dbapi addon derive column DDL
+    the same way: `boolean` schema type -> `INTEGER`, since SQLite has no
+    native boolean type), never a real SQL `BOOLEAN`. SQLite tolerates a
+    Python `bool` param against an `INTEGER` column (it coerces `True`/
+    `False` to `1`/`0` itself), but PostgreSQL is strictly typed and raises
+    `operator does not exist: integer = boolean`. `JsonPath`/`RelatedObject`
+    reach into `json_data` instead, where a JSON boolean round-trips
+    correctly (see `_render_json_path`'s own bool handling) and needs no
+    coercion here.
+    """
+    if not isinstance(value, bool):
+        return value
+    name = column.name if isinstance(column, FlatColumnRef) else column
+    if isinstance(name, str) and name in spec.bool_columns:
+        return int(value)
+    return value
+
+
 class Comparison:
     """Base class for single-column comparison leaves (`Eq`, `Lt`, ...).
 
@@ -1266,7 +1296,8 @@ class Comparison:
             comparison_params = column_params + value_params
         else:
             comparison_sql = f"{column_sql} {sql_op} ?"
-            comparison_params = column_params + [self.value]
+            literal = _coerce_bool_literal(self.column, self.value, spec)
+            comparison_params = column_params + [literal]
         return comparison_sql, comparison_params
 
     def __eq__(self, other: object) -> bool:
@@ -1452,7 +1483,8 @@ class In:
             self.column, spec, dialect, value=self.values[0], treeid=treeid
         )
         placeholders = ", ".join(["?"] * len(self.values))
-        return f"{column_sql} IN ({placeholders})", column_params + list(self.values)
+        literals = [_coerce_bool_literal(self.column, v, spec) for v in self.values]
+        return f"{column_sql} IN ({placeholders})", column_params + literals
 
     def __eq__(self, other: object) -> bool:
         return (

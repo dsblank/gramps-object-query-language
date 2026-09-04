@@ -272,6 +272,47 @@ def test_compile_query_jsonpath_where_eq_bool_postgresql_casts_to_boolean():
     assert params == ["private", True, 50]
 
 
+def test_compile_flat_bool_column_where_eq_postgresql_casts_to_int():
+    # `private` is a flat secondary column, physically INTEGER on every
+    # backend (SQLite has no native boolean type, so `boolean`-schema
+    # secondary fields are stored as 0/1 -- see `_spec_for`'s
+    # `bool_columns`). PostgreSQL is strictly typed and rejects `integer =
+    # boolean`, so a Python bool literal must be coerced to int for a flat
+    # column (unlike a JsonPath, which extracts into `json_data` where a
+    # JSON boolean round-trips correctly -- see the sibling `..._jsonpath_
+    # where_eq_bool_postgresql_casts_to_boolean` test above).
+    query = Query(select=["handle"], where=Eq("private", False))
+    sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
+    assert "private IS NOT DISTINCT FROM ?" in sql
+    assert params[0] == 0
+    assert type(params[0]) is int
+
+
+def test_compile_flat_bool_column_where_eq_sqlite_also_casts_to_int():
+    # SQLite tolerates a bool param against an INTEGER column (it coerces
+    # True/False to 1/0 itself), but coercing here too keeps behavior
+    # dialect-independent and the physical param type honest.
+    query = Query(select=["handle"], where=Eq("private", True))
+    sql, params = compile_query(PERSON, query, dialect=Dialect.SQLITE)
+    assert params[0] == 1
+    assert type(params[0]) is int
+
+
+def test_compile_flat_bool_column_where_in_postgresql_casts_to_int():
+    query = Query(select=["handle"], where=In("private", [True, False]))
+    sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
+    assert params[0] == 1 and type(params[0]) is int
+    assert params[1] == 0 and type(params[1]) is int
+
+
+def test_compile_flat_non_bool_column_where_eq_unaffected():
+    # A non-bool flat column's literal is passed through untouched --
+    # coercion only kicks in for `bool_columns` members.
+    query = Query(select=["handle"], where=Eq("surname", "Smith"))
+    sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
+    assert params[0] == "Smith"
+
+
 def test_compile_query_jsonpath_where_eq_str_postgresql_stays_text():
     path = JsonPath(("primary_name", "first_name"))
     query = Query(select=["handle"], where=Eq(path, "Root"))
