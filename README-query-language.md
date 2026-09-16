@@ -341,6 +341,21 @@ particular position in the list was filled in
 (`primary_name.surname_list[1].surname != None`), which only really answers
 "two or more" and breaks down for "three or more."
 
+### Goal: Find people with an alternate name recorded as "Doyle"
+
+```
+Person "any(alternate_names, first_name == 'Doyle')"
+```
+
+`alternate_names` -- a person's names beyond the primary one (a maiden
+name, a name used before marriage, an anglicized name, ...) -- isn't a
+collection like `notes`/`citations`: each one only ever exists embedded in
+the person record itself, with no page of its own. `any(path, condition)`
+is for exactly this: a condition on *one element* of a plain list already
+living on the record, not a search across another table. `any(path)` alone
+(no condition) just asks "is there at least one at all," identical to
+`len(path) > 0`.
+
 ### Goal: Find families that have a child named Steve
 
 ```

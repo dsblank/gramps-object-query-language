@@ -61,6 +61,8 @@ from .query import (
     Exists,
     FlatColumnRef,
     In,
+    JsonArrayCount,
+    JsonArrayExists,
     JsonPath,
     Length,
     Not,
@@ -167,7 +169,17 @@ def get_json_path(obj: Any, path: JsonPath) -> Any:
     path navigates via `json_extract`/`->` against the stored `json_data`
     column -- using it here keeps the two paths interpreting a `JsonPath`
     identically without hand-duplicating that shape.
+
+    `base_column == "je.value"` marks a field inside an `any(...)`/
+    `len(..., condition)` condition (see `resolve_any_path`/
+    `resolve_column_path` in query.py) -- there, `obj` *is* already one
+    array element's raw dict (no real Gramps object exists per element,
+    see `_json_array_items`), so it's walked directly, skipping
+    `object_to_dict()` (which expects a real Gramps object, not a plain
+    dict already in the JSON shape it would otherwise produce).
     """
+    if path.base_column == "je.value":
+        return _walk_json_path(obj, path.segments, obj)
     if path.base_column != "json_data":
         raise ValueError(f"unsupported JsonPath base column: {path.base_column!r}")
     data = json_utils.object_to_dict(obj)
@@ -210,6 +222,8 @@ def resolve_column_ref(db: Any, obj: Any, ref: ColumnRef, spec: ObjectTypeSpec) 
         return _collection_count(db, obj, ref)
     if isinstance(ref, Length):
         return _length_of(db, obj, ref, spec)
+    if isinstance(ref, JsonArrayCount):
+        return _json_array_count(db, obj, ref, spec)
     if isinstance(ref, FlatColumnRef):
         return get_flat_column(obj, ref.name, spec)
     return get_flat_column(obj, ref, spec)
@@ -301,6 +315,35 @@ def _length_of(db: Any, obj: Any, length: Length, spec: ObjectTypeSpec) -> int:
     """
     value = resolve_column_ref(db, obj, length.inner, spec)
     return len(value) if isinstance(value, list) else 0
+
+
+def _json_array_items(db: Any, obj: Any, array: ColumnRef, spec: ObjectTypeSpec) -> list:
+    """The raw list of dicts `array` (a `JsonPath`, or a `RelatedObject`
+    chain ending in one -- see query.py's `resolve_any_path`) resolves to
+    on `obj` -- shared by `JsonArrayExists`/`JsonArrayCount`'s own evaluator
+    counterparts. Reuses `resolve_column_ref` verbatim, so a relationship-
+    crossing array (`father.attribute_list`) gets the same privacy-
+    respecting hop (`_resolve_related_object`) any other `RelatedObject`
+    field already does, with no separate handling needed here. A missing
+    path or a non-list value both come back as `[]`, matching `Length`'s
+    own "missing/non-array is 0" reasoning one level up (`any`/`len` over
+    nothing to iterate is simply nothing to match).
+    """
+    items = resolve_column_ref(db, obj, array, spec)
+    return items if isinstance(items, list) else []
+
+
+def _json_array_count(db: Any, obj: Any, count: "JsonArrayCount", spec: ObjectTypeSpec) -> int:
+    """How many elements of `count.array` match `count.condition` -- the
+    evaluator counterpart to `query.py`'s `JsonArrayCount` SQL rendering.
+    Each element is a plain dict (no real Gramps object exists per array
+    element), evaluated against `count.element_spec` the same way
+    `_collection_count` evaluates a related row against `collection.target`.
+    """
+    items = _json_array_items(db, obj, count.array, spec)
+    if count.condition is None:
+        return len(items)
+    return sum(1 for item in items if evaluate_where(db, item, count.condition, count.element_spec))
 
 
 def _like_to_regex(pattern: str) -> re.Pattern:
@@ -426,6 +469,14 @@ def _evaluate_tri(db: Any, obj: Any, expr: Any, spec: ObjectTypeSpec) -> Optiona
             ):
                 return True
         return False
+    if isinstance(expr, JsonArrayExists):
+        # Same "always a definite True/False" reasoning as Exists just
+        # above -- an intra-record array with nothing matching (or nothing
+        # in it at all) is simply False, not UNKNOWN.
+        items = _json_array_items(db, obj, expr.array, spec)
+        if expr.condition is None:
+            return len(items) > 0
+        return any(evaluate_where(db, item, expr.condition, expr.element_spec) for item in items)
     if isinstance(expr, In):
         value = resolve_column_ref(db, obj, expr.column, spec)
         if value is None:

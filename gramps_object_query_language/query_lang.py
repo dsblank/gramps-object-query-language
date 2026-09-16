@@ -113,7 +113,7 @@ supports today:
 from __future__ import annotations
 
 import ast
-from typing import Any, List, Sequence, Tuple, Union
+from typing import Any, List, Optional, Sequence, Tuple, Union
 
 from gramps.gen.datehandler import parser as _date_parser
 from gramps.gen.lib import (
@@ -161,6 +161,8 @@ from .query import (
     Gt,
     Gte,
     In,
+    JsonArrayCount,
+    JsonArrayExists,
     Like,
     Lt,
     Lte,
@@ -172,6 +174,7 @@ from .query import (
     Regex,
     SelectRef,
     default_ref_key,
+    resolve_any_path,
     resolve_collection,
     resolve_column_path,
     resolve_length_path,
@@ -429,24 +432,84 @@ def _is_len_call(node: ast.AST) -> bool:
     return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "len"
 
 
-def _translate_len_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:
-    """Translate `len(path)` into `{"length_of": <column>}` -- the *value*-
-    producing counterpart to a plain path, for measuring a JSON array
-    already living inside the current row (`len(attribute_list)`,
-    `len(father.aka_surnames)`) rather than crossing to another table the
-    way `count(...)` does. `<column>` is whatever `_translate_column` would
-    already produce for that same path (a plain string or `{"json_path":
-    [...]}`) -- resolved into a real `Length` later, in
-    `json_column_to_ref`/`resolve_length_path`, the same two-stage way
-    `count(...)`'s `relationship` name is only resolved once translation
-    reaches `query.py`.
+def _try_resolve_bare_collection(node: ast.AST, spec: ObjectTypeSpec) -> Optional[Union["Collection", Backlinks]]:
+    """`node` resolved as a registered `Collection`, if it's a bare name
+    that is one -- else `None` (not an error; the caller falls through to
+    resolving it as an ordinary array path instead).
+
+    This is the one dispatch rule behind `any`/`len`'s whole unification
+    with `exists`/`count` (see ROADMAP.md's "one dispatch, two keyword
+    generations"): try `resolve_collection` first, fall through to
+    `resolve_any_path`/a plain path on failure. No naming-collision risk --
+    collection aliases (`children`, `notes`, ...) are deliberately spelled
+    differently from the JSON field they wrap (`child_ref_list`,
+    `note_list`, ...), so the two resolution attempts can never both
+    succeed for the same name.
     """
-    if len(node.args) != 1 or node.keywords:
-        raise QueryLangError("len(path) takes exactly 1 positional argument")
-    arg = node.args[0]
-    if not _is_path_node(arg):
-        raise QueryLangError(f"len(...)'s argument must be a field path: {ast.dump(node)}")
-    return {"length_of": _translate_column(arg, spec)}
+    if not isinstance(node, ast.Name):
+        return None
+    try:
+        return resolve_collection(spec, node.id)
+    except QueryError:
+        return None
+
+
+def _translate_collection_payload(node: ast.Call, collection: Union["Collection", Backlinks], spec: ObjectTypeSpec) -> dict:
+    """`{"relationship": ..., "where": [...]}` -- shared by `any`/`len`'s
+    own collection branch (once `node.args[0]` is known to resolve to
+    `collection`) and, in spirit, `exists`/`count`'s identical payload --
+    kept as its own small helper here rather than calling into
+    `_translate_exists_call`/`_translate_count_call` directly, so those two
+    stay untouched (frozen at their current capability -- see
+    ROADMAP.md) and their own error messages keep saying "exists(...)"/
+    "count(...)", not "any(...)"/"len(...)", when something written with
+    the older keyword goes wrong.
+    """
+    payload: dict = {"relationship": node.args[0].id}  # type: ignore[attr-defined]
+    if len(node.args) == 2:
+        if isinstance(collection, Backlinks):
+            payload["where"] = [_translate_backlinks_condition(node.args[1])]
+        else:
+            payload["where"] = _translate_top_level(node.args[1], collection.target)
+    return payload
+
+
+def _translate_len_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:
+    """Translate `len(...)` -- three shapes, by argument count and what the
+    first argument resolves to (see `_try_resolve_bare_collection`):
+
+    - `len(name)` / `len(name, condition)`, `name` resolves to a registered
+      `Collection`: identical to `count(name)`/`count(name, condition)` --
+      `{"count_of": {"relationship": ..., "where": [...]}}`.
+    - `len(path)` -- one argument, not a collection name: array length,
+      unchanged since before this unification -- `{"length_of": <column>}`.
+    - `len(path, condition)`, `path` resolves to a list-of-structs JSON
+      array: new -- count of elements matching `condition` --
+      `{"length_of_matching": {"path": [...], "where": [...]}}`. `<column>`/
+      `path` are whatever `_translate_column`/`_translate_path` already
+      produce for that path -- resolved into a real `CollectionCount`/
+      `Length`/`JsonArrayCount` later, in `json_column_to_ref`/
+      `resolve_length_path`/`resolve_any_path`, the same two-stage way
+      `count(...)`'s `relationship` name is only resolved once translation
+      reaches `query.py`.
+    """
+    if not 1 <= len(node.args) <= 2 or node.keywords:
+        raise QueryLangError("len(name_or_path[, condition]) takes 1 or 2 positional arguments")
+    first = node.args[0]
+    if not _is_path_node(first):
+        raise QueryLangError(f"len(...)'s first argument must be a field path: {ast.dump(node)}")
+    collection = _try_resolve_bare_collection(first, spec)
+    if collection is not None:
+        return {"count_of": _translate_collection_payload(node, collection, spec)}
+    if len(node.args) == 1:
+        return {"length_of": _translate_column(first, spec)}
+    segments = _translate_path(first)
+    try:
+        _, element_spec = resolve_any_path(spec, segments)
+    except QueryError as error:
+        raise QueryLangError(str(error)) from error
+    where = _translate_top_level(node.args[1], element_spec)
+    return {"length_of_matching": {"path": list(segments), "where": where}}
 
 
 def _translate_column_or_computed(node: ast.AST, spec: ObjectTypeSpec) -> Union[str, dict]:
@@ -767,9 +830,45 @@ def _translate_exists_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:
     return {"exists": payload}
 
 
+def _translate_any_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:
+    """Translate `any(...)` -- two shapes, by what the first argument
+    resolves to (see `_try_resolve_bare_collection`):
+
+    - `any(name)` / `any(name, condition)`, `name` resolves to a registered
+      `Collection`: identical to `exists(name)`/`exists(name, condition)`
+      -- `{"exists": {"relationship": ..., "where": [...]}}`.
+    - `any(path)` -- one argument, not a collection name: "the array has at
+      least one element at all", equivalent to `len(path) > 0` -- returns
+      that exact `{"column": {"length_of": ...}, "op": "gt", "value": 0}`
+      comparison shape rather than a fresh `EXISTS`-over-`json_each`,
+      reusing `Length`'s cheaper, already-tested rendering (see
+      ROADMAP.md's own performance note on this). A valid leaf on its own,
+      same as `exists(name)` is, just a different wire shape.
+    - `any(path, condition)`, `path` resolves to a list-of-structs JSON
+      array: new -- `{"any": {"path": [...], "where": [...]}}`.
+    """
+    if not 1 <= len(node.args) <= 2 or node.keywords:
+        raise QueryLangError("any(name_or_path[, condition]) takes 1 or 2 positional arguments")
+    first = node.args[0]
+    if not _is_path_node(first):
+        raise QueryLangError(f"any(...)'s first argument must be a field path: {ast.dump(node)}")
+    collection = _try_resolve_bare_collection(first, spec)
+    if collection is not None:
+        return {"exists": _translate_collection_payload(node, collection, spec)}
+    if len(node.args) == 1:
+        return {"column": {"length_of": _translate_column(first, spec)}, "op": "gt", "value": 0}
+    segments = _translate_path(first)
+    try:
+        _, element_spec = resolve_any_path(spec, segments)
+    except QueryError as error:
+        raise QueryLangError(str(error)) from error
+    where = _translate_top_level(node.args[1], element_spec)
+    return {"any": {"path": list(segments), "where": where}}
+
+
 def _translate_comparison_like_node(node: ast.AST, spec: ObjectTypeSpec) -> dict:
     """A single leaf: a `Compare`, or a whitelisted
-    `like(...)`/`regex(...)`/`exists(...)` call."""
+    `like(...)`/`regex(...)`/`exists(...)`/`any(...)` call."""
     if isinstance(node, ast.Compare):
         return _translate_compare(node, spec)
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
@@ -779,9 +878,11 @@ def _translate_comparison_like_node(node: ast.AST, spec: ObjectTypeSpec) -> dict
             return _translate_regex_call(node, spec)
         if node.func.id == "exists":
             return _translate_exists_call(node, spec)
+        if node.func.id == "any":
+            return _translate_any_call(node, spec)
     raise QueryLangError(
         f"expected a comparison (a == b, a in [...], like(a, 'pat'), "
-        f"regex(a, 'pat'), exists(rel, cond)), got: {ast.dump(node)}"
+        f"regex(a, 'pat'), exists(rel, cond), any(rel_or_path, cond)), got: {ast.dump(node)}"
     )
 
 
@@ -1027,12 +1128,7 @@ class _ComprehensionDesugarer(ast.NodeTransformer):
         if not isinstance(node.func, ast.Name) or node.keywords:
             return node
         name = node.func.id
-        if name == "any":
-            if len(node.args) != 1 or not isinstance(node.args[0], ast.GeneratorExp):
-                raise QueryLangError(
-                    "any(...) is only supported wrapping a generator comprehension, "
-                    f"e.g. any(x.field == 1 for x in rel): {ast.dump(node)}"
-                )
+        if name == "any" and len(node.args) == 1 and isinstance(node.args[0], ast.GeneratorExp):
             comp = node.args[0]
             generator = _comprehension_generator(comp, node)
             condition = _any_condition(comp, generator.target.id)
@@ -1042,12 +1138,14 @@ class _ComprehensionDesugarer(ast.NodeTransformer):
             generator = _comprehension_generator(comp, node)
             condition = _len_condition(comp, generator.target.id)
             return ast.copy_location(_make_call("count", generator.iter, condition), node)
-        # `len(...)` on anything other than a list comprehension isn't this
-        # sugar's business -- it's the array-length form (`len(path) > 1`,
-        # see `_translate_len_call`), a different, unambiguous AST shape
-        # (see ROADMAP.md's naming note above `_ComprehensionDesugarer`).
-        # Left untouched here; `_translate_compare` rejects it later if
-        # `path` doesn't turn out to be a real argument shape either.
+        # `any(...)`/`len(...)` on anything other than a real comprehension
+        # isn't this sugar's business -- it's the unified any()/len() form
+        # (`any(name_or_path[, condition])`/`len(name_or_path[, condition])`,
+        # see `_translate_any_call`/`_translate_len_call`), a different,
+        # unambiguous AST shape (see ROADMAP.md's naming note above
+        # `_ComprehensionDesugarer`). Left untouched here; `_translate_any_
+        # call`/`_translate_len_call` reject it later if it doesn't turn out
+        # to be a real argument shape either.
         return node
 
 
@@ -1142,7 +1240,11 @@ def json_column_to_ref(column: Union[str, dict], spec: ObjectTypeSpec) -> Column
     `{"json_path": [...]}`, whatever `_translate_column` produced) resolves
     to a `Length` via `resolve_length_path` -- same two-stage resolution as
     `count_of`, just against `resolve_column_path` instead of
-    `resolve_collection`.
+    `resolve_collection`. `{"length_of_matching": {"path": [...], "where":
+    [...]}}` is `length_of`'s own two-argument counterpart (`len(path,
+    condition)`, see `_translate_len_call`) -- resolves to a `JsonArrayCount`
+    via `resolve_any_path`, the value-producing sibling of `_node_from_json`'s
+    `"any"` case.
 
     A plain string goes through `resolve_ref_string`, so a *dotted* one
     (`"birth.date.sortval"`) means the same thing here as the identical
@@ -1150,8 +1252,13 @@ def json_column_to_ref(column: Union[str, dict], spec: ObjectTypeSpec) -> Column
     unknown flat column. A single-segment string stays a flat column
     reference, whitelist-checked -- see `resolve_ref_string`.
     """
+    # `spec.table == ""` marks the synthetic per-element spec any(...)/
+    # len(..., condition) build (see resolve_any_path) -- every field
+    # reference inside such a condition resolves relative to the array
+    # element itself (`je.value`), not the row's own `json_data`.
+    base_column = "je.value" if spec.table == "" else "json_data"
     if isinstance(column, str):
-        return resolve_ref_string(spec, column)
+        return resolve_ref_string(spec, column, base_column)
     if "count_of" in column:
         payload = column["count_of"]
         collection = resolve_collection(spec, payload["relationship"])
@@ -1166,7 +1273,12 @@ def json_column_to_ref(column: Union[str, dict], spec: ObjectTypeSpec) -> Column
         inner = column["length_of"]
         segments = (inner,) if isinstance(inner, str) else tuple(inner["json_path"])
         return resolve_length_path(spec, segments)
-    return resolve_column_path(spec, column["json_path"])
+    if "length_of_matching" in column:
+        payload = column["length_of_matching"]
+        array_ref, element_spec = resolve_any_path(spec, payload["path"])
+        condition = where_list_to_ast(payload["where"], element_spec)
+        return JsonArrayCount(array_ref, element_spec, condition)
+    return resolve_column_path(spec, column["json_path"], base_column)
 
 
 def _condition_from_json(condition: dict, spec: ObjectTypeSpec) -> Any:
@@ -1267,7 +1379,13 @@ def _node_from_json(node: dict, spec: ObjectTypeSpec) -> Any:
     `_backlink_condition_from_json` instead of `where_list_to_ast` -- a
     `Backlinks` condition is never a general boolean tree (see
     `BacklinkClassFilter`'s docstring in query.py), so it needs no
-    `collection.target` to resolve against (it has none).
+    `collection.target` to resolve against (it has none). `"any"` is the
+    array-path counterpart: no `resolve_collection` lookup (there's no
+    collection name to resolve, just a schema-validated path), so
+    `resolve_any_path` derives the synthetic element `ObjectTypeSpec`
+    `where` resolves against instead of a `Collection.target` -- see
+    `JsonArrayExists`'s own docstring in query.py for why this needs no
+    special condition-resolution handling despite that.
     """
     if "and" in node:
         return And(*(_node_from_json(child, spec) for child in node["and"]))
@@ -1285,6 +1403,11 @@ def _node_from_json(node: dict, spec: ObjectTypeSpec) -> Any:
         else:
             condition = where_list_to_ast(payload["where"], collection.target)
         return Exists(collection, condition)
+    if "any" in node:
+        payload = node["any"]
+        array_ref, element_spec = resolve_any_path(spec, payload["path"])
+        condition = where_list_to_ast(payload["where"], element_spec) if "where" in payload else None
+        return JsonArrayExists(array_ref, element_spec, condition)
     return _condition_from_json(node, spec)
 
 

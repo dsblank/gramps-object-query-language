@@ -46,6 +46,8 @@ from gramps_object_query_language.query import (
     Gt,
     Gte,
     In,
+    JsonArrayCount,
+    JsonArrayExists,
     JsonPath,
     Length,
     Like,
@@ -70,6 +72,7 @@ from gramps_object_query_language.query import (
     is_composite_type,
     parse_path_string,
     path_value_type,
+    resolve_any_path,
     resolve_collection,
     resolve_column_path,
     resolve_length_path,
@@ -2084,6 +2087,165 @@ def test_length_end_to_end_sqlite_execution():
         PERSON, Query(select=["handle"], where=Gt(ref, 1)), dialect=Dialect.SQLITE
     )
     assert conn.execute(sql, params).fetchall() == [("two-attrs",)]
+
+
+# --- any()/len() unified with exists()/count() (JsonArrayExists/JsonArrayCount) -----
+
+
+def test_resolve_any_path_accepts_list_of_structs_fields():
+    for spec, segments, expected_cls_name in [
+        (PERSON, ("attribute_list",), "Attribute"),
+        (PERSON, ("alternate_names",), "Name"),
+        (PERSON, ("address_list",), "Address"),
+        (PERSON, ("primary_name", "surname_list"), "Surname"),
+    ]:
+        ref, element_spec = resolve_any_path(spec, segments)
+        assert element_spec.cls.__name__ == expected_cls_name
+        assert element_spec.table == ""
+        assert element_spec.columns == frozenset()
+
+
+def test_resolve_any_path_uses_class_not_title():
+    # Family.child_ref_list's schema `title` is "Child Reference" (a
+    # human-readable label), not "ChildRef" -- confirming the element class
+    # comes from the schema's own `_class` enum instead (see
+    # resolve_any_path's own docstring for why `title` isn't safe to use
+    # here in general).
+    ref, element_spec = resolve_any_path(FAMILY, ("child_ref_list",))
+    assert element_spec.cls.__name__ == "ChildRef"
+
+
+def test_resolve_any_path_rejects_list_of_scalars():
+    for segments in [("note_list",), ("tag_list",)]:
+        with pytest.raises(QueryError, match="list-of-structs"):
+            resolve_any_path(PERSON, segments)
+
+
+def test_resolve_any_path_rejects_non_array_field():
+    with pytest.raises(QueryError, match="JSON array path"):
+        resolve_any_path(PERSON, ("gender",))
+
+
+def test_json_array_exists_requires_dialect():
+    ref, element_spec = resolve_any_path(PERSON, ("attribute_list",))
+    node = JsonArrayExists(ref, element_spec, Eq("value", "X"))
+    with pytest.raises(QueryError):
+        compile_query(PERSON, Query(where=node))
+
+
+def test_json_array_exists_sqlite_shape_with_condition():
+    ref, element_spec = resolve_any_path(PERSON, ("attribute_list",))
+    node = JsonArrayExists(ref, element_spec, Eq(JsonPath(("value",), base_column="je.value"), "X"))
+    sql, params = compile_query(
+        PERSON, Query(select=["handle"], where=node), dialect=Dialect.SQLITE
+    )
+    assert "EXISTS (SELECT 1 FROM json_each(person.json_data, ?) AS je" in sql
+    assert "json_extract(je.value, ?)" in sql
+    assert params == ["$.attribute_list", "$.value", "X", 50]
+
+
+def test_json_array_exists_sqlite_shape_no_condition():
+    ref, element_spec = resolve_any_path(PERSON, ("attribute_list",))
+    node = JsonArrayExists(ref, element_spec, None)
+    sql, params = compile_query(
+        PERSON, Query(select=["handle"], where=node), dialect=Dialect.SQLITE
+    )
+    assert "EXISTS (SELECT 1 FROM json_each(person.json_data, ?) AS je)" in sql
+    assert params == ["$.attribute_list", 50]
+
+
+def test_json_array_exists_postgresql_shape():
+    ref, element_spec = resolve_any_path(PERSON, ("attribute_list",))
+    node = JsonArrayExists(ref, element_spec, Eq(JsonPath(("value",), base_column="je.value"), "X"))
+    sql, params = compile_query(
+        PERSON, Query(select=["handle"], where=node), dialect=Dialect.POSTGRESQL
+    )
+    assert (
+        "EXISTS (SELECT 1 FROM jsonb_array_elements(person.json_data::jsonb -> "
+        "'attribute_list') AS je(value)" in sql
+    )
+    assert "jsonb_extract_path_text(je.value::jsonb, ?)" in sql
+    assert params == ["value", "X", 50]
+
+
+def test_json_array_exists_relationship_chained_shape():
+    # any(father.attribute_list, ...) -- the array lives on the related
+    # Person row (father), reached via a correlated join, not the outer
+    # Family row's own json_data.
+    ref, element_spec = resolve_any_path(FAMILY, ("father", "attribute_list"))
+    assert isinstance(ref, RelatedObject)
+    node = JsonArrayExists(ref, element_spec, Eq(JsonPath(("value",), base_column="je.value"), "X"))
+    sql, params = compile_query(
+        FAMILY, Query(select=["handle"], where=node), dialect=Dialect.SQLITE
+    )
+    assert "FROM person AS person__any0, json_each(person__any0.json_data, ?) AS je" in sql
+    assert "person__any0.handle = (family.father_handle)" in sql
+    assert params == ["$.attribute_list", "$.value", "X", 50]
+
+
+def test_json_array_count_sqlite_shape():
+    ref, element_spec = resolve_any_path(PERSON, ("attribute_list",))
+    node = JsonArrayCount(ref, element_spec, Eq(JsonPath(("value",), base_column="je.value"), "X"))
+    sql, params = compile_query(
+        PERSON, Query(select=["handle"], where=Gt(node, 0)), dialect=Dialect.SQLITE
+    )
+    assert "(SELECT COUNT(*) FROM json_each(person.json_data, ?) AS je" in sql
+    assert params == ["$.attribute_list", "$.value", "X", 0, 50]
+
+
+def test_json_array_count_requires_dialect():
+    ref, element_spec = resolve_any_path(PERSON, ("attribute_list",))
+    node = JsonArrayCount(ref, element_spec, None)
+    with pytest.raises(QueryError):
+        compile_query(PERSON, Query(where=Gt(node, 0)))
+
+
+def test_default_ref_key_rejects_json_array_count():
+    ref, element_spec = resolve_any_path(PERSON, ("attribute_list",))
+    node = JsonArrayCount(ref, element_spec, None)
+    with pytest.raises(QueryError):
+        default_ref_key(node)
+
+
+def test_json_array_exists_end_to_end_sqlite_execution():
+    """Exercises the shapes a hand-built where=JsonArrayExists(...) needs to
+    get right against real data: a matching element, a non-matching one, an
+    empty list, and a missing key -- none of these should error, only the
+    first should match.
+    """
+    import json
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE person (handle TEXT, json_data TEXT)")
+    conn.execute(
+        "INSERT INTO person VALUES ('matching', ?)",
+        (json.dumps({"attribute_list": [{"value": "a"}, {"value": "X"}]}),),
+    )
+    conn.execute(
+        "INSERT INTO person VALUES ('non-matching', ?)",
+        (json.dumps({"attribute_list": [{"value": "a"}]}),),
+    )
+    conn.execute(
+        "INSERT INTO person VALUES ('empty-list', ?)", (json.dumps({"attribute_list": []}),)
+    )
+    conn.execute("INSERT INTO person VALUES ('missing-key', ?)", (json.dumps({}),))
+
+    ref, element_spec = resolve_any_path(PERSON, ("attribute_list",))
+    node = JsonArrayExists(ref, element_spec, Eq(JsonPath(("value",), base_column="je.value"), "X"))
+    sql, params = compile_query(
+        PERSON, Query(select=["handle"], where=node), dialect=Dialect.SQLITE
+    )
+    assert conn.execute(sql, params).fetchall() == [("matching",)]
+
+    count_node = JsonArrayCount(ref, element_spec, None)
+    sql, params = compile_query(
+        PERSON, Query(select=["handle"], where=Eq(count_node, 0)), dialect=Dialect.SQLITE
+    )
+    assert conn.execute(sql, params).fetchall() == [
+        ("empty-list",),
+        ("missing-key",),
+    ]
 
 
 # --- Backlinks (reverse references, via Gramps' own `reference` table) --------

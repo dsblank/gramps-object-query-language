@@ -283,6 +283,13 @@ surname"`).
 
 ## One-to-many relationships: `exists(...)`
 
+**`any(...)` (see [Array membership](#array-membership-anypath-condition)
+below) does everything this section describes too, and more -- it's the
+recommended spelling going forward.** `exists(...)` still works exactly as
+described here and isn't going away, but a new query is better off written
+with `any(...)` from the start; keep reading here for how the underlying
+collections/condition grammar works, since that part is identical either way.
+
 Every relationship in the table above is one-to-one -- a family has exactly
 *one* father, a person has exactly *one* birth event. Some relationships are
 naturally one-to-many instead -- a family has any number of children, a
@@ -359,6 +366,10 @@ for ordinary comparisons.
 
 ## Counting a collection: `count(...)`
 
+**`len(...)` (see [Array length](#array-length-lenpath) below) does
+everything this section describes too, and more -- it's the recommended
+spelling going forward**, the same way `any(...)` supersedes `exists(...)`.
+
 `exists(...)` only answers "at least one" -- `count(name, condition)` asks
 "how many," over the same registered collections:
 
@@ -393,6 +404,13 @@ at all) is `0`, not `NULL`, the same way `COUNT(*)` over zero matching rows
 always is in SQL.
 
 ## Array length: `len(path)`
+
+`len(...)` is actually two things at once, disambiguated by what its first
+argument is: `len(name)`/`len(name, condition)`, where `name` is a
+registered collection, is a direct synonym for `count(name)`/`count(name,
+condition)` -- `len(children) > 2` and `count(children) > 2` compile to the
+identical query. This section is about the *other* thing: `len(path)`, where
+`path` isn't a collection name at all.
 
 `count(...)` measures a *collection* -- a list of handles reaching into
 another table (`Family.children`, `Person.notes`). `len(path)` measures a
@@ -436,6 +454,68 @@ sugar spelling, `len([... for x in rel])` (see
 own call syntax keeps the two apart: `len(...)` wrapping a real list
 comprehension is that sugar; `len(...)` wrapping a plain path is this
 array-length form instead.
+
+## Array membership: `any(path, condition)`
+
+`any(...)`, like `len(...)`, is two things disambiguated by its first
+argument: `any(name)`/`any(name, condition)` over a registered collection is
+a direct synonym for `exists(name)`/`exists(name, condition)`. This section
+is the other thing, `any(...)`'s own new capability: a *condition* on one
+element of a plain intra-record JSON array, the thing `len(path)` alone
+can't express -- `len(path) > 0` only ever answers "is the array non-empty,"
+never "does *this specific* element match something":
+
+```python
+Person "any(alternate_names, first_name == 'Doyle')"
+Family "any(children, gender == Person.MALE)"
+```
+
+The second line reads identically to `exists(children, gender ==
+Person.MALE)` -- `children` is a registered collection, so `any(...)`
+resolves it exactly the way `exists(...)` always has. The first line is new:
+`alternate_names` isn't a collection (a `Name` has no `gramps_id`, no page
+of its own -- it only ever exists embedded inside the person record it
+belongs to), so no `exists(...)`/`count(...)` form could reach it before
+`any(...)`/`len(...)` existed. Rule of thumb for telling the two apart: if
+the thing you're filtering on would show up as its own record elsewhere in
+the tree (a child, a note, a citation), it's a collection, reachable the
+`exists`/`any` way already documented above; if it's just one of several
+alternative values recorded directly on this same field (a name, an
+address, an attribute), it's an array, and needs this section's form.
+
+`any(path)` -- one argument, no condition -- means "the array has at least
+one element at all," exactly what `len(path) > 0` already means (and
+compiles to the identical query, reusing that cheaper rendering rather than
+scanning the array for real):
+
+```python
+Person "any(attribute_list)"
+```
+
+`len(path, condition)` is `any(path, condition)`'s own value-producing
+counterpart -- how many elements match, not just whether any do:
+
+```python
+Person "len(alternate_names, first_name == 'Doyle') > 1"
+```
+
+Both take an optional relationship hop before the array, the same as every
+other construct on this page:
+
+```python
+Family "any(father.attribute_list, value == 'Blacksmith')"
+```
+
+A condition's fields resolve *relative to one array element*, not the
+outer row -- inside `any(alternate_names, first_name == 'Doyle')`,
+`first_name` means that specific alternate name's own `first_name`, the
+same way `condition` inside `exists(children, ...)` resolves against one
+child, not the family. Only a **list-of-structs** array -- one whose
+elements are themselves records with their own fields (`Name`, `Attribute`,
+`Address`, `Surname`) -- can take a condition this way; a plain list of
+values (`note_list`, `tag_list`) has no sub-field to write one against, and
+is rejected with a clear error if you try (`any(path)`/`len(path) > 0`, no
+condition, already covers "has any at all" for those).
 
 ## Reverse references: `exists(backlinks)`
 

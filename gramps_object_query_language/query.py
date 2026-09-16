@@ -41,6 +41,7 @@ import re
 from dataclasses import dataclass, replace
 from typing import Any, Iterable, List, Optional, Sequence, Tuple, Union
 
+import gramps.gen.lib as gramps_lib
 from gramps.gen.lib import (
     Citation,
     Event,
@@ -515,6 +516,72 @@ class CollectionCount:
 
 
 @dataclass(frozen=True)
+class JsonArrayExists:
+    """`any(path, condition)` -- a boolean membership test over a plain JSON
+    array already living inside the current row's own `json_data` (or
+    reached by crossing a relationship first, `father.attribute_list`), the
+    intra-record counterpart to `Exists`'s cross-table `Collection` --
+    *no target table at all*, unlike `Exists`/`CollectionCount`.
+
+    `array`: a `JsonPath` (same-row array) or a `RelatedObject` chain ending
+    in one -- see `resolve_any_path`. `element_spec`: the synthetic
+    `ObjectTypeSpec` (`table=""`, no flat columns) `condition`'s own fields
+    resolve against, `resolve_any_path`'s own return -- every field inside
+    `condition` is a `JsonPath` with `base_column="je.value"` (see
+    `resolve_column_path`), so `condition.compile()` needs no special
+    handling at all, just an ordinary `Comparison`/`And`/`Or`/`Not` tree
+    whose `JsonPath`s happen to render against the array-element alias
+    (`je.value`) instead of `json_data` -- see `_json_array_subquery_body`.
+    `condition=None` means "the array has at least one element at all" --
+    not how `any(path)` (no condition) is actually compiled today (see
+    `query_lang.py`'s `_translate_any_call`, which routes that case through
+    the cheaper `Length`/`json_array_length` instead), but a coherent,
+    equally correct shape at this AST level regardless.
+    """
+
+    array: "ColumnRef"
+    element_spec: ObjectTypeSpec
+    condition: Optional[Any] = None
+
+    def compile(
+        self,
+        spec: ObjectTypeSpec,
+        dialect: Optional[Dialect] = None,
+        treeid: Optional[int] = None,
+    ) -> Tuple[str, list]:
+        if dialect is None:
+            raise QueryError(
+                "a dialect is required to compile any(...) over a JSON array, "
+                "but none was given"
+            )
+        body, params = _json_array_subquery_body(
+            self.array, self.condition, self.element_spec, spec.table, dialect, treeid
+        )
+        return f"EXISTS (SELECT 1 FROM {body})", params
+
+    def __repr__(self) -> str:
+        return f"JsonArrayExists({self.array!r}, {self.condition!r})"
+
+
+@dataclass(frozen=True)
+class JsonArrayCount:
+    """`len(path, condition)` -- how many elements of a plain JSON array
+    (see `JsonArrayExists`'s own docstring for `array`/`element_spec`)
+    match `condition`. The value-returning counterpart to `JsonArrayExists`,
+    exactly as `CollectionCount` is to `Exists` -- shares
+    `_json_array_subquery_body` verbatim, just wrapped as
+    `(SELECT COUNT(*) FROM ...)` instead of `EXISTS (SELECT 1 FROM ...)`.
+    """
+
+    array: "ColumnRef"
+    element_spec: ObjectTypeSpec
+    condition: Optional[Any] = None
+
+    def __repr__(self) -> str:
+        return f"JsonArrayCount({self.array!r}, {self.condition!r})"
+
+
+@dataclass(frozen=True)
 class Backlinks:
     """Pseudo-collection: `EXISTS`/`COUNT` against Gramps' own `reference`
     table (`obj_handle, obj_class, ref_handle, ref_class` -- see
@@ -607,6 +674,81 @@ def _wrap_length(field: "ColumnRef") -> "ColumnRef":
             f"len(...) requires a JSON array path, not a flat column: {field!r}"
         )
     return Length(field)
+
+
+def _terminal_json_path(ref: "ColumnRef", spec: ObjectTypeSpec) -> Tuple[JsonPath, ObjectTypeSpec]:
+    """The `JsonPath` at the very end of a (possibly relationship-crossing)
+    `ColumnRef` chain, plus the `ObjectTypeSpec` that path's segments
+    actually resolve against -- `spec` itself for a same-row path, or the
+    innermost `RelatedObject.target` for a chain (`father.attribute_list`).
+    `resolve_any_path` needs this to `walk_schema` the array's own schema
+    node, which `resolve_column_path`'s return value alone doesn't carry.
+    """
+    if isinstance(ref, RelatedObject):
+        return _terminal_json_path(ref.field, ref.target)
+    if isinstance(ref, JsonPath):
+        return ref, spec
+    raise QueryError(f"any(...)/len(...) requires a JSON array path, got {ref!r}")
+
+
+def resolve_any_path(
+    spec: ObjectTypeSpec, segments: Sequence[Union[str, int]]
+) -> Tuple["ColumnRef", ObjectTypeSpec]:
+    """Resolve `any(path, condition)`'s/`len(path, condition)`'s array-path
+    argument -- the same `resolve_column_path` used for any other path,
+    plus validation that it lands on a list-of-structs JSON array (not a
+    plain scalar list like `note_list`/`tag_list` -- those have no
+    sub-field to write a condition against; `len(path) > 0`/`any(path)`
+    alone already cover "has any at all" for them), and the synthetic
+    `ObjectTypeSpec` the condition itself resolves against.
+
+    Returns `(array_ref, element_spec)` -- `array_ref` is a `JsonPath`
+    (same-row array) or a `RelatedObject` chain ending in one
+    (`father.attribute_list`), returned as-is, *not* wrapped in anything
+    (unlike `resolve_length_path`'s `Length`-wrapping) -- `JsonArrayExists`/
+    `JsonArrayCount` hold it directly and resolve where it lives themselves,
+    at render time (see `_resolve_array_location`).
+
+    `element_spec.cls` -- the real Gramps class an array element
+    deserializes to (`Attribute`, `Name`, `Surname`, ...) -- comes from the
+    schema node's own `items["_class"]["enum"][0]`, *not*
+    `items["title"]`: verified live that `title` is a human-readable label
+    that happens to match the class name for `Attribute`/`Name`/`Address`
+    (coincidence, not a rule) but not for every list-of-structs field --
+    `Family.child_ref_list`'s `items["title"]` is `"Child Reference"`, while
+    its `_class` enum is `["ChildRef"]`, the real, importable
+    `gramps.gen.lib` class name every serialized JSON object already
+    carries for exactly this purpose (see `Backlinks`'s own `_class`
+    condition field).
+    """
+    ref = resolve_column_path(spec, segments)
+    array_path, owning_spec = _terminal_json_path(ref, spec)
+    schema = walk_schema(owning_spec, array_path.segments)
+    path_text = ".".join(str(s) for s in segments)
+    if schema.get("type") != "array":
+        raise QueryError(
+            f"any(...)/len(...) with a condition requires a JSON array path, "
+            f"got {_describe_schema(schema)}: {path_text!r}"
+        )
+    items_schema = schema.get("items", {})
+    if items_schema.get("type") != "object":
+        raise QueryError(
+            "any(...)/len(...) with a condition requires a list-of-structs "
+            "array (e.g. attribute_list, primary_name.surname_list) -- a "
+            "list of plain values has no sub-field to write a condition "
+            "against; len(path) > 0/any(path) (no condition) already cover "
+            f"'has any at all': got {_describe_schema(schema)} for {path_text!r}"
+        )
+    class_name = items_schema.get("properties", {}).get("_class", {}).get("enum", [None])[0]
+    if not class_name or not hasattr(gramps_lib, class_name):
+        raise QueryError(
+            f"any(...)/len(...) can't determine the element type of {path_text!r}"
+        )
+    element_cls = getattr(gramps_lib, class_name)
+    element_spec = ObjectTypeSpec(
+        table="", columns=frozenset(), text_columns=frozenset(), bool_columns=frozenset(), cls=element_cls
+    )
+    return ref, element_spec
 
 
 def _generic_collections(
@@ -747,7 +889,7 @@ def resolve_collection(spec: ObjectTypeSpec, name: str) -> Union[Collection, Bac
 
 
 def resolve_column_path(
-    spec: ObjectTypeSpec, segments: Sequence[Union[str, int]]
+    spec: ObjectTypeSpec, segments: Sequence[Union[str, int]], base_column: str = "json_data"
 ) -> ColumnRef:
     """Resolve a dotted/indexed path against `spec` into a `ColumnRef`.
 
@@ -766,6 +908,14 @@ def resolve_column_path(
     A relationship name with nothing after it (`segments == ("birth",)`)
     is rejected explicitly -- there's no value to return for "the related
     row itself", only for a field of it.
+
+    `base_column` is almost always left at its default -- the one exception
+    is `any(path, condition)`/`len(path, condition)`'s own condition, whose
+    fields resolve against a JSON array *element* (`je.value`, an unnamed
+    row `json_each`/`jsonb_array_elements` produces), not the current row's
+    `json_data` column -- see `resolve_any_path`. Every caller of this
+    function passes it explicitly only in that one case; everywhere else it
+    defaults to `"json_data"`, unchanged from before this parameter existed.
     """
     if not segments:
         raise QueryError("empty column path")
@@ -789,7 +939,7 @@ def resolve_column_path(
                 f"own -- use {head}.<field>, e.g. {head}.gramps_id"
             )
         target_spec, handle_ref = relationships[head]
-        field = resolve_column_path(target_spec, rest)
+        field = resolve_column_path(target_spec, rest, base_column)
         return RelatedObject(name=head, target=target_spec, handle_ref=handle_ref, field=field)
     # Not a flat column and not a relationship -- so it's a path into
     # `json_data`, checked against the type's own Gramps JSON Schema
@@ -798,7 +948,7 @@ def resolve_column_path(
     # (`select`, `where`, `where_expr`) funnels through, so checking here
     # covers all of them at once.
     walk_schema(spec, segments)
-    return JsonPath(tuple(segments))
+    return JsonPath(tuple(segments), base_column)
 
 
 _PATH_SEGMENT_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)((?:\[[0-9]+\])*)\Z")
@@ -848,7 +998,7 @@ def parse_path_string(text: str) -> Tuple[Union[str, int], ...]:
     return tuple(segments)
 
 
-def resolve_ref_string(spec: ObjectTypeSpec, text: str) -> "ColumnRef":
+def resolve_ref_string(spec: ObjectTypeSpec, text: str, base_column: str = "json_data") -> "ColumnRef":
     """Resolve a bare string column reference against `spec`.
 
     One code path for every spelling: `"gramps_id"`, `"primary_name"`, and
@@ -858,8 +1008,15 @@ def resolve_ref_string(spec: ObjectTypeSpec, text: str) -> "ColumnRef":
     a `RelatedObject` crossing a relationship. There is no special case for
     a single segment: `gendr` is rejected because the Gramps schema has no
     such field, not because of any rule about dots.
+
+    `base_column` -- see `resolve_column_path`'s own docstring -- only ever
+    passed non-default from `json_column_to_ref`, for a bare-string column
+    reference inside an `any(...)`/`len(..., condition)` condition (reaching
+    here only via hand-written raw JSON, never this module's own AST
+    parser, which always emits `{"json_path": [...]}` there instead -- see
+    `_translate_column`'s empty-`spec.columns` fast-path check).
     """
-    return resolve_column_path(spec, parse_path_string(text))
+    return resolve_column_path(spec, parse_path_string(text), base_column)
 
 
 def default_ref_key(ref: "ColumnRef") -> str:
@@ -929,7 +1086,7 @@ class FlatColumnRef:
 # `FlatColumnRef`) a flat column marked as a field rather than a literal --
 # `field: ColumnRef` on `RelatedObject` makes this recursive, so a chain
 # like `birth.place.title` is itself a valid `ColumnRef`.
-ColumnRef = Union[str, JsonPath, RelatedObject, CollectionCount, FlatColumnRef, Length]
+ColumnRef = Union[str, JsonPath, RelatedObject, CollectionCount, FlatColumnRef, Length, JsonArrayCount]
 SelectRef = ColumnRef
 
 
@@ -1291,6 +1448,8 @@ def _render_column(
         sql, params = _render_collection_count(column, spec.table, dialect, treeid)
     elif isinstance(column, Length):
         sql, params = _render_length(column, dialect)
+    elif isinstance(column, JsonArrayCount):
+        sql, params = _render_json_array_count(column, spec.table, dialect, treeid)
     else:
         if isinstance(column, FlatColumnRef):
             column = column.name
@@ -1829,6 +1988,157 @@ def _render_collection_count(
         )
     body, params = _collection_subquery_body(
         count.collection, outer_table, count.condition, dialect, treeid
+    )
+    return f"(SELECT COUNT(*) FROM {body})", params
+
+
+def _resolve_array_location(
+    array: "ColumnRef",
+    outer_table: str,
+    dialect: Dialect,
+    treeid: Optional[int],
+    _depth: int = 0,
+) -> Tuple[List[str], List[str], list, str, Tuple[Union[str, int], ...]]:
+    """Peel `array`'s (possibly relationship-crossing) `RelatedObject` chain
+    into flat `FROM`-clause join entries + `WHERE`-clause handle
+    correlations, the shape `_collection_subquery_body` already builds for
+    one hop, generalized to N -- bottoms out at the terminal `JsonPath`,
+    whose segments name the array field on whichever row (the outer row, or
+    the innermost joined target) it actually lives on.
+
+    Returns `(from_parts, where_parts, params, json_data_ref, segments)`.
+    `from_parts`/`where_parts`/`params` are all empty for a same-row array
+    (`attribute_list`) -- no join needed at all, just unnest the outer row's
+    own `json_data` directly. Each `RelatedObject` hop
+    (`father.attribute_list`) instead adds one `<table> AS <alias>` join
+    entry and one `<alias>.handle = (...)` correlation (plus, if `treeid`
+    is given, one `<alias>.treeid = ?`) -- mirroring
+    `_collection_subquery_body`'s own single-hop join exactly, just
+    correlated to `outer_table` instead of unnesting a `Collection`'s
+    `list_path`.
+    """
+    if isinstance(array, JsonPath):
+        return [], [], [], f"{outer_table}.{array.base_column}", array.segments
+    if isinstance(array, RelatedObject):
+        target_table = array.target.table
+        target_alias = f"{target_table}__any{_depth}"
+        handle_sql = _guarded_handle_ref_sql(array.handle_ref, outer_table, dialect)
+        from_parts = [f"{target_table} AS {target_alias}"]
+        where_parts = [f"{target_alias}.handle = ({handle_sql})"]
+        params: list = []
+        if treeid is not None:
+            where_parts.append(f"{target_alias}.treeid = ?")
+            params.append(treeid)
+        inner_from, inner_where, inner_params, json_data_ref, segments = _resolve_array_location(
+            array.field, target_alias, dialect, treeid, _depth=_depth + 1
+        )
+        return (
+            from_parts + inner_from,
+            where_parts + inner_where,
+            params + inner_params,
+            json_data_ref,
+            segments,
+        )
+    raise QueryError(f"any(...)/len(...) requires a JSON array path, got {array!r}")
+
+
+def _json_array_source_sqlite(json_data_ref: str, segments: Tuple[Union[str, int], ...]) -> Tuple[str, list]:
+    """`(source, params)` for unnesting a JSON array on SQLite -- reuses
+    `_render_json_path`'s own JSONPath-string construction verbatim
+    (`json_each` takes the identical path syntax `json_extract` does), just
+    passed to `json_each` instead so each element is its own row.
+    """
+    jsonpath = "$" + "".join(
+        f"[{segment}]" if isinstance(segment, int) else f".{segment}" for segment in segments
+    )
+    return f"json_each({json_data_ref}, ?) AS je", [jsonpath]
+
+
+def _json_array_source_postgresql(json_data_ref: str, segments: Tuple[Union[str, int], ...]) -> str:
+    """The `->` chain for unnesting a JSON array on PostgreSQL --
+    `jsonb_array_elements` needs the full chain built out (reusing
+    `_postgresql_handle_ref_path_sql`'s inlining pattern, not
+    `_collection_source_postgresql`'s single-key shortcut), since `array`
+    can be arbitrarily nested (`primary_name.surname_list`), unlike a
+    `Collection.list_path` (always a single top-level key). Segments are
+    inlined, not bound as `?` parameters, the same deliberate exception
+    `_postgresql_handle_ref_path_sql` already makes and for the same
+    reason: PostgreSQL's `->` needs a real typed int/text literal to pick
+    the right operator overload (array-index vs. object-key), which a bound
+    parameter can't reliably guarantee -- safe here because every segment
+    is schema-validated (via `walk_schema`, see `resolve_any_path`), never
+    raw, unchecked user text.
+    """
+    expr = f"{json_data_ref}::jsonb"
+    for segment in segments:
+        if isinstance(segment, int):
+            expr += f" -> {segment}"
+        else:
+            expr += f" -> '{segment}'"
+    return f"jsonb_array_elements({expr}) AS je(value)"
+
+
+def _json_array_subquery_body(
+    array: "ColumnRef",
+    condition: Optional[Any],
+    element_spec: ObjectTypeSpec,
+    outer_table: str,
+    dialect: Dialect,
+    treeid: Optional[int],
+) -> Tuple[str, list]:
+    """`<join entries>, <unnest source> [WHERE <join correlation>[ AND
+    (<condition>)]]` -- the subquery body shared by `JsonArrayExists`
+    (`EXISTS (SELECT 1 FROM <body>)`) and `JsonArrayCount`
+    (`(SELECT COUNT(*) FROM <body>)`), mirroring how `_collection_subquery_
+    body` is shared by `Exists`/`CollectionCount` -- just over an
+    intra-record JSON array instead of a cross-table `Collection`, so a
+    same-row array needs no join at all (no target table to alias), only a
+    relationship-crossing one does.
+
+    `condition`'s own `JsonPath`s already carry `base_column="je.value"`
+    (see `resolve_any_path`/`resolve_column_path`), so it compiles via the
+    ordinary `Comparison`/`And`/`Or`/`Not.compile()` every other condition
+    uses, with no special-casing here -- `element_spec` is passed through
+    only because `.compile()` requires *some* `ObjectTypeSpec`; it's
+    otherwise inert for a condition built entirely of `JsonPath`s (see
+    `JsonArrayExists`'s own docstring).
+    """
+    from_parts, where_parts, join_params, json_data_ref, segments = _resolve_array_location(
+        array, outer_table, dialect, treeid
+    )
+    if dialect == Dialect.SQLITE:
+        source, source_params = _json_array_source_sqlite(json_data_ref, segments)
+    elif dialect == Dialect.POSTGRESQL:
+        source, source_params = _json_array_source_postgresql(json_data_ref, segments), []
+    else:
+        raise QueryError(f"unsupported dialect: {dialect!r}")
+    params = list(join_params) + list(source_params)
+    where_parts = list(where_parts)
+    if condition is not None:
+        cond_sql, cond_params = condition.compile(element_spec, dialect, treeid)
+        where_parts.append(f"({cond_sql})")
+        params.extend(cond_params)
+    from_clause = ", ".join(from_parts + [source])
+    body = f"{from_clause} WHERE {' AND '.join(where_parts)}" if where_parts else from_clause
+    return body, params
+
+
+def _render_json_array_count(
+    count: "JsonArrayCount",
+    outer_table: str,
+    dialect: Optional[Dialect],
+    treeid: Optional[int],
+) -> Tuple[str, list]:
+    """`(SELECT COUNT(*) FROM <body>)` -- `JsonArrayCount`'s rendering,
+    dispatched from `_render_column` the same way `CollectionCount` is.
+    """
+    if dialect is None:
+        raise QueryError(
+            "a dialect is required to compile len(..., condition) over a JSON "
+            "array, but none was given"
+        )
+    body, params = _json_array_subquery_body(
+        count.array, count.condition, count.element_spec, outer_table, dialect, treeid
     )
     return f"(SELECT COUNT(*) FROM {body})", params
 

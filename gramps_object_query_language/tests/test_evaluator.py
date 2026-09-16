@@ -70,12 +70,16 @@ from gramps_object_query_language.query import (
     Exists,
     Gt,
     In,
+    JsonArrayCount,
+    JsonArrayExists,
+    JsonPath,
     Length,
     Like,
     Ne,
     Not,
     Or,
     Regex,
+    resolve_any_path,
     resolve_collection,
     resolve_column_path,
     resolve_length_path,
@@ -678,6 +682,86 @@ def test_sql_and_evaluator_agree_on_length(db_handles):
     db, handles = db_handles
     attrs = resolve_length_path(PERSON, ("attribute_list",))
     wheres = [Eq(attrs, 0), Gt(attrs, 0), In(attrs, [0, 1])]
+    people = {
+        key: db.get_person_from_handle(handles[key])
+        for key in ("father", "mother", "no_birth", "secret_attr_person")
+    }
+    for where in wheres:
+        sql, params = compile_query(
+            PERSON, Query(select=["handle"], where=where), dialect=Dialect.SQLITE
+        )
+        db.dbapi.execute(sql, params)
+        sql_matches = {row[0] for row in db.dbapi.fetchall()}
+        for key, person in people.items():
+            expected = handles[key] in sql_matches
+            actual = evaluate_where(db, person, where, PERSON)
+            assert actual == expected, f"{where!r} on {key!r}: SQL={expected} eval={actual}"
+
+
+# --- any()/len() unified with exists()/count() (JsonArrayExists/JsonArrayCount) -----
+
+
+def test_evaluate_where_json_array_exists_matches_element(db_handles):
+    db, handles = db_handles
+    father = db.get_person_from_handle(handles["father"])
+    ref, element_spec = resolve_any_path(PERSON, ("primary_name", "surname_list"))
+    node = JsonArrayExists(ref, element_spec, Eq(JsonPath(("surname",), base_column="je.value"), "Anderson"))
+    assert evaluate_where(db, father, node, PERSON) is True
+    node_no_match = JsonArrayExists(ref, element_spec, Eq(JsonPath(("surname",), base_column="je.value"), "Nobody"))
+    assert evaluate_where(db, father, node_no_match, PERSON) is False
+
+
+def test_evaluate_where_json_array_exists_no_condition(db_handles):
+    db, handles = db_handles
+    mother = db.get_person_from_handle(handles["mother"])
+    ref, element_spec = resolve_any_path(PERSON, ("attribute_list",))
+    node = JsonArrayExists(ref, element_spec, None)
+    assert evaluate_where(db, mother, node, PERSON) is False  # mother has no attributes
+
+
+def test_evaluate_where_json_array_exists_relationship_chained(db_handles):
+    db, handles = db_handles
+    family = db.get_family_from_handle(handles["family"])
+    ref, element_spec = resolve_any_path(FAMILY, ("father", "primary_name", "surname_list"))
+    node = JsonArrayExists(ref, element_spec, Eq(JsonPath(("surname",), base_column="je.value"), "Anderson"))
+    assert evaluate_where(db, family, node, FAMILY) is True
+
+
+def test_evaluate_where_json_array_count(db_handles):
+    db, handles = db_handles
+    father = db.get_person_from_handle(handles["father"])
+    ref, element_spec = resolve_any_path(PERSON, ("primary_name", "surname_list"))
+    count = JsonArrayCount(ref, element_spec, Eq(JsonPath(("surname",), base_column="je.value"), "Anderson"))
+    assert evaluate_where(db, father, Eq(count, 1), PERSON) is True
+    assert evaluate_where(db, father, Eq(count, 0), PERSON) is False
+
+
+def test_proxy_excludes_private_item_from_json_array_exists(db_handles, proxy):
+    # secret_attr_person has one attribute, marked private -- the proxy
+    # drops it from attribute_list entirely (same reasoning as Length's own
+    # equivalent test above), so any(...) through the proxy finds nothing
+    # where the raw db finds the private attribute's own value.
+    db, handles = db_handles
+    ref, element_spec = resolve_any_path(PERSON, ("attribute_list",))
+    node = JsonArrayExists(ref, element_spec, Eq(JsonPath(("value",), base_column="je.value"), "SECRET-ATTR-VALUE"))
+
+    raw_person = db.get_person_from_handle(handles["secret_attr_person"])
+    assert evaluate_where(db, raw_person, node, PERSON) is True
+
+    proxied_person = proxy.get_person_from_handle(handles["secret_attr_person"])
+    assert evaluate_where(proxy, proxied_person, node, PERSON) is False
+
+
+def test_sql_and_evaluator_agree_on_json_array_exists(db_handles):
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+
+    db, handles = db_handles
+    ref, element_spec = resolve_any_path(PERSON, ("primary_name", "surname_list"))
+    wheres = [
+        JsonArrayExists(ref, element_spec, Eq(JsonPath(("surname",), base_column="je.value"), "Anderson")),
+        JsonArrayExists(ref, element_spec, Eq(JsonPath(("surname",), base_column="je.value"), "Nobody")),
+        JsonArrayExists(ref, element_spec, None),
+    ]
     people = {
         key: db.get_person_from_handle(handles[key])
         for key in ("father", "mother", "no_birth", "secret_attr_person")

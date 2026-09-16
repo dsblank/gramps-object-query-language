@@ -35,6 +35,7 @@ import pytest
 
 from gramps_object_query_language.query import Dialect, Query, compile_query
 from gramps_object_query_language.query_lang import (
+    QueryLangError,
     compile_expr,
     parse_select,
     resolve_namespace,
@@ -773,6 +774,82 @@ def test_len_relationship_chained(db):
     # fam1's father (dad1) has a note; fam2's father (granddad1) doesn't.
     result = run(db, "Family", "len(father.note_list) > 0")
     assert result == [("fam1",)]
+
+
+# --- Array membership: any(path, condition) -----------------------------------
+
+
+def test_any_of_collection_matches_children_readme_example(db):
+    # any(children, ...) on a registered collection is a direct synonym for
+    # exists(children, ...) -- fam1's one recorded child (kid1, Robert) is
+    # male.
+    result = run(db, "Family", "any(children, gender == Person.MALE)")
+    assert result == [("fam1",)]
+
+
+def test_any_of_path_alternate_names_doc_example():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE person (handle TEXT, json_data TEXT)")
+
+    def person(handle, alternate_first_names):
+        conn.execute(
+            "INSERT INTO person VALUES (?, ?)",
+            (
+                handle,
+                json.dumps(
+                    {"alternate_names": [{"first_name": n} for n in alternate_first_names]}
+                ),
+            ),
+        )
+
+    # pat1 has "Doyle" recorded as an alternate name; jo1 has an alternate
+    # name, just not that one; sam1 has none recorded at all.
+    person("pat1", ["Doyle"])
+    person("jo1", ["Smith"])
+    person("sam1", [])
+
+    result = run(conn, "Person", "any(alternate_names, first_name == 'Doyle')")
+    assert result == [("pat1",)]
+
+    # any(path) alone (no condition) -- "has any element at all," identical
+    # to len(path) > 0.
+    result = run(conn, "Person", "any(alternate_names)")
+    assert {row[0] for row in result} == {"pat1", "jo1"}
+
+    # len(path, condition) -- the value-producing counterpart -- how many
+    # match, not just whether any do.
+    result = run(conn, "Person", "len(alternate_names, first_name == 'Doyle') > 0")
+    assert result == [("pat1",)]
+
+
+def test_any_of_path_relationship_chained_doc_example():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE person (handle TEXT, json_data TEXT)")
+    conn.execute("CREATE TABLE family (handle TEXT, father_handle TEXT, mother_handle TEXT, json_data TEXT)")
+
+    def person(handle, attribute_values):
+        conn.execute(
+            "INSERT INTO person VALUES (?, ?)",
+            (handle, json.dumps({"attribute_list": [{"value": v} for v in attribute_values]})),
+        )
+
+    person("smith1", ["Blacksmith"])
+    person("baker1", ["Baker"])
+    conn.execute("INSERT INTO family VALUES ('fam-smith', 'smith1', NULL, '{}')")
+    conn.execute("INSERT INTO family VALUES ('fam-baker', 'baker1', NULL, '{}')")
+
+    result = run(conn, "Family", "any(father.attribute_list, value == 'Blacksmith')")
+    assert result == [("fam-smith",)]
+
+
+def test_any_of_path_rejects_list_of_scalars_doc_example():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE person (handle TEXT, json_data TEXT)")
+    conn.execute(
+        "INSERT INTO person VALUES ('p1', ?)", (json.dumps({"note_list": ["note-1"]}),)
+    )
+    with pytest.raises(QueryLangError, match="list-of-structs"):
+        run(conn, "Person", "any(note_list, format == 0)")
 
 
 # --- Date modifier/quality/dateval, via Date.MOD_*/QUAL_* constants ----------

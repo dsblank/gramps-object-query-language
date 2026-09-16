@@ -41,6 +41,8 @@ from gramps_object_query_language.query import (
     Exists,
     Gt,
     Gte,
+    JsonArrayCount,
+    JsonArrayExists,
     JsonPath,
     Length,
     Lt,
@@ -1458,27 +1460,24 @@ def test_any_comprehension_multiple_for_clauses_rejected():
         parse_expr("family", "any(c.a == 1 for c in children for d in c.notes)")
 
 
-def test_any_comprehension_not_wrapping_generator_rejected():
-    with pytest.raises(QueryLangError):
-        parse_expr("family", "any(children)")
+def test_any_comprehension_not_wrapping_generator_is_the_unified_form():
+    # any(children) -- children is a bare name, not a generator expression,
+    # so this is no longer the exists()-sugar shape (see ROADMAP.md's naming
+    # note above _ComprehensionDesugarer) -- it's the unified any()/exists()
+    # dispatch instead (see the any()/len() unification section below):
+    # "children" resolves as a registered Collection on Family, so this is
+    # byte-identical to exists(children).
+    assert parse_expr("family", "any(children)") == parse_expr("family", "exists(children)")
 
 
-def test_len_call_not_wrapping_listcomp_is_the_array_length_form():
-    # len(children) -- children is a bare name, not a list comprehension,
-    # so this is no longer the count()-sugar shape (see ROADMAP.md's naming
-    # note above _ComprehensionDesugarer) -- it parses as the array-length
-    # form (see the "len(...) (array-length comparisons)" section below)
-    # instead. It still doesn't *work*, just for a different reason and at
-    # a different stage: "children" is a registered Collection name, not a
-    # real JSON field on Family, so resolving it as a len(...) path fails
-    # at compile time, not at parse time (matching how any other unresolved
-    # plain path already behaves -- see test_where_expr_rejects_unknown_field).
-    result = parse_expr("family", "len(children) > 2")
-    assert result == [
-        {"column": {"length_of": {"json_path": ["children"]}}, "op": "gt", "value": 2}
-    ]
-    with pytest.raises(QueryError, match="unknown field"):
-        compile_expr("family", "len(children) > 2")
+def test_len_call_not_wrapping_listcomp_is_the_unified_form():
+    # len(children) -- children is a bare name, not a list comprehension, so
+    # this is no longer the count()-sugar shape (see ROADMAP.md's naming note
+    # above _ComprehensionDesugarer) -- it's the unified any()/len()
+    # dispatch instead (see the any()/len() unification section below):
+    # "children" resolves as a registered Collection on Family, so this is
+    # byte-identical to count(children).
+    assert parse_expr("family", "len(children) > 2") == parse_expr("family", "count(children) > 2")
 
 
 def test_len_listcomp_computed_elt_rejected():
@@ -1509,6 +1508,132 @@ def test_compile_expr_len_listcomp_matches_count():
     _, sugar_where = compile_expr("family", "len([c for c in children]) > 2")
     _, plain_where = compile_expr("family", "count(children) > 2")
     assert sugar_where == plain_where
+
+
+# --- any()/len() unified with exists()/count() --------------------------------
+
+
+def test_any_of_collection_matches_exists():
+    assert parse_expr("family", "any(children)") == parse_expr("family", "exists(children)")
+    assert parse_expr("family", "any(children, gender == 1)") == parse_expr(
+        "family", "exists(children, gender == 1)"
+    )
+
+
+def test_len_of_collection_matches_count():
+    assert parse_expr("family", "len(children) > 2") == parse_expr("family", "count(children) > 2")
+    assert parse_expr("family", "len(children, gender == 1) > 1") == parse_expr(
+        "family", "count(children, gender == 1) > 1"
+    )
+
+
+def test_any_of_path_produces_any_wire_shape():
+    result = parse_expr("person", "any(alternate_names, first_name == 'Doyle')")
+    assert result == [
+        {
+            "any": {
+                "path": ["alternate_names"],
+                "where": [{"column": {"json_path": ["first_name"]}, "op": "eq", "value": "Doyle"}],
+            }
+        }
+    ]
+
+
+def test_any_of_path_no_condition_matches_len_greater_than_zero():
+    # any(path) alone -- "has any element at all" -- reuses len(path) > 0's
+    # own wire shape rather than a fresh EXISTS-over-json_each (cheaper, see
+    # ROADMAP.md's own performance note on this).
+    assert parse_expr("person", "any(attribute_list)") == parse_expr("person", "len(attribute_list) > 0")
+
+
+def test_len_of_path_with_condition_produces_length_of_matching_shape():
+    result = parse_expr("person", "len(alternate_names, first_name == 'Doyle') > 1")
+    assert result == [
+        {
+            "column": {
+                "length_of_matching": {
+                    "path": ["alternate_names"],
+                    "where": [{"column": {"json_path": ["first_name"]}, "op": "eq", "value": "Doyle"}],
+                }
+            },
+            "op": "gt",
+            "value": 1,
+        }
+    ]
+
+
+def test_len_of_path_without_condition_unchanged():
+    # len(path) -- one argument -- is still exactly the already-shipped
+    # array-length form, not routed through resolve_any_path at all (a
+    # list-of-scalars field like note_list must keep working here).
+    assert parse_expr("person", "len(note_list) > 0") == [
+        {"column": {"length_of": {"json_path": ["note_list"]}}, "op": "gt", "value": 0}
+    ]
+
+
+def test_any_len_of_path_with_condition_rejects_list_of_scalars():
+    with pytest.raises(QueryLangError, match="list-of-structs"):
+        parse_expr("person", "any(note_list, value == 'X')")
+    with pytest.raises(QueryLangError, match="list-of-structs"):
+        parse_expr("person", "len(note_list, value == 'X') > 0")
+
+
+def test_any_len_wrong_arity_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "any() ")
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "any(attribute_list, value == 'X', 1)")
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "len(attribute_list, value == 'X', 1) > 0")
+
+
+def test_any_first_argument_must_be_a_path():
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "any('attribute_list', value == 'X')")
+
+
+def test_any_condition_can_chain_relationships():
+    result = parse_expr("family", "any(father.attribute_list, value == 'X')")
+    assert result == [
+        {
+            "any": {
+                "path": ["father", "attribute_list"],
+                "where": [{"column": {"json_path": ["value"]}, "op": "eq", "value": "X"}],
+            }
+        }
+    ]
+
+
+def test_compile_expr_any_of_path_produces_json_array_exists():
+    spec, where = compile_expr("person", "any(alternate_names, first_name == 'Doyle')")
+    assert isinstance(where, JsonArrayExists)
+    assert where.element_spec.cls.__name__ == "Name"
+
+
+def test_compile_expr_len_of_path_produces_json_array_count():
+    spec, where = compile_expr("person", "len(alternate_names, first_name == 'Doyle') > 0")
+    assert isinstance(where, Gt)
+    assert isinstance(where.column, JsonArrayCount)
+
+
+def test_compile_expr_any_of_backlinks_matches_exists():
+    _, sugar_where = compile_expr("note", "any(backlinks, _class == 'Person')")
+    _, plain_where = compile_expr("note", "exists(backlinks, _class == 'Person')")
+    assert repr(sugar_where) == repr(plain_where)
+
+
+def test_any_unknown_path_with_condition_rejected_eagerly():
+    # "bogus_field" isn't a registered collection *or* a real schema field
+    # on Person. Unlike a bare len(path) (deferred to compile time -- the
+    # value isn't resolved until json_column_to_ref runs), any(path,
+    # condition)/len(path, condition) validate *eagerly*, at parse time --
+    # resolve_any_path has to run immediately to know the element spec the
+    # condition itself parses against, exactly the same reason exists(...)/
+    # count(...) already resolve their own collection name eagerly.
+    with pytest.raises(QueryLangError, match="unknown field"):
+        parse_expr("person", "any(bogus_field, value == 'X')")
+    with pytest.raises(QueryLangError, match="unknown field"):
+        parse_expr("person", "len(bogus_field, value == 'X') > 0")
 
 
 # --- compile_expr / compile_expr_for_spec (expr string -> query.py AST) ------
