@@ -1567,6 +1567,53 @@ def test_any_comprehension_of_relationship_chained_path_matches_direct_call():
     ) == parse_expr("family", "any(father.attribute_list, value == 'Blacksmith')")
 
 
+def test_bare_comprehension_of_path_matches_bare_direct_call():
+    # No `if` clause and a bare loop-variable `elt` -- "has any element at
+    # all" -- has to reach the plain-array-path form too, the same as a
+    # condition does (test_any_comprehension_of_path_matches_direct_call
+    # above), not just registered collections.
+    assert parse_expr("person", "any(x for x in alternate_names)") == parse_expr(
+        "person", "any(alternate_names)"
+    )
+    assert parse_expr("person", "len([x for x in alternate_names]) > 0") == parse_expr(
+        "person", "len(alternate_names) > 0"
+    )
+
+
+def test_bare_comprehension_of_list_of_scalars_path_matches_direct_call():
+    # note_list is a list of plain handles, not structs -- only the
+    # no-condition "has any at all" shape is legal for it either way, but
+    # that shape still has to work through the comprehension spelling too.
+    assert parse_expr("person", "any(x for x in note_list)") == parse_expr(
+        "person", "any(note_list)"
+    )
+    assert parse_expr("person", "len([x for x in note_list]) > 0") == parse_expr(
+        "person", "len(note_list) > 0"
+    )
+
+
+def test_nested_comprehension_over_inner_path_matches_direct_call():
+    # The existing nested-comprehension test (any(any(e.type.value == X for
+    # e in c.events) for c in children)) nests over a registered collection
+    # (events) at the inner level. This nests over a plain array path
+    # instead (c.attribute_list, not a collection) -- the exact shape that
+    # was broken before this fix, just one level deeper.
+    assert parse_expr(
+        "family",
+        "any(any(a.value == 'Blacksmith' for a in c.attribute_list) for c in children)",
+    ) == parse_expr("family", "any(children, any(attribute_list, value == 'Blacksmith'))")
+
+
+def test_child_refs_comprehension_elt_as_condition_matches_direct_call():
+    # The doc/README example uses an `if` clause
+    # (any(ref for ref in child_refs if ref.frel...)); this is the other
+    # legal comprehension shape -- elt itself as the condition, no `if` --
+    # for the same self-linked collection.
+    assert parse_expr("person", "any(ref.frel.value == 2 for ref in child_refs)") == parse_expr(
+        "person", "any(child_refs, frel.value == 2)"
+    )
+
+
 def test_any_of_path_no_condition_matches_len_greater_than_zero():
     # any(path) alone -- "has any element at all" -- reuses len(path) > 0's
     # own wire shape rather than a fresh EXISTS-over-json_each (cheaper, see
