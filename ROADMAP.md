@@ -999,113 +999,368 @@ dropped from the list entirely, not just masked, so `len()` through the
 proxy comes back one lower than the raw db -- `test_evaluator.py`), and a
 SQL-vs-evaluator agreement test.
 
+**Update, now that `any()`/`len()` are scoped as one unification (see
+"Possibilities" below):** this one-argument array-length form is staying
+exactly as shipped -- the planned follow-up is additive, a *second*,
+two-argument form (`len(path, condition)`, "how many array elements match,"
+sharing machinery with `any(path, condition)`), not a change to anything
+described above. `len(name)`/`len(name, condition)` where `name` is a
+registered collection (a new synonym for `count(name)`/`count(name,
+condition)`) is also planned, on the same terms.
+
 ## Possibilities
 
-### `any(...)` -- intra-record JSON array membership
+### `any(...)`/`len()` unified with `exists(...)`/`count(...)` -- one dispatch, two keyword generations
 
-**Naming note:** `any(...)` is already in use for a *different* thing --
-comprehension sugar for `exists(...)`, see Done above -- but the two don't
-collide; that form only fires when `any(...)`'s sole argument is a real
-`ast.GeneratorExp` node, so a path-and-condition argument list here
-(`any(path, condition)`) is free to mean this instead. Building this just
-adds an `else` branch to the existing dispatch, not a rename.
+**Naming decision:** `any`/`len` are the real Python names for "does at
+least one match" and "how many" -- going forward, *they* are the canonical
+spellings, including for what `exists(...)`/`count(...)` already do.
+`exists`/`count` are kept exactly as they are today, unchanged, frozen at
+their current (collection-only) capability -- a backwards-compatible pair
+of older spellings, not a second thing to keep building out. Nothing
+already shipped, tested, or documented under `exists`/`count` changes.
 
-Resolves an open question from `exists(...)`'s own scoping pass (see
-"Done" above): is `any` just redundant with `exists`? **No** -- they target
-different data shapes and aren't substitutable:
+This supersedes the original, narrower `any()` scoping below it in this
+section's history: rather than a new, separate boolean primitive sitting
+alongside `exists()`, `any()`/`len()` become a **strict superset** of
+`exists()`/`count()` -- each accepts everything its legacy counterpart does,
+*plus* the new intra-record-array case neither `exists()` nor `count()` can
+structurally reach (they only ever resolve a bare name via
+`resolve_collection`, which never matches a plain schema path).
 
-- `exists(collection, condition)` -- a *cross-table* one-to-many
-  relationship, registered via `Collection`/`_COLLECTIONS` (`Family.children`
-  reaches a real `Person` row in another table).
-- `any(path, condition)` -- an *intra-record* JSON array already living
-  inside the current row's own `json_data` (`primary_name.surname_list`,
-  `attribute_list`, `url_list`, ...) -- no second table, no registration at
-  all, works on any JSON array path the same permissive way `JsonPath`
-  already works on any nested field.
+**The dispatch rule, one sentence:** given `any`/`len`'s first argument,
+try `resolve_collection(spec, name)` first (bare name only) -- if that
+succeeds, behave exactly like `exists`/`count` on that collection; if it
+fails, resolve the argument as an ordinary (possibly relationship-crossing,
+possibly dotted) *path* instead, and if that resolves to a list-of-structs
+JSON array, behave as described in the original `any()` design below. No
+naming collision risk today: collection aliases (`children`, `notes`,
+`citations`, ...) are deliberately spelled differently from the JSON field
+they wrap (`child_ref_list`, `note_list`, ...), so the two resolution
+attempts can never both succeed for the same name.
+
+**What each keyword now covers, by argument shape:**
+
+- **`any(...)`** -- boolean, "at least one matches":
+  1. `any(elt for x in rel if ...)` -- comprehension sugar, unchanged (see
+     "Comprehension sugar" under Done).
+  2. `any(name)` / `any(name, condition)`, `name` resolves via
+     `resolve_collection` -- identical to `exists(name)`/`exists(name,
+     condition)`.
+  3. `any(path)` / `any(path, condition)`, `path` resolves to a
+     list-of-structs JSON array -- the original `any()` design: `any(path)`
+     alone means "the array has at least one element at all" (faithful to
+     real Python's own `any()` over a list of always-truthy dicts -- and
+     equivalent to `len(path) > 0`, just spelled the way a Python reader
+     would expect); `any(path, condition)` narrows to elements matching
+     `condition`.
+- **`len(...)`** -- numeric, "how many"/"how long":
+  1. `len([x for x in rel if ...])` -- comprehension sugar, unchanged.
+  2. `len(name)` / `len(name, condition)`, `name` resolves via
+     `resolve_collection` -- identical to `count(name)`/`count(name,
+     condition)`.
+  3. `len(path)` -- array length (**already shipped**, unchanged -- see
+     `len()` under Done above).
+  4. `len(path, condition)` -- **new**: count of array elements matching
+     `condition`. Genuinely new capability ("how many alternate names have
+     surname == 'Doyle'"), not reachable by any existing spelling. Renders
+     by wrapping the same no-target-table subquery body `any(path,
+     condition)` uses in `(SELECT COUNT(*) FROM ...)` instead of `EXISTS
+     (SELECT 1 FROM ...)` -- exactly how `CollectionCount` already shares
+     `_collection_subquery_body` with `Exists` rather than duplicating it.
+
+Resolves the open question from `exists(...)`'s own scoping pass (see
+"Done" above): is `any` just redundant with `exists`? Structurally, no --
+different data shapes (cross-table collection vs. intra-record array) --
+but a `where_expr` *author* no longer needs to know that distinction at all,
+which is the actual point of unifying the keyword.
 
 Motivated by: "people with a surname of Doyle recorded, in *any* position"
 -- today only answerable by checking a fixed index
-(`primary_name.surname_list[1].surname != None`, `len()`'s own motivating
-example above), which breaks if the matching surname isn't at that exact
-position.
+(`primary_name.surname_list[1].surname != None`), which breaks if the
+matching surname isn't at that exact position.
 
-**Difficulty:** large -- the biggest of the three items on this page.
-Unlike `count()`/`len()` (operate on a value already reachable via the
-existing `JsonPath`/`RelatedObject` machinery) or `exists()` (operates on a
-real registered target table with its own `ObjectTypeSpec`), `any()`'s
-condition has to resolve field references against an *anonymous* JSON
-object with no `ObjectTypeSpec` at all -- a `Surname`/`Attribute`/`Url`
-struct isn't one of the ten primary types with `get_secondary_fields()`.
+**Difficulty:** large -- larger than the original standalone `any()`
+scoping below, since it now also touches `len()`'s own grammar (a new
+two-argument form) and adds a second new AST node (`JsonArrayCount`
+alongside `JsonArrayExists`), not just one. Still, per-piece, nothing here
+is harder than what was already scoped -- `JsonArrayCount` is `JsonArrayExists`
+wrapped differently, exactly as `CollectionCount` is to `Exists` today.
 
 **What it would take, layer by layer:**
 
-1. **`query_lang.py`** -- `any(path, condition)` as a third whitelisted call
-   form (alongside `like`/`exists`), producing
-   `{"any": {"path": [...], "where": [...]}}`. Condition parsing needs a
-   spec whose `.columns` is always empty, forcing every field reference
-   inside the condition to fall through to `JsonPath` -- a synthetic
-   `ObjectTypeSpec(table="", columns=frozenset(), text_columns=frozenset())`
-   does this with no new parser logic, reusing `_translate_top_level`
-   exactly as `exists` already does.
-2. **`query.py`** -- a new AST node (e.g. `JsonArrayExists`), sibling to
-   `Exists` but with *no target table at all* -- the condition's columns
-   render as `json_extract(je.value, '$.<field>')` (SQLite) /
-   `je.value ->> '<field>'` (PostgreSQL) instead of a real table column, so
-   `_render_column`/`Comparison.compile()` need a way to resolve "against
-   `je.value`, not `spec.table`" for anything nested inside an `any(...)`.
-   This is the one place the existing `spec.table`-correlation assumption
-   baked into `_render_column`/`RelatedObject`/`Exists` doesn't hold.
+1. **`query_lang.py`** -- `_translate_exists_call`/`_translate_count_call`
+   stay exactly as they are (frozen, collection-only). New: a shared
+   resolver, `_resolve_collection_or_array_path(spec, name_node)`, tried by
+   both `_translate_any_call` and `_translate_len_call`'s (extended) two-arg
+   form -- `resolve_collection(spec, name)` first, `resolve_any_path(spec,
+   segments)` (see below) on failure. Condition parsing for the array branch
+   needs a spec whose `.columns` is always empty, forcing every field
+   reference inside the condition to fall through to `JsonPath` -- a
+   synthetic `ObjectTypeSpec(table="", columns=frozenset(),
+   text_columns=frozenset())` does this with no new parser logic, reusing
+   `_translate_top_level` exactly as `exists` already does. That synthetic
+   spec's `cls` still needs to be the real element class (`Attribute`,
+   `Name`, `Surname`, ...) for `walk_schema` to validate the condition's own
+   fields -- **derive it from the array's schema node's
+   `items["_class"]["enum"][0]`, not `items["title"]`**: verified live that
+   `title` is a human-readable label that happens to match the class name
+   for `Attribute`/`Name`/`Address` (coincidence, not a rule) but *not* for
+   every list-of-structs field -- `Family.child_ref_list`'s `items["title"]`
+   is `"Child Reference"`, while its `_class` enum is `["ChildRef"]`, the
+   real, importable `gramps.gen.lib` class name. `_class` is the one every
+   serialized JSON object already carries for exactly this purpose (see
+   `Backlinks`'s own `_class` condition field); reuse it here rather than
+   `title`. The `_ComprehensionDesugarer`'s own sugar output
+   (`_make_call("exists"/"count", ...)`) can stay pointed at the legacy
+   names -- they're just as correct a target as `any`/`len` now that both
+   pairs share the same underlying resolution, so there's no need to touch
+   already-working desugaring code.
+2. **`query.py`** -- two new AST nodes, `JsonArrayExists` and
+   `JsonArrayCount`, sharing one new subquery-body builder (parallel to how
+   `Exists`/`CollectionCount` already share `_collection_subquery_body`) --
+   *no target table at all*, so the condition's columns render as
+   `json_extract(je.value, '$.<field>')` (SQLite) / the `jsonb_extract_path*`
+   equivalent (PostgreSQL) instead of a real table column. This is the one
+   place the existing `spec.table`-correlation assumption baked into
+   `_render_column`/`RelatedObject`/`Exists` doesn't hold -- resolved by
+   giving the condition's `JsonPath` objects `base_column="je.value"`
+   instead of the default `"json_data"` (an optional parameter threaded
+   through `resolve_column_path`), so `_render_json_path`/`_render_column`
+   need *zero* new rendering code -- a `JsonPath` with a different
+   `base_column` already renders correctly today.
    - The array path itself (`primary_name.surname_list`) can be arbitrarily
      nested, unlike `Collection.list_path` (always a single top-level key)
      -- SQLite's `json_each` already accepts a full `'$.primary_name.
      surname_list'` path directly, no change needed; PostgreSQL's
      `jsonb_array_elements` needs the full `->` chain built out (reusing
-     `_postgresql_handle_ref_path_sql`'s pattern, not
-     `_collection_source_postgresql`'s single-key shortcut).
+     `_postgresql_handle_ref_path_sql`'s inlining pattern, not
+     `_collection_source_postgresql`'s single-key shortcut -- segments are
+     schema-validated identifiers, not raw user text, so inlining is safe,
+     and required: PostgreSQL's `->` needs a real typed int/text literal to
+     pick the right operator overload, which a bound parameter can't
+     reliably guarantee).
+   - Relationship-crossing before the array (`any(father.attribute_list,
+     ...)`) needs a small recursive helper peeling `RelatedObject` hops into
+     a flat list of `FROM`/`WHERE` join fragments -- the same shape
+     `_collection_subquery_body` already uses for one hop, generalized to N,
+     not a new pattern.
 3. **`evaluator.py`** -- walking a raw JSON list (from `get_json_path`)
    rather than a real Gramps object per element -- `resolve_column_ref`'s
    object-based machinery (`get_flat_column`'s `getattr`, `get_json_path`'s
    `object_to_dict`) doesn't apply; needs a parallel, simpler resolver that
-   walks a plain `dict` directly via `_walk_json_path` alone.
-4. **Docs + tests** -- the same four files as every prior addition.
+   walks a plain `dict` directly via `_walk_json_path` alone (a small marker
+   check in `get_json_path`: `base_column == "je.value"` means "walk `obj`
+   directly, it's already a dict," rather than calling `object_to_dict`
+   first). `JsonArrayCount`'s evaluator counterpart mirrors `_collection_count`
+   the same way its SQL rendering mirrors `_render_collection_count`.
+4. **Docs + tests** -- the same four files as every prior addition, plus
+   parity tests proving `any(name, cond)`/`exists(name, cond)` and
+   `len(name, cond)`/`count(name, cond)` compile to byte-identical wire JSON
+   when `name` is a real collection (the actual "is this really a
+   superset" guarantee, checked directly rather than assumed).
 
 **Risk / open decisions:**
 
 - **List-of-scalars fields** (`note_list`, `tag_list` -- plain handle
   strings, no sub-object) have no sub-field to write a condition against
-  inside `any(...)`. Recommend v1 requires a list-of-structs field and
-  rejects a bare-scalar list outright -- `len(note_list) > 0` already covers
-  "has any at all" for a scalar list, and `exists(notes)` already covers
-  `Person.notes` specifically once it's a registered `Collection`.
+  inside `any(path, condition)`/`len(path, condition)`. Recommend v1
+  requires a list-of-structs field and rejects a bare-scalar list outright
+  for the *condition* form -- `len(note_list) > 0`/`any(note_list)` (no
+  condition) already covers "has any at all" for a scalar list.
 - **Chaining a relationship before the array** (`any(birth.attribute_list,
   value == 'X')`) -- structurally free if the array-path segment reuses
   `resolve_column_path` the same way `exists`'s relationship name does;
   recommend allowing it.
-- **Nesting `any(...)` inside `exists(...)`'s condition, or vice versa** --
-  should fall out for free from both being ordinary leaf/boolean nodes, but
-  needs an explicit test once both exist, since neither was designed with
-  the other in mind originally.
+- **Nesting `any(...)`/`len(...)` inside `exists(...)`/`count(...)`'s
+  condition, or vice versa** -- should fall out for free from all four
+  being ordinary leaf/boolean/value nodes once the shared machinery exists,
+  but needs an explicit test, since none of this was designed with the
+  others in mind originally.
+- **Teaching the new spelling without confusing existing `exists`/`count`
+  users** -- docs should present `any`/`len` as the primary way to spell
+  both a collection check and an array check, mentioning `exists`/`count`
+  briefly as recognized older spellings limited to the collection case, not
+  as two competing "which one do I use" options.
 
-**Recommended scope for a v1:** `any(path, condition)` where `path` resolves
-to a list-of-structs JSON array (relationship-chaining allowed ahead of the
-array itself); condition fields resolve only as JSON paths relative to each
-element (no flat-column fast path, no nested `any`/`exists` inside the
-element for v1); list-of-scalars arrays explicitly unsupported and rejected
-with a clear error rather than silently matching nothing.
+**Recommended scope for a v1:** build the shared subquery-body builder,
+`JsonArrayExists`, and `JsonArrayCount` together (splitting them buys
+little, since they share nearly everything); wire `any`/`len` (not
+`exists`/`count`, which stay untouched) through the shared
+collection-or-array resolver; array-path condition fields resolve only as
+JSON paths relative to each element (no flat-column fast path, no nested
+`any`/`exists`/`len`/`count` inside the element for v1); list-of-scalars
+arrays explicitly unsupported for the condition form and rejected with a
+clear error rather than silently matching nothing; ship with the
+byte-identical parity tests against `exists`/`count` for the collection
+case.
 
-### Suggested implementation order for `len`/`any` (revised after `count()`)
+### `any(child_refs, ...)` -- the correlated-`ChildRef` gap behind "adopted" (item M)
 
-Originally planned as `count -> len -> any`, on the theory that `len()`
-would be the item that first introduces the "a column can be a *computed*
-value, not just a path" plumbing through `_translate_column`/`ColumnRef`/
-`_render_column`. That plumbing turned out to arrive with `count()` itself
-instead (`_translate_column_or_count`, `CollectionCount` as a `ColumnRef`
-variant, both described under Done above) -- so `len()` (now also Done, see
-above) came next and copied that exact pattern
-(`_translate_column_or_computed`, `Length` as a `ColumnRef` variant) rather
-than inventing it from scratch. `any()` is the one item left: it needs that
-same pattern *and* its own new no-target-table `EXISTS`-over-JSON-array
-rendering on top, the one piece neither `count()` nor `len()` needed.
+Motivated by gramps-connect's "adopted" filter preset (`HaveAltFamilies`,
+see `DISABLED-FILTER-RULES.md`), left `supported: false` when
+`has-alternate-name`/`has-addresses` were fixed by `len()` alone -- this one
+is structurally different and genuinely still open. Verified against the
+rule's own source (`gramps.gen.filters.rules.person.HaveAltFamilies.
+apply_to_one`), not inferred from its preset `notes`:
+
+```python
+for fhandle in person.parent_family_list:
+    family = db.get_family_from_handle(fhandle)
+    if family:
+        ref = [ref for ref in family.child_ref_list if ref.ref == person.handle]
+        if ref[0].frel == ChildRefType.ADOPTED or ref[0].mrel == ChildRefType.ADOPTED:
+            return True
+return False
+```
+
+**Why this isn't `any()` (item I) or the "outer row" gap (item J) alone --
+it's a specific combination of both, on a specific pair of tables.** Every
+`Collection`'s condition today resolves against the *joined target row's own
+fields* (`exists(parent_families, gramps_id == 'F001')` reads `Family`'s own
+`gramps_id`). This rule needs something no existing or currently-planned
+piece reaches: *within* the joined `Family` row, find the one entry in
+*its own* `child_ref_list` array whose `ref` equals the *outer* `Person`
+row's own handle, and test *that entry's* `frel`/`mrel` -- an array lookup
+(`any()`'s territory) *correlated back to the outer row* (item J's
+territory), both at once, and specifically two levels removed from the
+true outermost row (the array lives on the *joined* row, not the row
+`any()` would naturally be invoked from). Generalizing `any()`+J to
+arbitrary nesting depth would be strictly harder than solving this
+concrete case directly -- see "Recommended v1 scope" below for the
+narrower route.
+
+**Difficulty:** large, and not obviously smaller than `any()` -- possibly
+the hardest item on this page, since it combines two "large" pieces (I, J)
+into one shape neither was designed to compose with, on top of a specific
+new SQL structure (a *second*, target-row-scoped `json_each`/
+`jsonb_array_elements` unnest, correlated back to the *original* outer
+table by name, not the collection's own target).
+
+**Two designs considered:**
+
+1. **A dedicated, narrow construct -- `Person.child_refs`, a new kind of
+   `Collection` whose "list" isn't a field on the current row at all, but
+   a *correlated array on another table*: for each family handle in
+   `person.parent_family_list`, the one entry (if any) in *that family's*
+   `child_ref_list` whose `ref` equals `person.handle`.** Reads naturally
+   as `any(child_refs, frel.value == ChildRefType.ADOPTED or mrel.value ==
+   ChildRefType.ADOPTED)` -- or, equally, the older `exists(child_refs,
+   ...)` spelling: since `child_refs` is a registered `Collection`, it
+   resolves via plain `resolve_collection` like any other, so both
+   keyword generations reach it identically once `any`/`exists` share their
+   dispatch (see the `any()`/`len()` unification above) -- no
+   outer-row-reference feature needed at the `where_expr`-author level at
+   all, because the correlation is baked into `child_refs`'s own
+   definition/rendering, not exposed as a general capability. This is the
+   recommended route -- see below.
+2. **A general "outer row reference" mechanism** (the "Other gaps" list's
+   own item J, `exists(children, surname == father.surname)`), generalized
+   to also work when nested two levels deep inside `any()`. Solves more
+   cases in principle (any future rule shaped like this one), but requires
+   threading "the correlated outer handle(s), at every nesting depth" through
+   the whole condition-compilation stack -- a much bigger, more speculative
+   change with no second concrete consumer yet to prove it against.
+
+**What design 1 (recommended) would take, layer by layer:**
+
+1. **`query.py`** -- extend `Collection` with two new optional fields,
+   `self_link_field: Optional[str]` (e.g. `"child_ref_list"`, the *target*
+   row's own array) and `self_link_ref_field: Optional[str]` (e.g. `"ref"`,
+   the sub-field on each of *that* array's entries to match against the
+   *outer* row's handle) -- `None` for every existing `Collection`
+   (`children`, `notes`, ...), so this is additive, not a breaking change to
+   the dataclass's existing consumers. `_collection_subquery_body` grows a
+   second, conditional unnest stage when `self_link_field` is set: after the
+   existing `family AS target WHERE target.handle = <handle_expr>` join,
+   add `, json_each(target.json_data, '$.<self_link_field>') AS link WHERE
+   json_extract(link.value, '$.<self_link_ref_field>') = <outer_table>.handle`
+   (SQLite) / the `jsonb_array_elements` equivalent (PostgreSQL) -- a second
+   application of the exact same unnest-and-correlate pattern
+   `_collection_source_sqlite`/`_collection_source_postgresql` already do
+   once, just correlated to `outer_table` (by name, already in scope) instead
+   of a field on the current row. `condition.compile(...)` then needs to run
+   against `link.value`'s own schema (`ChildRef`), not `target`'s
+   (`Family`) -- reusing `any()`'s "synthetic element `ObjectTypeSpec`,
+   condition fields render as `json_extract(link.value, ...)`" machinery
+   (item I) directly, which is why this only makes sense to build *after*
+   `any()` exists, even though it isn't `any()` itself.
+2. **`query_lang.py`** -- register `child_refs` in `_COLLECTIONS[PERSON.
+   table]` with `self_link_field="child_ref_list"`,
+   `self_link_ref_field="ref"`, target `FAMILY` (needed for
+   `resolve_collection`'s existing return shape, even though the condition
+   actually resolves against `ChildRef`'s schema, not `Family`'s, once
+   `self_link_field` is set) -- `resolve_collection`/`_translate_exists_
+   call`/`_translate_count_call` need one branch: when the resolved
+   `Collection` has `self_link_field` set, parse the condition against the
+   *link element's* synthetic spec (element class from the target's own
+   schema's `items["_class"]`, e.g. `Family.child_ref_list`'s items are
+   `ChildRef` -- see the `any()` section's own note above about `_class`
+   vs. `title`) instead of `collection.target`.
+3. **`evaluator.py`** -- `_collection_handles`'s counterpart needs a
+   `_self_linked_entries` helper: for each handle in `collection.list_path`,
+   fetch the target object (a real `Family`), then `next((e for e in
+   getattr(target, self_link_field) if getattr(e, self_link_ref_field) ==
+   obj.handle), None)` -- mirroring the real rule's own `[ref for ref in
+   family.child_ref_list if ref.ref == person.handle]` almost verbatim (both
+   walk real `ChildRef` objects via attribute access, not dicts -- unlike
+   `any()`'s own evaluator side, which walks a raw JSON list since it has no
+   real object per element), but returning `None` rather than crashing on
+   `ref[0]` when the list comprehension is empty (see risk note below -- the
+   *real* Gramps rule has a latent `IndexError` bug here on inconsistent
+   data; GOQL's version should not inherit it).
+4. **Docs + tests** -- the same four files as every prior addition, plus
+   `DISABLED-FILTER-RULES.md`/`gqlFilterPresets.ts` (the actual "adopted"
+   preset, once this ships) and a verification run against gramps-core's own
+   `example.gramps` fixture and the real `HaveAltFamilies` rule, the same way
+   `has-alternate-name`/`has-addresses` were verified.
+
+**Risk / open decisions:**
+
+- **Data integrity: no matching `ChildRef` found at all.** `person.handle`
+  listed in a family's `parent_family_list` with no corresponding entry in
+  that family's own `child_ref_list` is inconsistent data (shouldn't
+  happen, but "shouldn't" isn't "can't") -- the real rule's own
+  `ref[0].frel` would raise `IndexError` on it, silently corrupting the
+  *whole* filter run in gramps-core today. GOQL's version should treat "no
+  matching link" as "this family contributes nothing" (skip, not match,
+  not error) -- the `WHERE` correlation already does this for free in SQL
+  (no matching row simply isn't produced), and the evaluator's `next(...,
+  None)` should follow the same rule explicitly, deliberately more
+  defensive than the code it's replacing.
+- **Multiple matching entries** (a person listed twice in the same
+  family's `child_ref_list` -- also inconsistent data). `EXISTS`/`any
+  matching entry satisfies` is the natural SQL semantics and doesn't need
+  a special case; the real rule's `ref[0]` would just take the first one
+  arbitrarily, silently ignoring the second -- GOQL's `EXISTS`-based
+  semantics ("was *any* matching entry adopted") is arguably more correct
+  than the code it's replacing, not just different.
+- **Naming: `child_refs` is Person/Family/`ChildRef`-specific, not a
+  general "self-linked collection" registered everywhere.** Gramps has a
+  few other Ref-object shapes with their own sub-fields that a rule could
+  plausibly key on the same way (`AssociationRef`'s own relationship-type
+  string, `RepoRef`'s own media type) -- but with exactly one concrete
+  consumer (`child_refs`) so far, register only that one, matching this
+  project's own established pattern (`Backlinks`/`_class`, `Place.
+  enclosed_by`) of building the concrete case first and generalizing only
+  once a second consumer actually shows up.
+- **Privacy.** No new handling anticipated -- `evaluator.py`'s
+  `_self_linked_entries` walks whatever `family`/`person` a `db`/proxy
+  already handed back (a private family or a private child-ref's sibling
+  fields are already whatever the proxy's own `sanitize_*` left them as,
+  same reasoning as every other collection condition -- see `evaluator.py`'s
+  own module docstring), so correctness should follow without a dedicated
+  guard, the same way it did for `len()`/`Exists`/`CollectionCount`. Worth
+  an explicit `PrivateProxyDb` test regardless, given the double-unnest
+  shape is new.
+
+**Recommended scope for a v1:** design 1 above (`Person.child_refs`, a
+narrowly-scoped `Collection` extension), built only after `any()` ships
+(reuses its element-schema-resolution machinery directly); `frel.value`/
+`mrel.value` comparisons only (matching the nested-`GrampsType` shape every
+other `.value`-suffixed constant comparison in this language already uses);
+no matching link treated as "this family contributes nothing," never an
+error.
 
 ### Sortable JSON/relationship columns (`order_by`/keyset on `JsonPath`/`RelatedObject`) (item K)
 
@@ -1400,11 +1655,12 @@ it" rule).
 
 A quick-reference table (informal 1-5 scale, 1 = easy, 5 = hard) gathering
 gaps described elsewhere in this document into one place for planning
-purposes. Only `len()`, `any()`, and K (sortable JSON/relationship
-`order_by` columns) have difficulty ratings arrived at through actual
-layer-by-layer scoping (see their sections above); the rest are estimates
-by analogy to those two and to `count()`'s actual implementation cost, not
-independently measured the same way. (LIKE
+purposes. Only `len()`, `any()`, M (the correlated-`ChildRef` gap behind
+"adopted"), and K (sortable JSON/relationship `order_by` columns) have
+difficulty ratings arrived at through actual layer-by-layer scoping (see
+their sections above); the rest are estimates by analogy to those two and to
+`count()`'s actual implementation cost, not independently measured the same
+way. (LIKE
 case-sensitivity parity is deliberately not in this table -- it's a
 database/collation concern, not a `where_expr` language gap.)
 
@@ -1424,8 +1680,9 @@ here, struck through, so that history stays legible.
 | F | `event.type == EventType.MARRIAGE` (or `FamilyRelType.*`, `NameType.*`, ...) | ~~only `Person`/`Citation`/`Note` constants wired~~ -- **stale, already Done**: `_CONSTANT_CLASSES` (query_lang.py) already covers `EventType`/`FamilyRelType`/`NameType`/`PlaceType`/and 10 more `GrampsType` classes, verified directly against a live parse (`event.type.value == EventType.BIRTH` compiles today). This row's original premise no longer holds; kept only as a note to fix the "Values and functions" bullet in Current limitations, not as an open item. | n/a |
 | G | `len(primary_name.surname_list) > 1` | see `len()` section above | 3 |
 | H | `upper(surname) == 'SMITH'`, string concatenation, arithmetic | no general function calls -- only `like()`/`Date()` are whitelisted | 3-4 |
-| I | `any(primary_name.surname_list, surname == 'Doyle')` | see `any()` section above | 5 |
+| I | `any(primary_name.surname_list, surname == 'Doyle')` | see the `any()`/`len()` unification section above | 5 |
 | J | `exists(children, surname == father.surname)` | `exists`/`count` conditions can't see the outer row | 4 |
+| M | `any(child_refs, frel.value == ChildRefType.ADOPTED)` (gramps-connect's "adopted" preset) | needs a correlated array lookup on the *joined* row's own field, matched back to the outer row's handle -- combines I and J's shapes, doesn't reduce to either alone | 5+ |
 | ~~K~~ | ~~`order_by=birth.date.sortval`, `order_by=primary_name.surname_list[0].surname`~~ | **Done** -- see [Sortable JSON/relationship columns](#sortable-jsonrelationship-columns-order_bykeyset-on-jsonpathrelatedobject-item-k) above | ~~3~~ |
 | ~~L~~ | ~~any `order_by`/`limit`/`after` under a proxy (e.g. `PrivateProxyDb`)~~ | **Done** -- see [Evaluator-path pagination/sort parity](#evaluator-path-paginationsort-parity-order_bylimitafterselect) above | ~~3-4~~ |
 
@@ -1533,12 +1790,18 @@ each other cheaper:
   recommended v1 scope (left-hand-side only, against a literal) sidesteps
   this on purpose, so it isn't a dependency today -- just a seam that
   reopens if that scope grows later.
-- **I depends on `exists()` (already Done), not on G.** `any()`'s
-  recursive condition-parsing trick (a synthetic empty-column
-  `ObjectTypeSpec` forcing every field reference through `JsonPath`) is
-  exactly what `exists()` already does. `len()` isn't a real prerequisite --
-  nesting `len()` inside an `any()` condition is a plausible nice-to-have,
-  not something I structurally depends on.
+- **I depends on `exists()`/`count()` (already Done), and now shares its
+  build with G's own two-argument extension, not just a nice-to-have
+  nesting relationship.** `any()`'s recursive condition-parsing trick (a
+  synthetic empty-column `ObjectTypeSpec` forcing every field reference
+  through `JsonPath`) is exactly what `exists()` already does. **Update, now
+  that `any()`/`len()` are scoped as one unification (see that section
+  above):** G (`len()`'s one-argument array-length form) already shipped
+  standalone and needs no rework, but G's *new* two-argument form
+  (`len(path, condition)`) and I (`any(path, condition)`) share one AST
+  node pair (`JsonArrayExists`/`JsonArrayCount`) and one subquery-body
+  builder -- building either alone doesn't make sense anymore; they ship
+  together.
 - **E, J, K were/are independent islands.** E (shipped) was pure registry
   entries plus its own `RelatedObject`-rendering fix, sharing no code with
   A-D/F-I -- its dependency was on the *actual object model*, not on
@@ -1554,6 +1817,19 @@ each other cheaper:
   paths once built -- a shared improvement, not new coupling, since a
   field-vs-field `where` comparison already has no `value` to drive that
   logic from today.
+- **M depends on I (`any()`), not on J.** M's recommended design (a new
+  `self_link_field`/`self_link_ref_field` pair on `Collection`) reuses I's
+  synthetic-element-spec/`json_extract(je.value, ...)` condition-resolution
+  machinery directly for the correlated `child_ref_list` entry -- it does
+  *not* build on J's "reference the outer row" mechanism at all, because
+  the correlation is baked into `child_refs`'s own SQL rendering rather than
+  exposed as something a `where_expr` author's condition can reach for
+  generally. J and M solve looks-similar-but-different problems: J is about
+  a condition seeing *two real object rows* at once (`children`'s own
+  `surname` vs. the outer `father`'s), M is about finding *which array
+  element* in an already-joined row corresponds to the outer row at all,
+  with no general "reach the outer row's other fields" need once that
+  element is found.
 - **L shipped downstream of K, capped rather than independent, exactly as
   predicted.** L's own recommended v1 scope (flat columns only) landed
   deliberately capped at whatever K still supports today, so the evaluator
