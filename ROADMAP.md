@@ -1088,174 +1088,84 @@ does) and a SQL-vs-evaluator agreement test (`test_evaluator.py`), and doc
 examples (`docs/where_expr.md`, `README-query-language.md`,
 `test_where_expr_examples.py`).
 
+### Self-linked collection: `Person.child_refs` -- the correlated-`ChildRef` gap behind "adopted" (item M)
+
+Implemented -- `Person.child_refs` is a registered `Collection` like any
+other (`exists(child_refs, ...)`/`count(child_refs, ...)`/`any(...)`/
+`len(...)` all reach it identically, via the same `resolve_collection`
+lookup), but its condition is about a field on the *link* between two
+records, not either record itself: for each of a person's own parent
+families, the one entry in that family's own `child_ref_list` that names
+this person, exposing that entry's own `frel`/`mrel` (adopted/birth/step/
+...) -- verified against the real rule this was built for
+(`gramps.gen.filters.rules.person.HaveAltFamilies`, gramps-connect's
+"adopted" filter preset), not inferred from its own description.
+
+**`Collection` grew two new optional fields**, `self_link_field`/
+`self_link_ref_field` (`None` for every ordinary collection -- additive,
+not a breaking change), and `_collection_subquery_body` grew a second,
+correlated unnest stage when they're set: after the ordinary join to the
+target row (`Family`, for `child_refs`), a second `json_each`/
+`jsonb_array_elements` unnests *that row's own* `self_link_field`
+(`child_ref_list`), correlated back to the *outer* row (`Person`) by
+matching `self_link_ref_field` (`ref`) against its own handle -- reusing
+the exact same unnest-and-correlate pattern already used once for the
+first join, on a different alias (`link`, distinct from the first join's
+own `je`).
+
+**Needed no new AST node at all** -- `Exists`/`CollectionCount` render a
+self-linked collection unchanged; the only new rendering is the second
+unnest stage described above. The condition's own `JsonPath`s carry
+`base_column="link.value"` (reusing `any()`'s own `base_column` trick, a
+second value alongside its `"je.value"`) baked in from parse time, so
+`Comparison.compile()` needs no special handling for them either.
+
+**`ObjectTypeSpec` grew a matching `element_base_column` field** (`None`
+for every real spec) to carry which alias a synthetic per-element spec's
+condition should target -- `resolve_any_path` gained an optional
+`base_column` parameter (defaulting to `"je.value"`, its own existing
+behavior) so the same element-class-resolution machinery (`_class`, not
+`title` -- see `any()`'s own write-up above) could be reused verbatim for
+`child_refs`' own `ChildRef` element spec, just requesting `"link.value"`
+instead. `evaluator.py`'s own marker check generalized from "is this
+exactly `je.value`" to "is this anything other than `json_data`" for the
+same reason -- the evaluator only ever has one `obj` in scope at a time,
+so which exact marker string it is doesn't matter there the way it does in
+SQL (where each alias has to be textually distinct to avoid colliding in
+the same query).
+
+**`exists`/`count` (and `any`/`len`'s own shared collection-payload
+helper) needed one small, deliberate exception to "frozen, unchanged"**: a
+new shared `_collection_condition_spec` helper resolves a collection's
+condition against its own self-linked element spec instead of
+`collection.target` when `self_link_field` is set -- necessary for
+correctness (`frel`/`mrel` are `ChildRef`'s own fields, not `Family`'s),
+not a capability expansion for any collection that already existed.
+
+**Data-integrity edge case, handled exactly as scoped**: a person named in
+a family's `parent_family_list` with no matching entry in that family's own
+`child_ref_list` is inconsistent data -- the real `HaveAltFamilies` rule's
+own `ref[0]` would raise `IndexError` on it; this construct instead treats
+"no matching link" as "this family contributes nothing" (the `WHERE`
+correlation already does this for free in SQL; `evaluator.py`'s
+`_self_linked_entry` returns `None` explicitly for the same case).
+Multiple matching entries (also inconsistent data) get `EXISTS`/`any-
+matching-entry` semantics for free, arguably more correct than the rule's
+own arbitrary `ref[0]`.
+
+Verified against the real `HaveAltFamilies` rule and hand-built data
+matching its own motivating shape (an adopted-into-second-family person, a
+birth-only control, and the no-matching-`ChildRef` edge case, matched
+exactly), via SQL-shape assertions for both dialects (`test_query.py`),
+real end-to-end SQLite execution, `query_lang.py` parsing tests confirming
+the condition resolves against `ChildRef`'s own schema (not `Family`'s) and
+that `any`/`len` reach it identically to `exists`/`count`, an evaluator
+unit-test section including the data-integrity case and a `PrivateProxyDb`
+test (a private `ChildRef` entry is excluded, matching a private
+attribute's own exclusion elsewhere in this project), and a
+SQL-vs-evaluator agreement test.
+
 ## Possibilities
-
-### `any(child_refs, ...)` -- the correlated-`ChildRef` gap behind "adopted" (item M)
-
-Motivated by gramps-connect's "adopted" filter preset (`HaveAltFamilies`,
-see `DISABLED-FILTER-RULES.md`), left `supported: false` when
-`has-alternate-name`/`has-addresses` were fixed by `len()` alone -- this one
-is structurally different and genuinely still open. Verified against the
-rule's own source (`gramps.gen.filters.rules.person.HaveAltFamilies.
-apply_to_one`), not inferred from its preset `notes`:
-
-```python
-for fhandle in person.parent_family_list:
-    family = db.get_family_from_handle(fhandle)
-    if family:
-        ref = [ref for ref in family.child_ref_list if ref.ref == person.handle]
-        if ref[0].frel == ChildRefType.ADOPTED or ref[0].mrel == ChildRefType.ADOPTED:
-            return True
-return False
-```
-
-**Why this isn't `any()` (item I) or the "outer row" gap (item J) alone --
-it's a specific combination of both, on a specific pair of tables.** Every
-`Collection`'s condition today resolves against the *joined target row's own
-fields* (`exists(parent_families, gramps_id == 'F001')` reads `Family`'s own
-`gramps_id`). This rule needs something no existing or currently-planned
-piece reaches: *within* the joined `Family` row, find the one entry in
-*its own* `child_ref_list` array whose `ref` equals the *outer* `Person`
-row's own handle, and test *that entry's* `frel`/`mrel` -- an array lookup
-(`any()`'s territory) *correlated back to the outer row* (item J's
-territory), both at once, and specifically two levels removed from the
-true outermost row (the array lives on the *joined* row, not the row
-`any()` would naturally be invoked from). Generalizing `any()`+J to
-arbitrary nesting depth would be strictly harder than solving this
-concrete case directly -- see "Recommended v1 scope" below for the
-narrower route.
-
-**Difficulty:** large, and not obviously smaller than `any()` -- possibly
-the hardest item on this page, since it combines two "large" pieces (I, J)
-into one shape neither was designed to compose with, on top of a specific
-new SQL structure (a *second*, target-row-scoped `json_each`/
-`jsonb_array_elements` unnest, correlated back to the *original* outer
-table by name, not the collection's own target).
-
-**Two designs considered:**
-
-1. **A dedicated, narrow construct -- `Person.child_refs`, a new kind of
-   `Collection` whose "list" isn't a field on the current row at all, but
-   a *correlated array on another table*: for each family handle in
-   `person.parent_family_list`, the one entry (if any) in *that family's*
-   `child_ref_list` whose `ref` equals `person.handle`.** Reads naturally
-   as `any(child_refs, frel.value == ChildRefType.ADOPTED or mrel.value ==
-   ChildRefType.ADOPTED)` -- or, equally, the older `exists(child_refs,
-   ...)` spelling: since `child_refs` is a registered `Collection`, it
-   resolves via plain `resolve_collection` like any other, so both
-   keyword generations reach it identically once `any`/`exists` share their
-   dispatch (see the `any()`/`len()` unification above) -- no
-   outer-row-reference feature needed at the `where_expr`-author level at
-   all, because the correlation is baked into `child_refs`'s own
-   definition/rendering, not exposed as a general capability. This is the
-   recommended route -- see below.
-2. **A general "outer row reference" mechanism** (the "Other gaps" list's
-   own item J, `exists(children, surname == father.surname)`), generalized
-   to also work when nested two levels deep inside `any()`. Solves more
-   cases in principle (any future rule shaped like this one), but requires
-   threading "the correlated outer handle(s), at every nesting depth" through
-   the whole condition-compilation stack -- a much bigger, more speculative
-   change with no second concrete consumer yet to prove it against.
-
-**What design 1 (recommended) would take, layer by layer:**
-
-1. **`query.py`** -- extend `Collection` with two new optional fields,
-   `self_link_field: Optional[str]` (e.g. `"child_ref_list"`, the *target*
-   row's own array) and `self_link_ref_field: Optional[str]` (e.g. `"ref"`,
-   the sub-field on each of *that* array's entries to match against the
-   *outer* row's handle) -- `None` for every existing `Collection`
-   (`children`, `notes`, ...), so this is additive, not a breaking change to
-   the dataclass's existing consumers. `_collection_subquery_body` grows a
-   second, conditional unnest stage when `self_link_field` is set: after the
-   existing `family AS target WHERE target.handle = <handle_expr>` join,
-   add `, json_each(target.json_data, '$.<self_link_field>') AS link WHERE
-   json_extract(link.value, '$.<self_link_ref_field>') = <outer_table>.handle`
-   (SQLite) / the `jsonb_array_elements` equivalent (PostgreSQL) -- a second
-   application of the exact same unnest-and-correlate pattern
-   `_collection_source_sqlite`/`_collection_source_postgresql` already do
-   once, just correlated to `outer_table` (by name, already in scope) instead
-   of a field on the current row. `condition.compile(...)` then needs to run
-   against `link.value`'s own schema (`ChildRef`), not `target`'s
-   (`Family`) -- reusing `any()`'s "synthetic element `ObjectTypeSpec`,
-   condition fields render as `json_extract(link.value, ...)`" machinery
-   (item I) directly, which is why this only makes sense to build *after*
-   `any()` exists, even though it isn't `any()` itself.
-2. **`query_lang.py`** -- register `child_refs` in `_COLLECTIONS[PERSON.
-   table]` with `self_link_field="child_ref_list"`,
-   `self_link_ref_field="ref"`, target `FAMILY` (needed for
-   `resolve_collection`'s existing return shape, even though the condition
-   actually resolves against `ChildRef`'s schema, not `Family`'s, once
-   `self_link_field` is set) -- `resolve_collection`/`_translate_exists_
-   call`/`_translate_count_call` need one branch: when the resolved
-   `Collection` has `self_link_field` set, parse the condition against the
-   *link element's* synthetic spec (element class from the target's own
-   schema's `items["_class"]`, e.g. `Family.child_ref_list`'s items are
-   `ChildRef` -- see the `any()` section's own note above about `_class`
-   vs. `title`) instead of `collection.target`.
-3. **`evaluator.py`** -- `_collection_handles`'s counterpart needs a
-   `_self_linked_entries` helper: for each handle in `collection.list_path`,
-   fetch the target object (a real `Family`), then `next((e for e in
-   getattr(target, self_link_field) if getattr(e, self_link_ref_field) ==
-   obj.handle), None)` -- mirroring the real rule's own `[ref for ref in
-   family.child_ref_list if ref.ref == person.handle]` almost verbatim (both
-   walk real `ChildRef` objects via attribute access, not dicts -- unlike
-   `any()`'s own evaluator side, which walks a raw JSON list since it has no
-   real object per element), but returning `None` rather than crashing on
-   `ref[0]` when the list comprehension is empty (see risk note below -- the
-   *real* Gramps rule has a latent `IndexError` bug here on inconsistent
-   data; GOQL's version should not inherit it).
-4. **Docs + tests** -- the same four files as every prior addition, plus
-   `DISABLED-FILTER-RULES.md`/`gqlFilterPresets.ts` (the actual "adopted"
-   preset, once this ships) and a verification run against gramps-core's own
-   `example.gramps` fixture and the real `HaveAltFamilies` rule, the same way
-   `has-alternate-name`/`has-addresses` were verified.
-
-**Risk / open decisions:**
-
-- **Data integrity: no matching `ChildRef` found at all.** `person.handle`
-  listed in a family's `parent_family_list` with no corresponding entry in
-  that family's own `child_ref_list` is inconsistent data (shouldn't
-  happen, but "shouldn't" isn't "can't") -- the real rule's own
-  `ref[0].frel` would raise `IndexError` on it, silently corrupting the
-  *whole* filter run in gramps-core today. GOQL's version should treat "no
-  matching link" as "this family contributes nothing" (skip, not match,
-  not error) -- the `WHERE` correlation already does this for free in SQL
-  (no matching row simply isn't produced), and the evaluator's `next(...,
-  None)` should follow the same rule explicitly, deliberately more
-  defensive than the code it's replacing.
-- **Multiple matching entries** (a person listed twice in the same
-  family's `child_ref_list` -- also inconsistent data). `EXISTS`/`any
-  matching entry satisfies` is the natural SQL semantics and doesn't need
-  a special case; the real rule's `ref[0]` would just take the first one
-  arbitrarily, silently ignoring the second -- GOQL's `EXISTS`-based
-  semantics ("was *any* matching entry adopted") is arguably more correct
-  than the code it's replacing, not just different.
-- **Naming: `child_refs` is Person/Family/`ChildRef`-specific, not a
-  general "self-linked collection" registered everywhere.** Gramps has a
-  few other Ref-object shapes with their own sub-fields that a rule could
-  plausibly key on the same way (`AssociationRef`'s own relationship-type
-  string, `RepoRef`'s own media type) -- but with exactly one concrete
-  consumer (`child_refs`) so far, register only that one, matching this
-  project's own established pattern (`Backlinks`/`_class`, `Place.
-  enclosed_by`) of building the concrete case first and generalizing only
-  once a second consumer actually shows up.
-- **Privacy.** No new handling anticipated -- `evaluator.py`'s
-  `_self_linked_entries` walks whatever `family`/`person` a `db`/proxy
-  already handed back (a private family or a private child-ref's sibling
-  fields are already whatever the proxy's own `sanitize_*` left them as,
-  same reasoning as every other collection condition -- see `evaluator.py`'s
-  own module docstring), so correctness should follow without a dedicated
-  guard, the same way it did for `len()`/`Exists`/`CollectionCount`. Worth
-  an explicit `PrivateProxyDb` test regardless, given the double-unnest
-  shape is new.
-
-**Recommended scope for a v1:** design 1 above (`Person.child_refs`, a
-narrowly-scoped `Collection` extension), built only after `any()` ships
-(reuses its element-schema-resolution machinery directly); `frel.value`/
-`mrel.value` comparisons only (matching the nested-`GrampsType` shape every
-other `.value`-suffixed constant comparison in this language already uses);
-no matching link treated as "this family contributes nothing," never an
-error.
 
 ### Sortable JSON/relationship columns (`order_by`/keyset on `JsonPath`/`RelatedObject`) (item K)
 
@@ -1577,7 +1487,7 @@ here, struck through, so that history stays legible.
 | H | `upper(surname) == 'SMITH'`, string concatenation, arithmetic | no general function calls -- only `like()`/`Date()` are whitelisted | 3-4 |
 | ~~I~~ | ~~`any(primary_name.surname_list, surname == 'Doyle')`~~ | **Done** -- see [`any()`/`len()` unified with `exists()`/`count()`](#anylen-unified-with-existscount----one-dispatch-two-keyword-generations) above | ~~5~~ |
 | J | `exists(children, surname == father.surname)` | `exists`/`count` conditions can't see the outer row | 4 |
-| M | `any(child_refs, frel.value == ChildRefType.ADOPTED)` (gramps-connect's "adopted" preset) | needs a correlated array lookup on the *joined* row's own field, matched back to the outer row's handle -- combines I and J's shapes, doesn't reduce to either alone | 5+ |
+| ~~M~~ | ~~`any(child_refs, frel.value == ChildRefType.ADOPTED)` (gramps-connect's "adopted" preset)~~ | **Done** -- see [Self-linked collection: `Person.child_refs`](#self-linked-collection-personchild_refs----the-correlated-childref-gap-behind-adopted-item-m) above | ~~5+~~ |
 | ~~K~~ | ~~`order_by=birth.date.sortval`, `order_by=primary_name.surname_list[0].surname`~~ | **Done** -- see [Sortable JSON/relationship columns](#sortable-jsonrelationship-columns-order_bykeyset-on-jsonpathrelatedobject-item-k) above | ~~3~~ |
 | ~~L~~ | ~~any `order_by`/`limit`/`after` under a proxy (e.g. `PrivateProxyDb`)~~ | **Done** -- see [Evaluator-path pagination/sort parity](#evaluator-path-paginationsort-parity-order_bylimitafterselect) above | ~~3-4~~ |
 
@@ -1711,19 +1621,20 @@ each other cheaper:
   paths once built -- a shared improvement, not new coupling, since a
   field-vs-field `where` comparison already has no `value` to drive that
   logic from today.
-- **M depends on I (`any()`), not on J.** M's recommended design (a new
-  `self_link_field`/`self_link_ref_field` pair on `Collection`) reuses I's
-  synthetic-element-spec/`json_extract(je.value, ...)` condition-resolution
-  machinery directly for the correlated `child_ref_list` entry -- it does
-  *not* build on J's "reference the outer row" mechanism at all, because
-  the correlation is baked into `child_refs`'s own SQL rendering rather than
-  exposed as something a `where_expr` author's condition can reach for
-  generally. J and M solve looks-similar-but-different problems: J is about
-  a condition seeing *two real object rows* at once (`children`'s own
-  `surname` vs. the outer `father`'s), M is about finding *which array
-  element* in an already-joined row corresponds to the outer row at all,
-  with no general "reach the outer row's other fields" need once that
-  element is found.
+- **M depended on I (`any()`), not on J -- confirmed exactly as predicted,
+  now shipped.** M's design (`self_link_field`/`self_link_ref_field` on
+  `Collection`) reused I's synthetic-element-spec/`resolve_any_path`
+  machinery directly for the correlated `child_ref_list` entry (just
+  requesting a second `base_column`, `"link.value"`, alongside `any()`'s own
+  `"je.value"`) -- it did *not* build on J's "reference the outer row"
+  mechanism at all, because the correlation is baked into `child_refs`'s own
+  SQL rendering rather than exposed as something a `where_expr` author's
+  condition can reach for generally. J and M solve looks-similar-but-different
+  problems: J is about a condition seeing *two real object rows* at once
+  (`children`'s own `surname` vs. the outer `father`'s), M is about finding
+  *which array element* in an already-joined row corresponds to the outer
+  row at all, with no general "reach the outer row's other fields" need once
+  that element is found -- J remains open, unbuilt.
 - **L shipped downstream of K, capped rather than independent, exactly as
   predicted.** L's own recommended v1 scope (flat columns only) landed
   deliberately capped at whatever K still supports today, so the evaluator

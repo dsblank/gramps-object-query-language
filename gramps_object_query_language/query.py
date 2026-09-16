@@ -66,6 +66,21 @@ class ObjectTypeSpec:
     `cls` is what makes a `JsonPath` checkable rather than trusted: the
     flat columns are whitelisted by `columns`, and everything reachable
     inside `json_data` is whitelisted by the class's own JSON Schema.
+
+    `element_base_column` is `None` for every real spec (`PERSON`, `FAMILY`,
+    ...) -- set only on a *synthetic* spec built for one JSON array
+    element's own fields (`table=""`, `columns=frozenset()`, so every field
+    reference is forced through `JsonPath` -- see `resolve_any_path`), where
+    it names the SQL alias a condition's fields should actually render
+    against (`"je.value"` for `any()`'s own array element, `"link.value"`
+    for a self-linked `Collection`'s correlated link entry -- see
+    `Collection`'s own docstring) instead of the default `"json_data"`.
+    Threaded straight into `resolve_column_path`'s `base_column` parameter
+    by `json_column_to_ref` (query_lang.py) -- two different synthetic
+    contexts can't share one hardcoded marker string, since both can be
+    active in the same query (`any(...)` nested inside a self-linked
+    collection's own condition, or vice versa), each needing its *own*
+    unnest alias.
     """
 
     table: str
@@ -73,6 +88,7 @@ class ObjectTypeSpec:
     text_columns: frozenset[str]
     bool_columns: frozenset[str]
     cls: type[TableObject]
+    element_base_column: Optional[str] = None
 
 
 def _spec_for(
@@ -484,12 +500,33 @@ class Collection:
         objects (`"ref"`, for `ChildRef`/`EventRef`/... entries) -- `None`
         for a list that's already plain handle strings (`note_list`,
         `tag_list`).
+
+    `self_link_field`/`self_link_ref_field` (both `None` for every ordinary
+    collection above) mark a *self-linked* collection instead -- one whose
+    condition isn't about the joined target row's own fields at all, but
+    about one entry in *that row's own* array (`self_link_field`, e.g.
+    `"child_ref_list"`) that links back to the *current* (outer) row --
+    found by matching `self_link_ref_field` (e.g. `"ref"`) against the
+    outer row's own handle. `Person.child_refs` (query_lang.py's
+    `_COLLECTIONS`) is the one concrete case so far: "for each of my parent
+    families, the one `ChildRef` entry (if any) that is me" -- see
+    `ROADMAP.md`'s "adopted" write-up for why this needed its own construct
+    rather than a general "condition sees the outer row" mechanism. No new
+    AST node needed for this -- `Exists`/`CollectionCount` render it via a
+    second, correlated unnest stage in `_collection_subquery_body`, and the
+    condition's own `JsonPath`s already carry `base_column="link.value"`
+    (set once, at parse time -- see `query_lang.py`'s handling of
+    `self_link_field`), the same trick `any()`'s `base_column="je.value"`
+    already uses, just a second alias since a self-linked collection's own
+    `list_path` unnest already claims `je`.
     """
 
     name: str
     target: ObjectTypeSpec
     list_path: JsonPath
     ref_field: Optional[str]
+    self_link_field: Optional[str] = None
+    self_link_ref_field: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -692,7 +729,7 @@ def _terminal_json_path(ref: "ColumnRef", spec: ObjectTypeSpec) -> Tuple[JsonPat
 
 
 def resolve_any_path(
-    spec: ObjectTypeSpec, segments: Sequence[Union[str, int]]
+    spec: ObjectTypeSpec, segments: Sequence[Union[str, int]], base_column: str = "je.value"
 ) -> Tuple["ColumnRef", ObjectTypeSpec]:
     """Resolve `any(path, condition)`'s/`len(path, condition)`'s array-path
     argument -- the same `resolve_column_path` used for any other path,
@@ -701,6 +738,15 @@ def resolve_any_path(
     sub-field to write a condition against; `len(path) > 0`/`any(path)`
     alone already cover "has any at all" for them), and the synthetic
     `ObjectTypeSpec` the condition itself resolves against.
+
+    `base_column` (almost always left at its default) is stored on the
+    returned `element_spec` (see `ObjectTypeSpec.element_base_column`'s own
+    docstring) -- the one exception is a *self-linked* `Collection`'s own
+    condition (`Person.child_refs`, see `Collection`'s docstring), which
+    reuses this same function to derive its `ChildRef` element spec but
+    needs its condition's fields to render against `"link.value"` instead,
+    a different SQL alias from `any()`'s own `"je.value"` (see
+    `query_lang.py`'s `_collection_condition_spec`).
 
     Returns `(array_ref, element_spec)` -- `array_ref` is a `JsonPath`
     (same-row array) or a `RelatedObject` chain ending in one
@@ -746,7 +792,12 @@ def resolve_any_path(
         )
     element_cls = getattr(gramps_lib, class_name)
     element_spec = ObjectTypeSpec(
-        table="", columns=frozenset(), text_columns=frozenset(), bool_columns=frozenset(), cls=element_cls
+        table="",
+        columns=frozenset(),
+        text_columns=frozenset(),
+        bool_columns=frozenset(),
+        cls=element_cls,
+        element_base_column=base_column,
     )
     return ref, element_spec
 
@@ -801,6 +852,20 @@ _COLLECTIONS: dict[str, dict[str, Collection]] = {
         "families": Collection("families", FAMILY, JsonPath(("family_list",)), None),
         "parent_families": Collection(
             "parent_families", FAMILY, JsonPath(("parent_family_list",)), None
+        ),
+        # Self-linked: iterates the exact same parent_family_list as
+        # parent_families above, but the condition is about the specific
+        # ChildRef entry (frel/mrel, ...) that names *this* person as a
+        # child in that family -- not the joined Family row's own fields.
+        # See Collection's own docstring and ROADMAP.md's "adopted"
+        # write-up for why this needed its own registered shape.
+        "child_refs": Collection(
+            "child_refs",
+            FAMILY,
+            JsonPath(("parent_family_list",)),
+            None,
+            self_link_field="child_ref_list",
+            self_link_ref_field="ref",
         ),
         "associations": Collection(
             "associations", PERSON, JsonPath(("person_ref_list",)), "ref"
@@ -1873,6 +1938,31 @@ def _collection_source_postgresql(collection: Collection, outer_table: str) -> T
     return source, handle_expr, []
 
 
+def _self_link_source_sqlite(collection: Collection, target_alias: str) -> Tuple[str, str]:
+    """`(source, correlation_expr)` for a self-linked collection's *second*
+    unnest stage on SQLite -- iterates `target_alias`'s own
+    `self_link_field` array (aliased `link`, distinct from the first
+    unnest's own `je`, since both can appear in the same `FROM`),
+    extracting `self_link_ref_field` from each entry so the caller can
+    correlate it back to the outer row (`Person.child_refs`: `target_alias`
+    is the joined `Family`, `link` unnests its own `child_ref_list`,
+    correlated by `ref` matching the outer `Person`'s own handle).
+    """
+    return (
+        f"json_each({target_alias}.json_data, '$.{collection.self_link_field}') AS link",
+        f"json_extract(link.value, '$.{collection.self_link_ref_field}')",
+    )
+
+
+def _self_link_source_postgresql(collection: Collection, target_alias: str) -> Tuple[str, str]:
+    """`_self_link_source_sqlite`'s PostgreSQL counterpart."""
+    return (
+        f"jsonb_array_elements({target_alias}.json_data::jsonb -> "
+        f"'{collection.self_link_field}') AS link(value)",
+        f"link.value ->> '{collection.self_link_ref_field}'",
+    )
+
+
 def _collection_subquery_body(
     collection: Collection,
     outer_table: str,
@@ -1880,11 +1970,19 @@ def _collection_subquery_body(
     dialect: Dialect,
     treeid: Optional[int],
 ) -> Tuple[str, list]:
-    """`<target_table> AS <alias>, <source> WHERE <handle correlation>
-    [ AND (<condition>)][ AND <alias>.treeid = ?]` -- the subquery body
-    shared by `Exists` (`EXISTS (SELECT 1 FROM <body>)`) and
-    `CollectionCount` (`(SELECT COUNT(*) FROM <body>)`) alike; only the
-    wrapper differs.
+    """`<target_table> AS <alias>, <source>[, <self-link source>] WHERE
+    <handle correlation>[ AND <self-link correlation>][ AND (<condition>)]
+    [ AND <alias>.treeid = ?]` -- the subquery body shared by `Exists`
+    (`EXISTS (SELECT 1 FROM <body>)`) and `CollectionCount`
+    (`(SELECT COUNT(*) FROM <body>)`) alike; only the wrapper differs.
+
+    The bracketed self-link pieces only apply when `collection.
+    self_link_field` is set (see `Collection`'s own docstring) -- a second,
+    correlated unnest of the *joined* row's own array, aliased `link`, with
+    `condition`'s own `JsonPath`s already carrying `base_column=
+    "link.value"` from parse time (`query_lang.py`), so `condition.compile()`
+    needs no special handling here at all -- the same reason `any()`'s own
+    `base_column="je.value"` trick needed no new rendering code either.
 
     The target row is *always* aliased, even when `target_table !=
     outer_table` (the common case) -- a self-referencing collection (e.g.
@@ -1916,6 +2014,16 @@ def _collection_subquery_body(
 
     where_parts = [f"{target_alias}.handle = {handle_expr}"]
     params = list(source_params)
+    from_parts = [f"{target_table} AS {target_alias}", source]
+    if collection.self_link_field:
+        if dialect == Dialect.SQLITE:
+            link_source, link_correlation = _self_link_source_sqlite(collection, target_alias)
+        elif dialect == Dialect.POSTGRESQL:
+            link_source, link_correlation = _self_link_source_postgresql(collection, target_alias)
+        else:
+            raise QueryError(f"unsupported dialect: {dialect!r}")
+        from_parts.append(link_source)
+        where_parts.append(f"{link_correlation} = {outer_table}.handle")
     if condition is not None:
         cond_sql, cond_params = condition.compile(target, dialect, treeid)
         where_parts.append(f"({cond_sql})")
@@ -1924,7 +2032,7 @@ def _collection_subquery_body(
         where_parts.append(f"{target_alias}.treeid = ?")
         params.append(treeid)
 
-    body = f"{target_table} AS {target_alias}, {source} WHERE {' AND '.join(where_parts)}"
+    body = f"{', '.join(from_parts)} WHERE {' AND '.join(where_parts)}"
     return body, params
 
 

@@ -170,18 +170,23 @@ def get_json_path(obj: Any, path: JsonPath) -> Any:
     column -- using it here keeps the two paths interpreting a `JsonPath`
     identically without hand-duplicating that shape.
 
-    `base_column == "je.value"` marks a field inside an `any(...)`/
-    `len(..., condition)` condition (see `resolve_any_path`/
+    Any `base_column` other than `"json_data"` (`"je.value"`, `"link.value"`,
+    ...) marks a field inside an `any(...)`/`len(..., condition)` condition,
+    or a self-linked `Collection`'s own condition (see
+    `ObjectTypeSpec.element_base_column`/`resolve_any_path`/
     `resolve_column_path` in query.py) -- there, `obj` *is* already one
-    array element's raw dict (no real Gramps object exists per element,
-    see `_json_array_items`), so it's walked directly, skipping
-    `object_to_dict()` (which expects a real Gramps object, not a plain
-    dict already in the JSON shape it would otherwise produce).
+    array element's raw dict (no real Gramps object exists per element, see
+    `_json_array_items`/`_self_linked_entry`), so it's walked directly,
+    skipping `object_to_dict()` (which expects a real Gramps object, not a
+    plain dict already in the JSON shape it would otherwise produce). Which
+    exact marker string it is doesn't matter here -- unlike SQL, where each
+    one has to name a distinct alias so multiple unnests in the same query
+    don't collide, the evaluator only ever has one `obj` in scope at a time,
+    so any non-`"json_data"` value means the same thing: "this is already a
+    dict."
     """
-    if path.base_column == "je.value":
-        return _walk_json_path(obj, path.segments, obj)
     if path.base_column != "json_data":
-        raise ValueError(f"unsupported JsonPath base column: {path.base_column!r}")
+        return _walk_json_path(obj, path.segments, obj)
     data = json_utils.object_to_dict(obj)
     return _walk_json_path(data, path.segments, obj)
 
@@ -242,6 +247,35 @@ def _collection_handles(obj: Any, collection: Collection) -> list:
     return [item for item in items if item]
 
 
+def _self_linked_entry(related: Any, obj: Any, collection: Collection) -> Optional[dict]:
+    """The one entry (a dict, matching the SQL side's `link.value` shape --
+    see `query.py`'s `_self_link_source_sqlite`) in `related`'s own
+    `collection.self_link_field` array whose `collection.self_link_ref_field`
+    equals `obj`'s own handle -- `None` if no such entry exists (a
+    data-integrity edge case, e.g. `person.handle` listed in a family's
+    `parent_family_list` with no matching `ChildRef` in that family's own
+    `child_ref_list` -- treated as "this related row contributes nothing,"
+    not an error, unlike the real `HaveAltFamilies` rule this construct was
+    built for, whose own `ref[0]` would raise `IndexError` on exactly this
+    case; see `ROADMAP.md`'s "adopted" write-up).
+
+    Walks a plain dict (via `get_json_path`), not a real `ChildRef` object,
+    for the same reason `any()`'s own element-condition machinery does --
+    the condition's fields were parsed against a synthetic, table-less
+    `ObjectTypeSpec` (see `resolve_any_path`), so every one of them is a
+    `JsonPath`, never a flat-column `getattr`.
+    """
+    entries = get_json_path(related, JsonPath((collection.self_link_field,))) or []
+    return next(
+        (
+            e
+            for e in entries
+            if isinstance(e, dict) and e.get(collection.self_link_ref_field) == obj.handle
+        ),
+        None,
+    )
+
+
 def _backlink_handles(
     db: Any, obj: Any, condition: Optional[BacklinkClassFilter]
 ) -> Iterator[Tuple[str, str]]:
@@ -285,16 +319,21 @@ def _collection_count(db: Any, obj: Any, count: CollectionCount) -> int:
     """
     if isinstance(count.collection, Backlinks):
         return sum(1 for _ in _backlink_handles(db, obj, count.condition))
-    getter = getattr(db, GETTER_BY_TABLE[count.collection.target.table])
+    collection = count.collection
+    getter = getattr(db, GETTER_BY_TABLE[collection.target.table])
     matched = 0
-    for handle in _collection_handles(obj, count.collection):
+    for handle in _collection_handles(obj, collection):
         try:
             related = getter(handle)
         except HandleError:
             continue
-        if count.condition is None or evaluate_where(
-            db, related, count.condition, count.collection.target
-        ):
+        if collection.self_link_field:
+            entry = _self_linked_entry(related, obj, collection)
+            if entry is None:
+                continue
+            if count.condition is None or evaluate_where(db, entry, count.condition, collection.target):
+                matched += 1
+        elif count.condition is None or evaluate_where(db, related, count.condition, collection.target):
             matched += 1
     return matched
 
@@ -464,9 +503,13 @@ def _evaluate_tri(db: Any, obj: Any, expr: Any, spec: ObjectTypeSpec) -> Optiona
                 related = getter(handle)
             except HandleError:
                 continue
-            if expr.condition is None or evaluate_where(
-                db, related, expr.condition, collection.target
-            ):
+            if collection.self_link_field:
+                entry = _self_linked_entry(related, obj, collection)
+                if entry is None:
+                    continue
+                if expr.condition is None or evaluate_where(db, entry, expr.condition, collection.target):
+                    return True
+            elif expr.condition is None or evaluate_where(db, related, expr.condition, collection.target):
                 return True
         return False
     if isinstance(expr, JsonArrayExists):

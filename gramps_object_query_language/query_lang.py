@@ -410,7 +410,7 @@ def _translate_count_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:
         if isinstance(collection, Backlinks):
             payload["where"] = [_translate_backlinks_condition(node.args[1])]
         else:
-            payload["where"] = _translate_top_level(node.args[1], collection.target)
+            payload["where"] = _translate_top_level(node.args[1], _collection_condition_spec(collection))
     return {"count_of": payload}
 
 
@@ -454,6 +454,28 @@ def _try_resolve_bare_collection(node: ast.AST, spec: ObjectTypeSpec) -> Optiona
         return None
 
 
+def _collection_condition_spec(collection: "Collection") -> ObjectTypeSpec:
+    """The spec a `Collection`'s own `condition` resolves against --
+    ordinarily `collection.target` itself, but for a *self-linked*
+    collection (see `Collection`'s own docstring in query.py, e.g.
+    `Person.child_refs`), the condition is actually about one entry in the
+    target's own `self_link_field` array (a `ChildRef`, for `child_refs`),
+    not the target row's own fields -- reuses `any()`'s own
+    `resolve_any_path` to derive that entry's synthetic element spec, the
+    same `_class`-based element-class resolution `any()` already relies on.
+    Never called for `Backlinks` -- every call site already branches on
+    that first (`Backlinks` has no `self_link_field`, and its own
+    condition shape -- `BacklinkClassFilter` -- doesn't go through this
+    function at all).
+    """
+    if collection.self_link_field:
+        _, element_spec = resolve_any_path(
+            collection.target, (collection.self_link_field,), base_column="link.value"
+        )
+        return element_spec
+    return collection.target
+
+
 def _translate_collection_payload(node: ast.Call, collection: Union["Collection", Backlinks], spec: ObjectTypeSpec) -> dict:
     """`{"relationship": ..., "where": [...]}` -- shared by `any`/`len`'s
     own collection branch (once `node.args[0]` is known to resolve to
@@ -470,7 +492,7 @@ def _translate_collection_payload(node: ast.Call, collection: Union["Collection"
         if isinstance(collection, Backlinks):
             payload["where"] = [_translate_backlinks_condition(node.args[1])]
         else:
-            payload["where"] = _translate_top_level(node.args[1], collection.target)
+            payload["where"] = _translate_top_level(node.args[1], _collection_condition_spec(collection))
     return payload
 
 
@@ -826,7 +848,7 @@ def _translate_exists_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:
         if isinstance(collection, Backlinks):
             payload["where"] = [_translate_backlinks_condition(node.args[1])]
         else:
-            payload["where"] = _translate_top_level(node.args[1], collection.target)
+            payload["where"] = _translate_top_level(node.args[1], _collection_condition_spec(collection))
     return {"exists": payload}
 
 
@@ -1252,11 +1274,13 @@ def json_column_to_ref(column: Union[str, dict], spec: ObjectTypeSpec) -> Column
     unknown flat column. A single-segment string stays a flat column
     reference, whitelist-checked -- see `resolve_ref_string`.
     """
-    # `spec.table == ""` marks the synthetic per-element spec any(...)/
-    # len(..., condition) build (see resolve_any_path) -- every field
-    # reference inside such a condition resolves relative to the array
-    # element itself (`je.value`), not the row's own `json_data`.
-    base_column = "je.value" if spec.table == "" else "json_data"
+    # `spec.element_base_column` marks a synthetic per-element spec any()/
+    # len(..., condition)/a self-linked Collection's condition builds (see
+    # resolve_any_path/ObjectTypeSpec's own docstring) -- every field
+    # reference inside such a condition resolves relative to that specific
+    # array element (`je.value`/`link.value`, whichever the caller needed),
+    # not the row's own `json_data`.
+    base_column = spec.element_base_column or "json_data"
     if isinstance(column, str):
         return resolve_ref_string(spec, column, base_column)
     if "count_of" in column:
@@ -1267,7 +1291,7 @@ def json_column_to_ref(column: Union[str, dict], spec: ObjectTypeSpec) -> Column
         elif isinstance(collection, Backlinks):
             condition = _backlink_condition_from_json(payload["where"])
         else:
-            condition = where_list_to_ast(payload["where"], collection.target)
+            condition = where_list_to_ast(payload["where"], _collection_condition_spec(collection))
         return CollectionCount(collection, condition)
     if "length_of" in column:
         inner = column["length_of"]
@@ -1401,7 +1425,7 @@ def _node_from_json(node: dict, spec: ObjectTypeSpec) -> Any:
         elif isinstance(collection, Backlinks):
             condition = _backlink_condition_from_json(payload["where"])
         else:
-            condition = where_list_to_ast(payload["where"], collection.target)
+            condition = where_list_to_ast(payload["where"], _collection_condition_spec(collection))
         return Exists(collection, condition)
     if "any" in node:
         payload = node["any"]

@@ -1636,6 +1636,54 @@ def test_any_unknown_path_with_condition_rejected_eagerly():
         parse_expr("person", "len(bogus_field, value == 'X') > 0")
 
 
+# --- Self-linked collections (Person.child_refs, the "adopted" gap) -----------
+
+
+def test_exists_child_refs_condition_resolves_against_child_ref_not_family():
+    # frel/mrel are ChildRef's own fields, not Family's -- confirms the
+    # condition parses against the self-linked element spec, not
+    # collection.target (Family).
+    result = parse_expr("person", "exists(child_refs, frel.value == ChildRefType.ADOPTED)")
+    assert result == [
+        {"exists": {"relationship": "child_refs", "where": [{"column": {"json_path": ["frel", "value"]}, "op": "eq", "value": 2}]}}
+    ]
+
+
+def test_exists_child_refs_rejects_a_family_only_field():
+    # gramps_id is real on Family, but not on ChildRef. Parses fine
+    # (condition fields are never schema-checked at parse time, only the
+    # array-path/collection-name argument is -- same deferred-validation
+    # story as any other unresolved plain path, see
+    # test_where_expr_rejects_unknown_field); fails once the condition is
+    # actually resolved against ChildRef's schema, not Family's.
+    with pytest.raises(QueryError, match="unknown field 'gramps_id' on Child"):
+        compile_expr("person", "exists(child_refs, gramps_id == 'F001')")
+
+
+def test_any_of_child_refs_matches_exists():
+    assert parse_expr("person", "any(child_refs, frel.value == ChildRefType.ADOPTED)") == parse_expr(
+        "person", "exists(child_refs, frel.value == ChildRefType.ADOPTED)"
+    )
+
+
+def test_len_of_child_refs_matches_count():
+    assert parse_expr("person", "len(child_refs, frel.value == ChildRefType.ADOPTED) > 0") == parse_expr(
+        "person", "count(child_refs, frel.value == ChildRefType.ADOPTED) > 0"
+    )
+
+
+def test_compile_expr_child_refs_produces_exists_with_link_value_base_column():
+    spec, where = compile_expr(
+        "person", "any(child_refs, frel.value == ChildRefType.ADOPTED or mrel.value == ChildRefType.ADOPTED)"
+    )
+    assert isinstance(where, Exists)
+    assert where.collection.self_link_field == "child_ref_list"
+    # Both operands of the Or resolved against the link entry (je.value
+    # would be wrong here -- that's any()'s own marker, a different unnest).
+    assert where.condition.exprs[0].column.base_column == "link.value"
+    assert where.condition.exprs[1].column.base_column == "link.value"
+
+
 # --- compile_expr / compile_expr_for_spec (expr string -> query.py AST) ------
 
 

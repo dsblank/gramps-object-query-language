@@ -852,6 +852,44 @@ def test_any_of_path_rejects_list_of_scalars_doc_example():
         run(conn, "Person", "any(note_list, format == 0)")
 
 
+# --- Self-linked collections: Person.child_refs --------------------------------
+
+
+def test_child_refs_adopted_doc_example():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE person (handle TEXT, json_data TEXT)")
+    conn.execute("CREATE TABLE family (handle TEXT, father_handle TEXT, mother_handle TEXT, json_data TEXT)")
+
+    def person(handle, parent_family_handles):
+        conn.execute(
+            "INSERT INTO person VALUES (?, ?)",
+            (handle, json.dumps({"parent_family_list": list(parent_family_handles)})),
+        )
+
+    def family(handle, father_handle, child_ref_list):
+        conn.execute(
+            "INSERT INTO family VALUES (?, ?, NULL, ?)",
+            (handle, father_handle, json.dumps({"child_ref_list": child_ref_list})),
+        )
+
+    # pat1 was adopted into fam-adoptive (frel/mrel value 2 == ADOPTED),
+    # after being born into fam-bio (frel/mrel value 1 == BIRTH).
+    person("pat1", ["fam-bio", "fam-adoptive"])
+    family("fam-bio", "dad-bio", [{"ref": "pat1", "frel": {"value": 1}, "mrel": {"value": 1}}])
+    family("fam-adoptive", "dad-adoptive", [{"ref": "pat1", "frel": {"value": 2}, "mrel": {"value": 1}}])
+
+    # jo1 was never adopted -- born into just the one family.
+    person("jo1", ["fam-jo"])
+    family("fam-jo", "dad-jo", [{"ref": "jo1", "frel": {"value": 1}, "mrel": {"value": 1}}])
+
+    result = run(
+        conn,
+        "Person",
+        "any(child_refs, frel.value == ChildRefType.ADOPTED or mrel.value == ChildRefType.ADOPTED)",
+    )
+    assert result == [("pat1",)]
+
+
 # --- Date modifier/quality/dateval, via Date.MOD_*/QUAL_* constants ----------
 
 

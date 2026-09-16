@@ -5,7 +5,8 @@ backed by a GOQL preset registry at
 `../gramps-connect/app/src/data/gqlFilterPresets.ts`. Each preset maps a
 Gramps built-in Rule to a GOQL expression, with a `supported: boolean` flag.
 This doc started as the scoping pass for three `supported: false` presets;
-two are now fixed (see below), one remains open.
+all three are now fixed (see below) -- the registry has no remaining
+`supported: false` entries.
 
 ## 1. `has-alternate-name` — "People with an alternate name" — RESOLVED
 
@@ -25,28 +26,31 @@ two are now fixed (see below), one remains open.
   Verified exact match against gramps-core's own `example.gramps` fixture
   (2/2 people).
 
-## 2. `adopted` — "Adopted people" — STILL OPEN
+## 2. `adopted` — "Adopted people" — RESOLVED
 
 - Source Gramps rule: `HaveAltFamilies`
 - Blocker: the real rule walks each of a person's parent families, finds
   the `ChildRef` entry whose `ref` equals the person's own handle, and
-  checks *that entry's own* `frel`/`mrel` against `ChildRefType.ADOPTED`.
-  GOQL's `exists(parent_families, ...)` join only exposes the joined
-  Family row's own fields to the condition — `frel`/`mrel` live on the
-  `ChildRef` struct, a sibling of `ref` inside the family's child list, not
-  reachable through that join today.
-- What's needed: a way to join through to the specific `ChildRef` entry
-  matching the current person (not just the parent `Family` row), exposing
-  `frel`/`mrel` on that entry. Likely needs either a dedicated
-  `child_ref_in(parent_families, frel=..., mrel=...)`-style construct, or
-  making `parent_families` a richer join that carries the person's own
-  `ChildRef` alongside the joined `Family`.
-- **Not** the same gap as the other two turned out to be: this one is
-  about a field on the *join/link* itself (`ChildRef`), not a plain count
-  or a per-element condition over an array already living in the current
-  row — `any(path, condition)` (see below) wouldn't help here even once
-  built, since `parent_family_list` on Person is a plain list of Family
-  handles, not a list of `ChildRef` structs.
+  checks *that entry's own* `frel`/`mrel` against `ChildRefType.ADOPTED` —
+  a field on the *join/link* itself, not a plain count (#1/#3's actual
+  shape) or a per-element condition over an array already living in the
+  current row (`any(path, condition)`'s own shape, see below) --
+  `parent_family_list` on Person is a plain list of Family handles, not a
+  list of `ChildRef` structs, so neither `len()` nor `any()` alone reaches
+  this.
+- **Actual fix:** a new kind of *self-linked* `Collection` --
+  `Person.child_refs` -- registered exactly like any other collection
+  (reached identically via `exists`/`count`/`any`/`len`), but whose
+  condition is about one entry in the *joined* row's own array (`Family
+  .child_ref_list`) that links back to the outer row, not the joined row's
+  own fields. Built on top of `any()`'s own element-schema-resolution
+  machinery once that shipped (see `ROADMAP.md`'s "Self-linked collection:
+  `Person.child_refs`" write-up for the full design).
+- Registry updated: `expr: "any(child_refs, frel.value == ChildRefType
+  .ADOPTED or mrel.value == ChildRefType.ADOPTED)"`, `supported: true`.
+  Verified exact match against gramps-core's own `example.gramps` fixture
+  (2/2 people) and against the real rule's own `apply_to_one` source
+  directly, not inferred from its description.
 
 ## 3. `has-addresses` — "People with addresses" — RESOLVED
 
@@ -66,19 +70,26 @@ two are now fixed (see below), one remains open.
   (1/1 person), running the real rule with its own `["0", "greater than"]`
   parameterization for the equivalent comparison.
 
-## `any(path, condition)` — scoped, not built (not needed for #1/#3 after all)
+## `any(path, condition)` — built, and unified with `exists()`/`count()`
 
 A full session was spent scoping `any(path, condition)` — an intra-record
 JSON array *membership* test (unlike `len()`'s plain count) — before
 realizing, by reading the actual Gramps rule source for `#1`/`#3` above,
-that neither preset actually needed it: both are plain counts, fully
-covered by `len()` alone. The `any()` design (large difficulty, no target
-table, condition resolved against a synthetic per-element `ObjectTypeSpec`)
-is still recorded in `ROADMAP.md`'s "Possibilities" section for whenever a
-real per-element-field use case shows up (e.g. "people with a nickname
-recorded on *any* name, not just the primary one" — the `incomplete-names`/
-`has-nickname` presets' own still-open limitation, noted in their `notes`
-fields in `gqlFilterPresets.ts`).
+that *neither* of those two presets actually needed it: both are plain
+counts, fully covered by `len()` alone. It turned out to be needed anyway,
+for `#2` (`adopted`) once that was looked at properly — and once built, it
+was unified with `exists()`/`count()` as one shared dispatch (`any`/`len`
+are now the canonical spellings for both the collection case and the
+new array-membership case; `exists`/`count` stay as recognized, unchanged
+older spellings) rather than a separate standalone primitive. See
+`ROADMAP.md`'s "one dispatch, two keyword generations" write-up for the
+full design.
+
+The `incomplete-names`/`has-nickname` presets' own still-open limitation
+(noted in their `notes` fields in `gqlFilterPresets.ts` — GOQL only ever
+checked `primary_name`, not `alternate_names`) is now worth revisiting
+with `any()` in hand, but wasn't re-examined as part of this session --
+not one of the three presets this doc originally scoped.
 
 **Lesson for next time:** check the real Rule's own `apply_to_one` source
 first, before assuming a preset's GOQL gap matches the shape suggested by
@@ -91,5 +102,6 @@ Findings gathered 2026-09-16 in a gramps-connect session, from:
 - `app/src/data/gqlFilterPresets.ts` (registry + `notes` per preset)
 - `app/src/components/FilterPickerDialog.tsx` (disabled preset rendering)
 - `app/src/data/goqlFilterCombiner.ts` (reference to unsupported presets)
-- `gramps.gen.filters.rules.person.HasAlternateName`/`HasAddress` (real rule
-  source, read directly rather than inferred from the presets' own notes)
+- `gramps.gen.filters.rules.person.HasAlternateName`/`HasAddress`/
+  `HaveAltFamilies` (real rule source, read directly rather than inferred
+  from the presets' own notes)

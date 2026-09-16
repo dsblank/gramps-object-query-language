@@ -2248,6 +2248,124 @@ def test_json_array_exists_end_to_end_sqlite_execution():
     ]
 
 
+# --- Self-linked collections (Person.child_refs, the "adopted" gap) -----------
+
+
+def test_child_refs_registered_with_self_link_fields():
+    collection = resolve_collection(PERSON, "child_refs")
+    assert collection.target is FAMILY
+    assert collection.list_path == JsonPath(("parent_family_list",))
+    assert collection.ref_field is None
+    assert collection.self_link_field == "child_ref_list"
+    assert collection.self_link_ref_field == "ref"
+
+
+def test_ordinary_collections_have_no_self_link_fields():
+    # Additive dataclass fields, defaulted for every pre-existing
+    # registration -- confirms the new fields didn't silently creep onto
+    # collections that were never meant to have them.
+    for name in ("notes", "citations", "media", "tags", "families", "parent_families", "associations", "events"):
+        collection = resolve_collection(PERSON, name)
+        assert collection.self_link_field is None
+        assert collection.self_link_ref_field is None
+
+
+def test_child_refs_exists_sqlite_shape():
+    sql, params = compile_query(
+        PERSON,
+        Query(
+            select=["handle"],
+            where=Exists(resolve_collection(PERSON, "child_refs"), Eq(JsonPath(("frel", "value"), base_column="link.value"), 2)),
+        ),
+        dialect=Dialect.SQLITE,
+    )
+    assert (
+        "EXISTS (SELECT 1 FROM family AS family__target, json_each(person.json_data, ?) AS je, "
+        "json_each(family__target.json_data, '$.child_ref_list') AS link" in sql
+    )
+    assert "family__target.handle = je.value" in sql
+    assert "json_extract(link.value, '$.ref') = person.handle" in sql
+    assert "json_extract(link.value, ?)" in sql
+    assert params == ["$.parent_family_list", "$.frel.value", 2, 50]
+
+
+def test_child_refs_exists_postgresql_shape():
+    sql, params = compile_query(
+        PERSON,
+        Query(
+            select=["handle"],
+            where=Exists(resolve_collection(PERSON, "child_refs"), Eq(JsonPath(("frel", "value"), base_column="link.value"), 2)),
+        ),
+        dialect=Dialect.POSTGRESQL,
+    )
+    assert (
+        "jsonb_array_elements(family__target.json_data::jsonb -> 'child_ref_list') AS link(value)" in sql
+    )
+    assert "link.value ->> 'ref' = person.handle" in sql
+
+
+def test_child_refs_count_shares_same_shape_as_exists():
+    collection = resolve_collection(PERSON, "child_refs")
+    condition = Eq(JsonPath(("frel", "value"), base_column="link.value"), 2)
+    sql, params = compile_query(
+        PERSON, Query(select=["handle"], where=Gt(CollectionCount(collection, condition), 0)), dialect=Dialect.SQLITE
+    )
+    assert "(SELECT COUNT(*) FROM family AS family__target" in sql
+    assert "json_each(family__target.json_data, '$.child_ref_list') AS link" in sql
+
+
+def test_child_refs_end_to_end_sqlite_execution():
+    """Exercises the real motivating case (gramps-connect's "adopted"
+    filter) against hand-crafted data: a person adopted in one of two
+    parent families, a person who's a birth child everywhere, and a
+    data-integrity edge case (a family named in parent_family_list with no
+    matching ChildRef at all, which must not error or match)."""
+    import json
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE person (handle TEXT, json_data TEXT)")
+    conn.execute("CREATE TABLE family (handle TEXT, json_data TEXT)")
+
+    conn.execute(
+        "INSERT INTO person VALUES ('adopted-child', ?)",
+        (json.dumps({"parent_family_list": ["fam-bio", "fam-adoptive"]}),),
+    )
+    conn.execute(
+        "INSERT INTO family VALUES ('fam-bio', ?)",
+        (json.dumps({"child_ref_list": [{"ref": "adopted-child", "frel": {"value": 1}, "mrel": {"value": 1}}]}),),
+    )
+    conn.execute(
+        "INSERT INTO family VALUES ('fam-adoptive', ?)",
+        (json.dumps({"child_ref_list": [{"ref": "adopted-child", "frel": {"value": 2}, "mrel": {"value": 1}}]}),),
+    )
+
+    conn.execute(
+        "INSERT INTO person VALUES ('birth-child', ?)",
+        (json.dumps({"parent_family_list": ["fam-birth-only"]}),),
+    )
+    conn.execute(
+        "INSERT INTO family VALUES ('fam-birth-only', ?)",
+        (json.dumps({"child_ref_list": [{"ref": "birth-child", "frel": {"value": 1}, "mrel": {"value": 1}}]}),),
+    )
+
+    conn.execute(
+        "INSERT INTO person VALUES ('orphan-link', ?)",
+        (json.dumps({"parent_family_list": ["fam-no-childref"]}),),
+    )
+    conn.execute("INSERT INTO family VALUES ('fam-no-childref', ?)", (json.dumps({"child_ref_list": []}),))
+
+    collection = resolve_collection(PERSON, "child_refs")
+    condition = Or(
+        Eq(JsonPath(("frel", "value"), base_column="link.value"), 2),
+        Eq(JsonPath(("mrel", "value"), base_column="link.value"), 2),
+    )
+    sql, params = compile_query(
+        PERSON, Query(select=["handle"], where=Exists(collection, condition)), dialect=Dialect.SQLITE
+    )
+    assert conn.execute(sql, params).fetchall() == [("adopted-child",)]
+
+
 # --- Backlinks (reverse references, via Gramps' own `reference` table) --------
 
 
@@ -2394,6 +2512,7 @@ _EXPECTED_COLLECTIONS = {
     (PERSON, "tags"): (TAG, "tag_list", None),
     (PERSON, "families"): (FAMILY, "family_list", None),
     (PERSON, "parent_families"): (FAMILY, "parent_family_list", None),
+    (PERSON, "child_refs"): (FAMILY, "parent_family_list", None),
     (PERSON, "associations"): (PERSON, "person_ref_list", "ref"),
     (PERSON, "events"): (EVENT, "event_ref_list", "ref"),
     (FAMILY, "children"): (PERSON, "child_ref_list", "ref"),

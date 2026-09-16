@@ -356,6 +356,21 @@ living on the record, not a search across another table. `any(path)` alone
 (no condition) just asks "is there at least one at all," identical to
 `len(path) > 0`.
 
+### Goal: Find people who were adopted
+
+```
+Person "any(child_refs, frel.value == ChildRefType.ADOPTED or mrel.value == ChildRefType.ADOPTED)"
+```
+
+Gramps doesn't record "adopted" as a plain field on a person -- it's
+recorded on the *link* between a person and each of their parent families
+(the father's-side and mother's-side relationship, `frel`/`mrel`), since a
+person can be born into one family and later adopted into another.
+`child_refs` is a special collection for exactly this: for each of a
+person's own parent families, it reaches the one entry in that family's
+own child list that names *this* person, so `frel`/`mrel` mean that link's
+own relationship type, not a field on the person or the family themselves.
+
 ### Goal: Find families that have a child named Steve
 
 ```

@@ -557,6 +557,37 @@ whose surname is Smith) isn't supported yet -- see `ROADMAP.md`'s "Reverse
 relationships" item for why that needs a genuinely different, per-class
 construct rather than a straightforward extension of this one.
 
+## A self-linked collection: `Person.child_refs`
+
+Every collection so far reads like `exists(children, given_name == 'Steve')`
+-- a condition tested against the *joined row's own fields* (`children`'s
+condition sees a `Person`, `notes`' sees a `Note`). `child_refs` is the one
+exception: it's still a registered collection, reached the same way, but its
+condition is about a field on the *link* between the two records, not
+either record itself:
+
+```python
+Person "any(child_refs, frel.value == ChildRefType.ADOPTED or mrel.value == ChildRefType.ADOPTED)"
+```
+
+This is the query behind "was this person adopted" -- Gramps records that
+on the `ChildRef` entry a `Family` keeps for each of its children (`frel`/
+`mrel`, the father's/mother's side of the relationship), not on the
+`Person`/`Family` records themselves. `child_refs` walks each of a person's
+own parent families (`parent_family_list`, the same list `parent_families`
+above reaches) and, for each one, finds *the one entry in that family's own
+`child_ref_list` that names this person* -- `frel`/`mrel` (along with every
+other `ChildRef` field: `note_list`, `citation_list`, `private`) are that
+entry's own fields, not `Family`'s.
+
+`child_refs` composes with every keyword this page already covers --
+`exists(child_refs, ...)`, `count(child_refs, ...)`, and (per
+[Comprehension sugar](#comprehension-sugar-any-and-len) below) the
+`any`/`len` spellings all reach it identically, since it's a real
+registered collection like any other. What's different is entirely
+internal to how its own condition is resolved -- nothing about writing the
+query itself changes.
+
 ## Comprehension sugar: `any(...)` and `len([...])`
 
 `exists(children, given_name == 'Steve')` reads reasonably close to plain

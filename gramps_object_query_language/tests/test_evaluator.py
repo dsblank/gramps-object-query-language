@@ -35,6 +35,7 @@ from gramps.gen.dbstate import DbState
 from gramps.gen.lib import (
     Attribute,
     ChildRef,
+    ChildRefType,
     Citation,
     Event,
     EventType,
@@ -1069,3 +1070,171 @@ def test_proxy_excludes_backlink_from_a_private_referrer(backlinks_db_handles, b
     proxied_note = backlinks_proxy.get_note_from_handle(handles["privately_referenced_note"])
     where = Not(Exists(resolve_collection(NOTE, "backlinks")))
     assert evaluate_where(backlinks_proxy, proxied_note, where, NOTE) is True
+
+
+# --- Self-linked collections (Person.child_refs, the "adopted" gap) -----------
+
+
+@pytest.fixture(scope="module")
+def child_refs_db_handles():
+    """A person adopted into one of two parent families, a birth-only
+    control, and a data-integrity edge case (a family named in someone's
+    own `parent_family_list` with no matching `ChildRef` at all) -- the
+    exact shape `gramps.gen.filters.rules.person.HaveAltFamilies` (the real
+    rule behind gramps-connect's "adopted" filter) walks by hand.
+    """
+    dbman = CLIDbManager(DbState())
+    dirpath, db_name = dbman.create_new_db_cli("_test_evaluator_child_refs", dbid="sqlite")
+    db = make_database("sqlite")
+    db.load(dirpath)
+
+    handles = {}
+    with DbTxn("setup", db) as trans:
+        bio_father = Person()
+        handles["bio_father"] = db.add_person(bio_father, trans)
+        adoptive_father = Person()
+        handles["adoptive_father"] = db.add_person(adoptive_father, trans)
+
+        adopted_child = Person()
+        handles["adopted_child"] = db.add_person(adopted_child, trans)
+
+        bio_family = Family()
+        bio_family.set_father_handle(handles["bio_father"])
+        birth_ref = ChildRef()
+        birth_ref.set_reference_handle(handles["adopted_child"])
+        birth_ref.set_father_relation(ChildRefType.BIRTH)
+        bio_family.add_child_ref(birth_ref)
+        handles["bio_family"] = db.add_family(bio_family, trans)
+
+        adoptive_family = Family()
+        adoptive_family.set_father_handle(handles["adoptive_father"])
+        adopted_ref = ChildRef()
+        adopted_ref.set_reference_handle(handles["adopted_child"])
+        adopted_ref.set_father_relation(ChildRefType.ADOPTED)
+        adoptive_family.add_child_ref(adopted_ref)
+        handles["adoptive_family"] = db.add_family(adoptive_family, trans)
+
+        adopted_child.add_parent_family_handle(handles["bio_family"])
+        adopted_child.add_parent_family_handle(handles["adoptive_family"])
+        db.commit_person(adopted_child, trans)
+
+        control = Person()
+        handles["control"] = db.add_person(control, trans)
+        control_family = Family()
+        control_family.set_father_handle(handles["bio_father"])
+        control_ref = ChildRef()
+        control_ref.set_reference_handle(handles["control"])
+        control_ref.set_father_relation(ChildRefType.BIRTH)
+        control_family.add_child_ref(control_ref)
+        handles["control_family"] = db.add_family(control_family, trans)
+        control.add_parent_family_handle(handles["control_family"])
+        db.commit_person(control, trans)
+
+        # Data integrity: named in parent_family_list, but that family has
+        # no ChildRef for them at all (see ROADMAP.md's "adopted" write-up
+        # -- the real HaveAltFamilies rule's own ref[0] would crash here).
+        orphan_family = Family()
+        handles["orphan_family"] = db.add_family(orphan_family, trans)
+        orphan_link = Person()
+        handles["orphan_link"] = db.add_person(orphan_link, trans)
+        orphan_link.add_parent_family_handle(handles["orphan_family"])
+        db.commit_person(orphan_link, trans)
+
+        # Privacy: adopted, but the ChildRef entry itself is marked private.
+        private_father = Person()
+        handles["private_father"] = db.add_person(private_father, trans)
+        private_adopted = Person()
+        handles["private_adopted"] = db.add_person(private_adopted, trans)
+        private_family = Family()
+        private_family.set_father_handle(handles["private_father"])
+        private_ref = ChildRef()
+        private_ref.set_reference_handle(handles["private_adopted"])
+        private_ref.set_father_relation(ChildRefType.ADOPTED)
+        private_ref.set_privacy(True)
+        private_family.add_child_ref(private_ref)
+        handles["private_family"] = db.add_family(private_family, trans)
+        private_adopted.add_parent_family_handle(handles["private_family"])
+        db.commit_person(private_adopted, trans)
+
+    yield db, handles
+
+    db.close()
+    dbman.remove_database(db_name)
+
+
+@pytest.fixture(scope="module")
+def child_refs_proxy(child_refs_db_handles):
+    db, _handles = child_refs_db_handles
+    return PrivateProxyDb(db)
+
+
+def _adopted_condition():
+    frel = JsonPath(("frel", "value"), base_column="link.value")
+    mrel = JsonPath(("mrel", "value"), base_column="link.value")
+    return Or(Eq(frel, ChildRefType.ADOPTED), Eq(mrel, ChildRefType.ADOPTED))
+
+
+def test_evaluate_where_child_refs_matches_adopted_child(child_refs_db_handles):
+    db, handles = child_refs_db_handles
+    collection = resolve_collection(PERSON, "child_refs")
+    where = Exists(collection, _adopted_condition())
+
+    adopted = db.get_person_from_handle(handles["adopted_child"])
+    assert evaluate_where(db, adopted, where, PERSON) is True
+
+    control = db.get_person_from_handle(handles["control"])
+    assert evaluate_where(db, control, where, PERSON) is False
+
+
+def test_evaluate_where_child_refs_no_matching_link_is_false_not_error(child_refs_db_handles):
+    # The real HaveAltFamilies rule's own ref[0] would raise IndexError on
+    # this exact data shape -- GOQL's version must not.
+    db, handles = child_refs_db_handles
+    collection = resolve_collection(PERSON, "child_refs")
+    where = Exists(collection, _adopted_condition())
+    orphan = db.get_person_from_handle(handles["orphan_link"])
+    assert evaluate_where(db, orphan, where, PERSON) is False
+
+
+def test_evaluate_where_child_refs_count(child_refs_db_handles):
+    db, handles = child_refs_db_handles
+    collection = resolve_collection(PERSON, "child_refs")
+    count = CollectionCount(collection, _adopted_condition())
+    adopted = db.get_person_from_handle(handles["adopted_child"])
+    assert evaluate_where(db, adopted, Eq(count, 1), PERSON) is True
+    control = db.get_person_from_handle(handles["control"])
+    assert evaluate_where(db, control, Eq(count, 0), PERSON) is True
+
+
+def test_proxy_excludes_private_child_ref_entry(child_refs_db_handles, child_refs_proxy):
+    db, handles = child_refs_db_handles
+    collection = resolve_collection(PERSON, "child_refs")
+    where = Exists(collection, _adopted_condition())
+
+    raw_person = db.get_person_from_handle(handles["private_adopted"])
+    assert evaluate_where(db, raw_person, where, PERSON) is True
+
+    proxied_person = child_refs_proxy.get_person_from_handle(handles["private_adopted"])
+    assert evaluate_where(child_refs_proxy, proxied_person, where, PERSON) is False
+
+
+def test_sql_and_evaluator_agree_on_child_refs(child_refs_db_handles):
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+
+    db, handles = child_refs_db_handles
+    collection = resolve_collection(PERSON, "child_refs")
+    wheres = [Exists(collection, _adopted_condition()), Not(Exists(collection, _adopted_condition()))]
+    people = {
+        key: db.get_person_from_handle(handles[key])
+        for key in ("adopted_child", "control", "orphan_link")
+    }
+    for where in wheres:
+        sql, params = compile_query(
+            PERSON, Query(select=["handle"], where=where), dialect=Dialect.SQLITE
+        )
+        db.dbapi.execute(sql, params)
+        sql_matches = {row[0] for row in db.dbapi.fetchall()}
+        for key, person in people.items():
+            expected = handles[key] in sql_matches
+            actual = evaluate_where(db, person, where, PERSON)
+            assert actual == expected, f"{where!r} on {key!r}: SQL={expected} eval={actual}"
