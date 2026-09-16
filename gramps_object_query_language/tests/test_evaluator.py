@@ -70,6 +70,7 @@ from gramps_object_query_language.query import (
     Exists,
     Gt,
     In,
+    Length,
     Like,
     Ne,
     Not,
@@ -77,6 +78,7 @@ from gramps_object_query_language.query import (
     Regex,
     resolve_collection,
     resolve_column_path,
+    resolve_length_path,
 )
 
 
@@ -625,6 +627,70 @@ def test_sql_and_evaluator_agree_on_count(db_handles):
         for key, family in families.items():
             expected = handles[key] in sql_matches
             actual = evaluate_where(db, family, where, FAMILY)
+            assert actual == expected, f"{where!r} on {key!r}: SQL={expected} eval={actual}"
+
+
+# --- Length / len(...) (intra-record JSON array cardinality) ------------------
+
+
+def test_evaluate_where_length_counts_json_array(db_handles):
+    db, handles = db_handles
+    father = db.get_person_from_handle(handles["father"])
+    surnames = resolve_length_path(PERSON, ("primary_name", "surname_list"))
+    assert evaluate_where(db, father, Eq(surnames, 1), PERSON) is True
+    assert evaluate_where(db, father, Gt(surnames, 1), PERSON) is False
+
+
+def test_evaluate_where_length_zero_for_empty_list(db_handles):
+    db, handles = db_handles
+    mother = db.get_person_from_handle(handles["mother"])
+    attrs = resolve_length_path(PERSON, ("attribute_list",))
+    assert evaluate_where(db, mother, Eq(attrs, 0), PERSON) is True
+    assert evaluate_where(db, mother, Gt(attrs, 0), PERSON) is False
+
+
+def test_evaluate_where_length_relationship_chained(db_handles):
+    db, handles = db_handles
+    family = db.get_family_from_handle(handles["family"])
+    father_attrs = resolve_length_path(FAMILY, ("father", "attribute_list"))
+    assert evaluate_where(db, family, Eq(father_attrs, 0), FAMILY) is True
+
+
+def test_proxy_excludes_private_item_from_length(db_handles, proxy):
+    # secret_attr_person has one attribute, marked private -- the proxy
+    # drops it from attribute_list entirely (not just masking a field on
+    # it), so len() through the proxy comes back 0, matching the object the
+    # proxy's caller is actually allowed to see. No separate privacy
+    # handling needed here -- see the module docstring.
+    db, handles = db_handles
+    attrs = resolve_length_path(PERSON, ("attribute_list",))
+
+    raw_person = db.get_person_from_handle(handles["secret_attr_person"])
+    assert evaluate_where(db, raw_person, Eq(attrs, 1), PERSON) is True
+
+    proxied_person = proxy.get_person_from_handle(handles["secret_attr_person"])
+    assert evaluate_where(proxy, proxied_person, Eq(attrs, 0), PERSON) is True
+
+
+def test_sql_and_evaluator_agree_on_length(db_handles):
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+
+    db, handles = db_handles
+    attrs = resolve_length_path(PERSON, ("attribute_list",))
+    wheres = [Eq(attrs, 0), Gt(attrs, 0), In(attrs, [0, 1])]
+    people = {
+        key: db.get_person_from_handle(handles[key])
+        for key in ("father", "mother", "no_birth", "secret_attr_person")
+    }
+    for where in wheres:
+        sql, params = compile_query(
+            PERSON, Query(select=["handle"], where=where), dialect=Dialect.SQLITE
+        )
+        db.dbapi.execute(sql, params)
+        sql_matches = {row[0] for row in db.dbapi.fetchall()}
+        for key, person in people.items():
+            expected = handles[key] in sql_matches
+            actual = evaluate_where(db, person, where, PERSON)
             assert actual == expected, f"{where!r} on {key!r}: SQL={expected} eval={actual}"
 
 

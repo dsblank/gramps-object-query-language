@@ -49,9 +49,10 @@ Person "Date('Jan 1, 1968') < birth.date.sortval"
 Person "birth.date.sortval > Date('Jan 1, 1968')"
 ```
 
-These two lines are the same query. (This doesn't extend to `count(...)`,
-which is only ever recognized as the left-hand operand -- see
-[Counting a collection](#counting-a-collection-count).)
+These two lines are the same query. (This doesn't extend to `count(...)`/
+`len(...)`, each only ever recognized as the left-hand operand -- see
+[Counting a collection](#counting-a-collection-count) and
+[Array length](#array-length-lenpath).)
 
 ## Combining conditions with `and`, `or`, and `not`
 
@@ -381,14 +382,60 @@ Family "count(children) in [0, 1]"
 `count(...)` is deliberately narrower than a plain field: it's only
 recognized on a comparison's left-hand side, never on the right and never
 compared against another field or another `count(...)` (`count(a) ==
-count(b)` isn't supported) -- the same restriction `len()`'s own array-length
-form is planned to have (see `ROADMAP.md`), kept consistent between the two.
+count(b)` isn't supported) -- the same restriction `len(...)`'s own
+array-length form has (see [Array length](#array-length-lenpath) below),
+kept consistent between the two.
 
 Under the hood, `count(...)` reuses `exists(...)`'s own subquery shape
 verbatim, just wrapped as `(SELECT COUNT(*) FROM ...)` instead of
 `EXISTS (SELECT 1 FROM ...)` -- a missing collection (no children recorded
 at all) is `0`, not `NULL`, the same way `COUNT(*)` over zero matching rows
 always is in SQL.
+
+## Array length: `len(path)`
+
+`count(...)` measures a *collection* -- a list of handles reaching into
+another table (`Family.children`, `Person.notes`). `len(path)` measures a
+plain JSON array already living inside the current row itself, no second
+table involved -- an attribute list, a URL list, or (the motivating case)
+a person's *other* recorded surnames:
+
+```python
+Person "len(primary_name.surname_list) > 1"
+Person "len(note_list) > 0"
+```
+
+Gramps lets a person have several last names at once (a maiden name and a
+married name, say). Before `len(...)` existed, the only way to ask "does
+this person have more than one surname recorded" was checking whether a
+particular index position was filled in
+(`primary_name.surname_list[1].surname != None`) -- that only really answers
+"at least two," and breaks down for "at least three" or more. `len(...)`
+counts how many are actually there.
+
+Like `count(...)`, `len(...)` produces a *number*, so it appears as the
+left-hand side of a comparison (`len(note_list) > 0`, not a bare
+`len(note_list)`), supports `in` (`len(note_list) in [0, 1]`), and is
+deliberately narrower than a plain field: only ever the left-hand operand,
+never compared against another field or another `len(...)`.
+
+`path` can cross a relationship first, the same way any other field
+reference can:
+
+```python
+Family "len(father.attribute_list) > 0"
+```
+
+A missing path and a non-array value at that path both count as `0`, not
+`NULL` or an error -- "no list recorded" reads as "zero," not "unknown,"
+matching `count(...)`'s own "missing collection is `0`" behavior above.
+
+`len(...)` is a different feature from `count(...)`'s own list-comprehension
+sugar spelling, `len([... for x in rel])` (see
+[Comprehension sugar](#comprehension-sugar-any-and-len) below) -- Python's
+own call syntax keeps the two apart: `len(...)` wrapping a real list
+comprehension is that sugar; `len(...)` wrapping a plain path is this
+array-length form instead.
 
 ## Reverse references: `exists(backlinks)`
 

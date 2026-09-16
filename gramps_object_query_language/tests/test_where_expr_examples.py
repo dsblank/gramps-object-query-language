@@ -742,8 +742,37 @@ def test_multiple_surnames():
     person("maria1", "Maria", ["Garcia", "Lopez"])
     person("john1", "John", ["Smith"])
 
+    # The recommended way (see docs/where_expr.md's "Array length"): counts
+    # how many surnames are actually recorded, rather than only checking one
+    # fixed position.
+    result = run(conn, "Person", "len(primary_name.surname_list) > 1")
+    assert result == [("maria1",)]
+
+    # The older, index-based way still works too -- just fragile (only ever
+    # answers "at least two," and breaks down for "at least three").
     result = run(conn, "Person", "primary_name.surname_list[1].surname != None")
     assert result == [("maria1",)]
+
+
+# --- Array length: len(path) --------------------------------------------------
+
+
+def test_len_note_list_doc_example(db):
+    # dad1 has one note attached (see the fixture docstring above); everyone
+    # else has an empty note_list.
+    result = run(db, "Person", "len(note_list) > 0")
+    assert result == [("dad1",)]
+
+
+def test_len_zero_for_empty_list(db):
+    result = run(db, "Person", "len(note_list) == 0")
+    assert {row[0] for row in result} == {"mom1", "kid1", "other1", "granddad1", "grandma1"}
+
+
+def test_len_relationship_chained(db):
+    # fam1's father (dad1) has a note; fam2's father (granddad1) doesn't.
+    result = run(db, "Family", "len(father.note_list) > 0")
+    assert result == [("fam1",)]
 
 
 # --- Date modifier/quality/dateval, via Date.MOD_*/QUAL_* constants ----------

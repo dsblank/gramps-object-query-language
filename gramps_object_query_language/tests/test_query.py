@@ -47,6 +47,7 @@ from gramps_object_query_language.query import (
     Gte,
     In,
     JsonPath,
+    Length,
     Like,
     Lt,
     Lte,
@@ -71,6 +72,7 @@ from gramps_object_query_language.query import (
     path_value_type,
     resolve_collection,
     resolve_column_path,
+    resolve_length_path,
     resolve_ref_string,
     walk_schema,
 )
@@ -1983,6 +1985,105 @@ def test_collection_count_end_to_end_sqlite_execution():
         dialect=Dialect.SQLITE,
     )
     assert conn.execute(sql, params).fetchall() == [("fam-3kids",)]
+
+
+# --- Length / len(...) (intra-record JSON array cardinality) ------------------
+
+
+def test_length_requires_dialect():
+    ref = resolve_length_path(PERSON, ("attribute_list",))
+    with pytest.raises(QueryError):
+        compile_query(PERSON, Query(where=Gt(ref, 1)))
+
+
+def test_length_sqlite_shape():
+    ref = resolve_length_path(PERSON, ("primary_name", "surname_list"))
+    assert ref == Length(JsonPath(("primary_name", "surname_list")))
+    sql, params = compile_query(
+        PERSON, Query(select=["handle"], where=Gt(ref, 1)), dialect=Dialect.SQLITE
+    )
+    assert "COALESCE(json_array_length(json_data, ?), 0) > ?" in sql
+    assert params == ["$.primary_name.surname_list", 1, 50]
+
+
+def test_length_postgresql_shape():
+    ref = resolve_length_path(PERSON, ("attribute_list",))
+    sql, params = compile_query(
+        PERSON, Query(select=["handle"], where=Gt(ref, 0)), dialect=Dialect.POSTGRESQL
+    )
+    assert (
+        "CASE WHEN jsonb_typeof(jsonb_extract_path(json_data::jsonb, ?)) = 'array' "
+        "THEN jsonb_array_length(jsonb_extract_path(json_data::jsonb, ?)) ELSE 0 END > ?" in sql
+    )
+    assert params == ["attribute_list", "attribute_list", 0, 50]
+
+
+def test_length_relationship_chained_shape():
+    # len(father.attribute_list) -- Length pushed down onto the innermost
+    # field of the RelatedObject chain, not wrapping the RelatedObject
+    # itself (see resolve_length_path's docstring).
+    ref = resolve_length_path(FAMILY, ("father", "attribute_list"))
+    assert isinstance(ref, RelatedObject)
+    assert ref.field == Length(JsonPath(("attribute_list",)))
+    sql, params = compile_query(
+        FAMILY, Query(select=["handle"], where=Gt(ref, 0)), dialect=Dialect.SQLITE
+    )
+    assert "FROM person AS person__hop0" in sql
+    assert "COALESCE(json_array_length(json_data, ?), 0)" in sql
+    assert params == ["$.attribute_list", 0, 50]
+
+
+def test_length_rejects_non_array_field_on_related_object():
+    # A RelatedObject's own terminal *plain column* (not a JsonPath) can't be
+    # wrapped in Length -- there's no JSON array to measure.
+    with pytest.raises(QueryError):
+        resolve_length_path(FAMILY, ("father", "gender"))
+
+
+def test_default_ref_key_rejects_length():
+    ref = resolve_length_path(PERSON, ("attribute_list",))
+    with pytest.raises(QueryError):
+        default_ref_key(ref)
+
+
+def test_length_end_to_end_sqlite_execution():
+    """Exercises the two semantic edge cases the ROADMAP flagged as the real
+    risk in this feature: a genuinely missing path (NULL from
+    `json_array_length`) and a non-array JSON value at that path -- both
+    must come back as `0`, not `NULL`/an error/a false match.
+    """
+    import json
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE person (handle TEXT, json_data TEXT)")
+    conn.execute(
+        "INSERT INTO person VALUES ('two-attrs', ?)",
+        (json.dumps({"attribute_list": [{"value": "a"}, {"value": "b"}]}),),
+    )
+    conn.execute(
+        "INSERT INTO person VALUES ('empty-list', ?)", (json.dumps({"attribute_list": []}),)
+    )
+    conn.execute("INSERT INTO person VALUES ('missing-key', ?)", (json.dumps({}),))
+    conn.execute(
+        "INSERT INTO person VALUES ('non-array-value', ?)",
+        (json.dumps({"attribute_list": "not-a-list"}),),
+    )
+
+    ref = resolve_length_path(PERSON, ("attribute_list",))
+    sql, params = compile_query(
+        PERSON, Query(select=["handle"], where=Eq(ref, 0)), dialect=Dialect.SQLITE
+    )
+    assert conn.execute(sql, params).fetchall() == [
+        ("empty-list",),
+        ("missing-key",),
+        ("non-array-value",),
+    ]
+
+    sql, params = compile_query(
+        PERSON, Query(select=["handle"], where=Gt(ref, 1)), dialect=Dialect.SQLITE
+    )
+    assert conn.execute(sql, params).fetchall() == [("two-attrs",)]
 
 
 # --- Backlinks (reverse references, via Gramps' own `reference` table) --------

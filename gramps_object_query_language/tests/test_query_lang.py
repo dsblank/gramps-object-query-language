@@ -42,6 +42,7 @@ from gramps_object_query_language.query import (
     Gt,
     Gte,
     JsonPath,
+    Length,
     Lt,
     Not,
     Or,
@@ -1242,6 +1243,102 @@ def test_count_on_right_hand_side_rejected():
         parse_expr("family", "1 < count(children)")
 
 
+# --- len(...) (array-length comparisons) ---------------------------------------
+
+
+def test_len_produces_length_of_column():
+    result = parse_expr("person", "len(primary_name.surname_list) > 1")
+    assert result == [
+        {
+            "column": {"length_of": {"json_path": ["primary_name", "surname_list"]}},
+            "op": "gt",
+            "value": 1,
+        }
+    ]
+
+
+def test_len_plain_field_that_matches_a_flat_column():
+    # `_translate_column`'s own plain-string shortcut applies inside
+    # len(...) too, same as everywhere else a path is translated.
+    result = parse_expr("person", "len(gender) > 0")
+    assert result == [{"column": {"length_of": "gender"}, "op": "gt", "value": 0}]
+
+
+def test_len_condition_can_chain_relationships():
+    result = parse_expr("family", "len(father.attribute_list) > 0")
+    assert result == [
+        {
+            "column": {"length_of": {"json_path": ["father", "attribute_list"]}},
+            "op": "gt",
+            "value": 0,
+        }
+    ]
+
+
+def test_len_supports_in_operator():
+    result = parse_expr("person", "len(attribute_list) in [0, 1]")
+    assert result == [
+        {"column": {"length_of": {"json_path": ["attribute_list"]}}, "op": "in", "value": [0, 1]}
+    ]
+
+
+def test_len_composes_with_and():
+    result = parse_expr(
+        "person", "len(attribute_list) > 0 and given_name == 'Steve'"
+    )
+    assert result == [
+        {"column": {"length_of": {"json_path": ["attribute_list"]}}, "op": "gt", "value": 0},
+        {"column": "given_name", "op": "eq", "value": "Steve"},
+    ]
+
+
+def test_len_wrong_arity_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "len() > 1")
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "len(attribute_list, tag_list) > 1")
+
+
+def test_len_argument_must_be_a_path():
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "len('attribute_list') > 1")
+
+
+def test_len_bare_call_rejected():
+    # len(attribute_list) alone, with no comparison, isn't a leaf -- same as
+    # a bare path (gender, with no "== ...") being rejected.
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "len(attribute_list)")
+
+
+def test_len_field_vs_field_rejected():
+    # v1 scope: len(...) only supports comparison against a literal, not
+    # another field -- matching count(...)'s own restriction.
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "len(attribute_list) == len(tag_list)")
+
+
+def test_len_on_right_hand_side_rejected():
+    with pytest.raises(QueryLangError):
+        parse_expr("person", "1 < len(attribute_list)")
+
+
+def test_len_on_non_array_field_rejected_at_compile_time():
+    # "gender" is a real field, so it parses fine -- but it isn't a JSON
+    # array, so resolving it as a len(...) path fails once translation
+    # reaches query.py, same two-stage story as test_len_call_not_wrapping_
+    # listcomp_is_the_array_length_form above.
+    with pytest.raises(QueryError):
+        compile_expr("person", "len(gender) > 0")
+
+
+def test_compile_expr_len_array_length_shape():
+    _, where = compile_expr("person", "len(primary_name.surname_list) > 1")
+    assert isinstance(where, Gt)
+    assert where.column == Length(JsonPath(("primary_name", "surname_list")))
+    assert where.value == 1
+
+
 # --- comprehension sugar for exists(...)/count(...) --------------------------
 
 
@@ -1366,9 +1463,22 @@ def test_any_comprehension_not_wrapping_generator_rejected():
         parse_expr("family", "any(children)")
 
 
-def test_len_listcomp_not_wrapping_listcomp_rejected():
-    with pytest.raises(QueryLangError):
-        parse_expr("family", "len(children) > 2")
+def test_len_call_not_wrapping_listcomp_is_the_array_length_form():
+    # len(children) -- children is a bare name, not a list comprehension,
+    # so this is no longer the count()-sugar shape (see ROADMAP.md's naming
+    # note above _ComprehensionDesugarer) -- it parses as the array-length
+    # form (see the "len(...) (array-length comparisons)" section below)
+    # instead. It still doesn't *work*, just for a different reason and at
+    # a different stage: "children" is a registered Collection name, not a
+    # real JSON field on Family, so resolving it as a len(...) path fails
+    # at compile time, not at parse time (matching how any other unresolved
+    # plain path already behaves -- see test_where_expr_rejects_unknown_field).
+    result = parse_expr("family", "len(children) > 2")
+    assert result == [
+        {"column": {"length_of": {"json_path": ["children"]}}, "op": "gt", "value": 2}
+    ]
+    with pytest.raises(QueryError, match="unknown field"):
+        compile_expr("family", "len(children) > 2")
 
 
 def test_len_listcomp_computed_elt_rejected():

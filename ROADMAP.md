@@ -35,12 +35,13 @@ does today.
   table): `notes`/`citations`/`media`/`tags` wherever the type has them,
   plus `Person.families`/`parent_families`/`associations`/`events`,
   `Family.children`/`events`, `Place.enclosing_places`,
-  `Source.repositories`. `Tag` alone has no collections at all. There's
-  still no `len()` over a plain intra-record JSON array
-  (`primary_name.surname_list`, not a registered `Collection`), no `any(...)`
-  over one either, and no way for an `exists(...)`/`count(...)` condition to
-  reference the *outer* row (e.g. "a child with the same surname as the
-  father") -- all three still flagged as follow-ups, not solved here.
+  `Source.repositories`. `Tag` alone has no collections at all. `len(path)`
+  over a plain intra-record JSON array (`primary_name.surname_list`, not a
+  registered `Collection`) is now supported (see Done below); there's still
+  no `any(...)` (a *condition* over one, not just a count) and no way for an
+  `exists(...)`/`count(...)` condition to reference the *outer* row (e.g. "a
+  child with the same surname as the father") -- both still flagged as
+  follow-ups, not solved here.
 
 **Values and functions**
 - Three whitelisted function-call forms exist: `like(field, 'pattern')`,
@@ -565,17 +566,18 @@ never a longer chain). `all(...)`/`sum(...)` deliberately not covered --
 `all(...)` would need double-negation (`not exists(rel, not cond)`) for
 not much payoff without a concrete motivating case yet.
 
-**Naming note for whoever eventually builds the `len()`/`any()` items
-below:** both names are now spoken for by this sugar too, but the two
-meanings don't actually collide -- Python's own call syntax keeps them
+**Naming note:** both `any`/`len` are also spoken for by this sugar, but the
+two meanings don't actually collide -- Python's own call syntax keeps them
 apart. This sugar only ever fires when the *sole* argument is a real
-`ast.GeneratorExp`/`ast.ListComp` node (`_rewrite_any`/`_rewrite_len` in
-`query_lang.py` check the node type explicitly and raise otherwise); the
-array-length/membership forms described below take a bare path (or path +
-condition) as their argument instead, a different, unambiguous AST shape.
-Building either later item just means adding an `else` branch to the
-existing `any`/`len` dispatch in `_ComprehensionDesugarer.visit_Call` for
-"argument wasn't a comprehension," not renaming anything.
+`ast.GeneratorExp`/`ast.ListComp` node; a bare path (or path + condition)
+argument is a different, unambiguous AST shape. `len()`'s array-length form
+is built (see "Done" below, `### len() -- array-length comparisons`) --
+`_ComprehensionDesugarer.visit_Call`'s `name == "len"` branch now only
+rewrites when the argument really is an `ast.ListComp`, falling through
+(returning the node unchanged) otherwise, exactly the "add an `else` branch"
+this note originally anticipated. `any(...)`'s own array-membership form
+(`any(path, condition)`) is the one item of the two still open -- see
+"Possibilities" below.
 
 ### Path expressions in `select` (`birth.place.title`, `count(events) as n`)
 
@@ -940,95 +942,64 @@ temporary Gramps database, including a `PrivateProxyDb` test confirming a
 privately-referenced Note shows no backlinks through the proxy while the
 raw db still reports one (`test_evaluator.py`).
 
+### `len()` -- array-length comparisons
+
+Implemented -- `len(path) > 1` measures a plain JSON array already living
+inside the current row's own `json_data` (an attribute list, a URL list, a
+person's other recorded surnames), no second table involved -- the
+intra-record counterpart to `count(...)`'s cross-table collection
+cardinality. Motivated by "does a person have more than one surname
+recorded?", previously only answerable indirectly by indexing a fixed
+position (`primary_name.surname_list[1].surname != None`); see
+README-query-language.md's cookbook, now updated to the `len(...)` form.
+
+Copied `count()`'s own "column can be a computed value" plumbing directly
+rather than inventing it: a new `ColumnRef` variant, `Length(inner:
+ColumnRef)` (`query.py`), a new `{"length_of": {...}}` wire shape produced
+by `_translate_len_call`/`_is_len_call` and resolved via
+`resolve_length_path` (`query_lang.py`'s `_translate_column_or_computed`,
+generalized from `_translate_column_or_count`), and a matching `Length`
+branch in `evaluator.py`'s `resolve_column_ref` (`_length_of`).
+
+**Relationship-crossing (`len(father.attribute_list)`) pushes `Length` onto
+the innermost `field` of the resolved `RelatedObject` chain**, rather than
+wrapping the whole chain -- `resolve_length_path`/`_wrap_length` recurse
+through nested `RelatedObject`s the same way `resolve_column_path` built
+them, so `_render_related_object`'s existing field dispatch just needed one
+more `elif isinstance(related.field, Length)` branch, no new subquery shape.
+
+**The two semantic risk points flagged in the original scoping pass both
+needed real guards, not just documentation:**
+
+- **Missing path / non-array value both render as `0`, not `NULL` or an
+  error.** SQLite's `json_array_length` already returns `0` outright for a
+  non-array value, so only the missing-path case needed
+  `COALESCE(json_array_length(...), 0)`. PostgreSQL's `jsonb_array_length`
+  instead *errors* on a non-array value (confirmed: "cannot get array
+  length of a non-array") -- so there `CASE WHEN jsonb_typeof(...) =
+  'array' THEN jsonb_array_length(...) ELSE 0 END` is required, not
+  optional, and it covers the missing-path case for free too
+  (`jsonb_typeof(NULL)` is `NULL`, not `'array'`). `evaluator.py`'s
+  `_length_of` matches with a plain `len(value) if isinstance(value, list)
+  else 0`.
+- **Scope stayed left-hand-side-only, compared against a literal or `in`
+  list** -- exactly `count(...)`'s own v1 restriction, enforced the same
+  way (`_translate_compare` rejects `len(...)` on the right, or field-vs-
+  field against another `len(...)`/`count(...)`). A plain path resolving to
+  a flat column (not a JSON array) is also rejected, eagerly at
+  `resolve_length_path`/`_wrap_length` rather than deferred to SQL
+  rendering.
+
+Verified via SQL-shape assertions for both dialects including the
+relationship-chained case (`test_query.py`), real end-to-end SQLite
+execution specifically exercising the missing-key/empty-list/non-array-value
+trio against hand-crafted `json_data` rows (`test_query.py`), an evaluator
+unit-test section including a `PrivateProxyDb` test (a private attribute is
+dropped from the list entirely, not just masked, so `len()` through the
+proxy comes back one lower than the raw db -- `test_evaluator.py`), and a
+SQL-vs-evaluator agreement test.
+
 ## Possibilities
-
-### `len()` / array-length comparisons
-
-**Naming note:** `len(...)` is already in use for a *different* thing --
-comprehension sugar for `count(...)`, see Done above -- but the two don't
-collide; that form only fires when `len(...)`'s sole argument is a real
-`ast.ListComp` node, so a bare-path argument here (`len(x) > 1`) is free to
-mean this instead. Building this just adds an `else` branch to the
-existing dispatch, not a rename.
-
-Motivated by: "does a person have more than one surname recorded?" --
-today only answerable indirectly, by indexing a fixed position
-(`primary_name.surname_list[1].surname != None`, see
-README-query-language.md's cookbook) rather than asking for a count
-directly.
-
-**Note (written after `count()` shipped, see Done above):** the "column can
-be a computed value" plumbing this section originally worried about most is
-now a proven pattern, not a design risk -- `count()`'s
-`_translate_column_or_count`/`CollectionCount` did exactly this for
-`ColumnRef`, so `len()`'s parser/`query.py` work below can copy that shape
-directly rather than inventing it. The layer-by-layer breakdown and open
-semantic questions below are otherwise unchanged from the original pass.
-
-**Difficulty:** medium. **Invasiveness:** touches every layer (parser, both
-SQL dialects, the non-SQL evaluator, docs, tests), but each touch is small.
-Structurally bigger than a typical new-operator addition (e.g. the
-`'substring' in field` addition, ~210 lines across 9 files) because `len()`
-isn't a new comparison operator -- it's a new kind of *operand*, a computed
-value derived from a column, which has to be threaded through every place
-a "column" currently means "a path, verbatim."
-
-**What it would take, layer by layer:**
-
-1. **Parser (`query_lang.py`)** -- `len(x) > 1` breaks the assumption that a
-   comparison's left side is always `_translate_column(node.left, spec)`.
-   Needs a new case for `ast.Call(func=Name('len'))` before falling through
-   to plain path translation, producing a wire shape like
-   `{"column": {"length_of": {...}}, "op": "gt", "value": 1}`.
-   `_is_path_node` needs to keep saying "no" for `len(...)`, same as it
-   already does for `Date(...)`.
-2. **`query.py`** -- a new `ColumnRef` variant (e.g. `Length(inner:
-   ColumnRef)`), a new branch in `_render_column`, and dialect-specific
-   rendering:
-   - SQLite: easy -- `json_array_length(json_data, '$.path')` is a sibling
-     function to `json_extract`, same path syntax.
-   - PostgreSQL: harder -- `jsonb_array_length(...)` needs a *jsonb* value,
-     not text, so it has to reuse the `jsonb_extract_path` (non-`_text`)
-     branch that today only fires for numeric/boolean value-casting, not as
-     a general "give me raw jsonb" path.
-   - Wrapping a `RelatedObject` field (`len(father.aka_surnames)`) needs a
-     third branch in `_render_related_object`'s field dispatch, alongside
-     its existing `JsonPath`/`RelatedObject`/plain-column handling.
-3. **`evaluator.py`** -- a matching `Length` branch in `resolve_column_ref`
-   (`len(value) if isinstance(value, list) else ...`). This has to agree
-   with the SQL path on every input or the two execution modes silently
-   diverge -- the main correctness risk in the whole feature.
-4. **Docs + tests** -- `docs/where_expr.md`, `README-query-language.md`
-   (replacing the index-based workaround), plus `test_query_lang.py`,
-   `test_query.py` (both dialects -- SQL-shape assertions are expected for
-   each, per existing pattern), `test_evaluator.py`,
-   `test_where_expr_examples.py`.
-
-**Risk isn't the code, it's the semantics -- three decisions with no
-obviously-correct default:**
-
-- **Missing field.** `len(x)` where `x` doesn't exist at all -- SQLite's
-  `json_array_length` on a missing path returns `NULL`, not `0`. If that's
-  left as `NULL`, `len(x) != 0` renders via the existing `_NULL_SAFE_OPS`
-  machinery as `IS DISTINCT FROM`, and `NULL IS DISTINCT FROM 0` is
-  **true** -- so a person with *no list at all* would wrongly match "not
-  zero." Likely needs `COALESCE(json_array_length(...), 0)`, with the
-  evaluator side matched exactly.
-- **Non-array value at that path.** `len(surname)` (a string, not a list)
-  -- SQLite's `json_array_length` silently returns `0` for a non-array JSON
-  value rather than erroring. No schema is tracked at parse time, so
-  there's no way to reject `len()` on a scalar field up front -- misuse
-  just quietly returns 0/no-match instead of surfacing an error.
-- **Scope of where `len()` is legal.** Restricting it to "left side only,
-  compared against a literal" (`len(x) > 1`) is the safe, contained
-  version. Allowing it on the right, `len(a) == len(b)` field-vs-field, or
-  inside `select`, are each additional surface area worth cutting from a
-  first version.
-
-**Recommended scope for a v1:** `len(path) <op> <int literal>`, left-hand
-side only; missing path treated as `0` (matches user intuition -- "no list
-recorded" reads as "zero", not "unknown"); non-array-value and NULL-vs-zero
-edge cases written as tests *before* either dialect is wired up.
 
 ### `any(...)` -- intra-record JSON array membership
 
@@ -1129,12 +1100,12 @@ would be the item that first introduces the "a column can be a *computed*
 value, not just a path" plumbing through `_translate_column`/`ColumnRef`/
 `_render_column`. That plumbing turned out to arrive with `count()` itself
 instead (`_translate_column_or_count`, `CollectionCount` as a `ColumnRef`
-variant, both described under Done above) -- so `len()` is now the *easier*
-item of the two remaining, since it can copy that exact pattern
-(`_translate_column_or_len`, a `Length`/`ArrayLength` `ColumnRef` variant)
-rather than inventing it from scratch. `any()` still goes last: it needs
-that same pattern *and* its own new no-target-table `EXISTS`-over-JSON-array
-rendering on top, the one piece neither `count()` nor `len()` needs.
+variant, both described under Done above) -- so `len()` (now also Done, see
+above) came next and copied that exact pattern
+(`_translate_column_or_computed`, `Length` as a `ColumnRef` variant) rather
+than inventing it from scratch. `any()` is the one item left: it needs that
+same pattern *and* its own new no-target-table `EXISTS`-over-JSON-array
+rendering on top, the one piece neither `count()` nor `len()` needed.
 
 ### Sortable JSON/relationship columns (`order_by`/keyset on `JsonPath`/`RelatedObject`) (item K)
 

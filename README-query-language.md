@@ -331,15 +331,15 @@ Citation "confidence >= Citation.CONF_HIGH"
 ### Goal: Find people who have more than one last name recorded
 
 ```
-Person "primary_name.surname_list[1].surname != None"
+Person "len(primary_name.surname_list) > 1"
 ```
 
 Gramps lets a person have several last names at once (a maiden name and a
-married name, say) -- `surname_list[0]` is always the first one, and this
-checks whether a *second* one (`[1]`) exists at all. There's no direct way
-to ask "how many last names does this person have," but checking whether a
-particular position in the list is filled in works just as well for "two or
-more."
+married name, say). `len(...)` counts how many are actually recorded --
+before it existed, the only way to ask this was checking whether a
+particular position in the list was filled in
+(`primary_name.surname_list[1].surname != None`), which only really answers
+"two or more" and breaks down for "three or more."
 
 ### Goal: Find families that have a child named Steve
 

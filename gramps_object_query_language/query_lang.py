@@ -68,10 +68,10 @@ supports today:
   the value -- `5 < gender` and `gender > 5` compile to the identical wire
   node, via `_FLIP_OP` (`lt`<->`gt`, `lte`<->`gte`, `eq`/`ne` unchanged) --
   the wire shape always renders the path as `"column"`, regardless of which
-  side of the source expression it was written on. `count(...)` stays an
-  exception on purpose: it's only ever recognized when it's *the* left-hand
-  operand, per its own left-hand-side-only v1 scope (see
-  `_translate_column_or_count`) -- `2 < count(children)` doesn't flip into
+  side of the source expression it was written on. `count(...)`/`len(...)`
+  stay an exception on purpose: each is only ever recognized when it's *the*
+  left-hand operand, per its own left-hand-side-only v1 scope (see
+  `_translate_column_or_computed`) -- `2 < count(children)` doesn't flip into
   a supported shape, unlike `2 < gender`.
 - `in` has a second shape too: `'substring' in path` (a string literal on
   the left, a path on the right) is a plain substring test (`Contains`),
@@ -174,6 +174,7 @@ from .query import (
     default_ref_key,
     resolve_collection,
     resolve_column_path,
+    resolve_length_path,
     resolve_ref_string,
 )
 
@@ -418,18 +419,49 @@ def _is_count_call(node: ast.AST) -> bool:
     return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "count"
 
 
-def _translate_column_or_count(node: ast.AST, spec: ObjectTypeSpec) -> Union[str, dict]:
+def _is_len_call(node: ast.AST) -> bool:
+    """Is `node` a `len(path)` call (the array-length form, not the
+    list-comprehension sugar for `count(...)` -- that's already been rewritten
+    away by `_desugar_comprehensions` before this ever runs, see
+    `_ComprehensionDesugarer.visit_Call`)? Same role as `_is_count_call`, for
+    the same classify-before-translate reason.
+    """
+    return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "len"
+
+
+def _translate_len_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:
+    """Translate `len(path)` into `{"length_of": <column>}` -- the *value*-
+    producing counterpart to a plain path, for measuring a JSON array
+    already living inside the current row (`len(attribute_list)`,
+    `len(father.aka_surnames)`) rather than crossing to another table the
+    way `count(...)` does. `<column>` is whatever `_translate_column` would
+    already produce for that same path (a plain string or `{"json_path":
+    [...]}`) -- resolved into a real `Length` later, in
+    `json_column_to_ref`/`resolve_length_path`, the same two-stage way
+    `count(...)`'s `relationship` name is only resolved once translation
+    reaches `query.py`.
+    """
+    if len(node.args) != 1 or node.keywords:
+        raise QueryLangError("len(path) takes exactly 1 positional argument")
+    arg = node.args[0]
+    if not _is_path_node(arg):
+        raise QueryLangError(f"len(...)'s argument must be a field path: {ast.dump(node)}")
+    return {"length_of": _translate_column(arg, spec)}
+
+
+def _translate_column_or_computed(node: ast.AST, spec: ObjectTypeSpec) -> Union[str, dict]:
     """A comparison's column-like side: an ordinary path (`_translate_column`),
-    or a `count(...)` call -- the one place a "column" can be a *computed*
-    value rather than a path, verbatim. `count(...)` is deliberately not
-    recognized anywhere `_translate_column` itself is called directly (a
-    plain field on the other side of a comparison, `'in'`'s list/substring
-    branches) -- v1 scope only ever treats `count(...)` as *the* column,
-    never as something compared against another field, matching `len()`'s
-    own planned restriction (see ROADMAP.md).
+    or a `count(...)`/`len(...)` call -- the one place a "column" can be a
+    *computed* value rather than a path, verbatim. Neither is recognized
+    anywhere `_translate_column` itself is called directly (a plain field on
+    the other side of a comparison, `'in'`'s list/substring branches) -- v1
+    scope only ever treats either as *the* column, never as something
+    compared against another field (see ROADMAP.md).
     """
     if _is_count_call(node):
         return _translate_count_call(node, spec)
+    if _is_len_call(node):
+        return _translate_len_call(node, spec)
     return _translate_column(node, spec)
 
 
@@ -535,7 +567,7 @@ def _translate_compare(node: ast.Compare, spec: ObjectTypeSpec) -> dict:
     if op == "in":
         if isinstance(rhs, ast.List):
             # "field in [v1, v2, ...]" -- list membership.
-            column = _translate_column_or_count(node.left, spec)
+            column = _translate_column_or_computed(node.left, spec)
             value = _translate_list(rhs)
             if not value:
                 raise QueryLangError("'in' requires a non-empty list")
@@ -569,22 +601,22 @@ def _translate_compare(node: ast.Compare, spec: ObjectTypeSpec) -> dict:
             )
     else:
         left = node.left
-        if _is_path_node(left) or _is_count_call(left):
+        if _is_path_node(left) or _is_count_call(left) or _is_len_call(left):
             # "field OP value" / "field OP field" -- the shape this function
             # always assumed until operand-ordering was generalized. `left`
-            # is the column (or `count(...)`); `rhs` is either another field
-            # (`value_column`) or an ordinary value.
-            column = _translate_column_or_count(left, spec)
+            # is the column (or `count(...)`/`len(...)`); `rhs` is either
+            # another field (`value_column`) or an ordinary value.
+            column = _translate_column_or_computed(left, spec)
             if _is_path_node(rhs):
-                if isinstance(column, dict) and "count_of" in column:
-                    # count(...) is left-hand-side-only, against a literal (v1
-                    # scope, see ROADMAP.md) -- field-vs-field against a count
-                    # isn't supported, so reject explicitly rather than
-                    # silently building a value_column nothing downstream
-                    # can render.
+                if isinstance(column, dict) and ("count_of" in column or "length_of" in column):
+                    # count(...)/len(...) are left-hand-side-only, against a
+                    # literal (v1 scope, see ROADMAP.md) -- field-vs-field
+                    # against either isn't supported, so reject explicitly
+                    # rather than silently building a value_column nothing
+                    # downstream can render.
                     raise QueryLangError(
-                        f"count(...) only supports comparison against a literal value, "
-                        f"not a field: {ast.dump(node)}"
+                        f"count(...)/len(...) only support comparison against a literal "
+                        f"value, not a field: {ast.dump(node)}"
                     )
                 # Field-vs-field: "families where mother.death.date.sortval <
                 # father.death.date.sortval" -- the right-hand side is itself
@@ -598,10 +630,10 @@ def _translate_compare(node: ast.Compare, spec: ObjectTypeSpec) -> dict:
             # "value OP field", e.g. "Date('Jan 1, 1968') < mother.birth.sortval"
             # -- the literal happened to be written on the left. Flip the
             # operator so the column still renders on the wire's left, the
-            # one shape query.py/evaluator.py know how to read -- count(...)
-            # is deliberately not accepted here (see
-            # `_translate_column_or_count`'s docstring): only a plain path
-            # qualifies as "the column" on this side, matching count(...)'s
+            # one shape query.py/evaluator.py know how to read -- count(...)/
+            # len(...) are deliberately not accepted here (see
+            # `_translate_column_or_computed`'s docstring): only a plain path
+            # qualifies as "the column" on this side, matching their
             # existing left-hand-side-only v1 scope untouched.
             value = _translate_value(left)
             column = _translate_column(rhs, spec)
@@ -1005,16 +1037,17 @@ class _ComprehensionDesugarer(ast.NodeTransformer):
             generator = _comprehension_generator(comp, node)
             condition = _any_condition(comp, generator.target.id)
             return ast.copy_location(_make_call("exists", generator.iter, condition), node)
-        if name == "len":
-            if len(node.args) != 1 or not isinstance(node.args[0], ast.ListComp):
-                raise QueryLangError(
-                    "len(...) is only supported wrapping a list comprehension, "
-                    f"e.g. len([1 for x in rel if x.field == 1]): {ast.dump(node)}"
-                )
+        if name == "len" and len(node.args) == 1 and isinstance(node.args[0], ast.ListComp):
             comp = node.args[0]
             generator = _comprehension_generator(comp, node)
             condition = _len_condition(comp, generator.target.id)
             return ast.copy_location(_make_call("count", generator.iter, condition), node)
+        # `len(...)` on anything other than a list comprehension isn't this
+        # sugar's business -- it's the array-length form (`len(path) > 1`,
+        # see `_translate_len_call`), a different, unambiguous AST shape
+        # (see ROADMAP.md's naming note above `_ComprehensionDesugarer`).
+        # Left untouched here; `_translate_compare` rejects it later if
+        # `path` doesn't turn out to be a real argument shape either.
         return node
 
 
@@ -1092,18 +1125,24 @@ VALID_LEAF_OPS = frozenset(_OP_CLASSES) | {"in", "like", "regex", "contains"}
 
 def json_column_to_ref(column: Union[str, dict], spec: ObjectTypeSpec) -> ColumnRef:
     """A wire-format column reference (plain string, `{"json_path": [...]}`,
-    or `{"count_of": {...}}`), resolved to a `ColumnRef` -- via
-    `resolve_column_path`, so a path crossing a relationship
-    (`{"json_path": ["birth", "date", "sortval"]}`) becomes a `RelatedObject`
-    the same way it would coming from `object_query.py`, not a literal
-    `JsonPath(("birth", "date", "sortval"))` that would (harmlessly, but
-    incorrectly) look for a `birth` key inside `json_data` instead.
+    `{"count_of": {...}}`, or `{"length_of": ...}`), resolved to a
+    `ColumnRef` -- via `resolve_column_path`, so a path crossing a
+    relationship (`{"json_path": ["birth", "date", "sortval"]}`) becomes a
+    `RelatedObject` the same way it would coming from `object_query.py`, not
+    a literal `JsonPath(("birth", "date", "sortval"))` that would
+    (harmlessly, but incorrectly) look for a `birth` key inside `json_data`
+    instead.
     `{"count_of": {"relationship": ..., "where": [...]}}` resolves to a
     `CollectionCount` the same way `_node_from_json`'s `"exists"` case
     resolves to an `Exists` -- same `resolve_collection` lookup, same
     recursive `where_list_to_ast` for the optional condition (or, when
     `relationship` resolves to `Backlinks`, `_backlink_condition_from_json`
     instead -- see `_node_from_json`'s own docstring for why).
+    `{"length_of": <column>}` (`<column>` itself a plain string or
+    `{"json_path": [...]}`, whatever `_translate_column` produced) resolves
+    to a `Length` via `resolve_length_path` -- same two-stage resolution as
+    `count_of`, just against `resolve_column_path` instead of
+    `resolve_collection`.
 
     A plain string goes through `resolve_ref_string`, so a *dotted* one
     (`"birth.date.sortval"`) means the same thing here as the identical
@@ -1123,6 +1162,10 @@ def json_column_to_ref(column: Union[str, dict], spec: ObjectTypeSpec) -> Column
         else:
             condition = where_list_to_ast(payload["where"], collection.target)
         return CollectionCount(collection, condition)
+    if "length_of" in column:
+        inner = column["length_of"]
+        segments = (inner,) if isinstance(inner, str) else tuple(inner["json_path"])
+        return resolve_length_path(spec, segments)
     return resolve_column_path(spec, column["json_path"])
 
 
@@ -1326,7 +1369,7 @@ def parse_select_entry(spec: ObjectTypeSpec, entry: str) -> Tuple[SelectRef, str
         raise QueryLangError(f"could not parse select entry {entry!r}: {error}") from error
 
     try:
-        ref = json_column_to_ref(_translate_column_or_count(node, spec), spec)
+        ref = json_column_to_ref(_translate_column_or_computed(node, spec), spec)
     except (QueryLangError, QueryError) as error:
         raise QueryLangError(f"invalid select entry {entry!r}: {error}") from error
 

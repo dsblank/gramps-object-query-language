@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import enum
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterable, List, Optional, Sequence, Tuple, Union
 
 from gramps.gen.lib import (
@@ -556,6 +556,59 @@ class BacklinkClassFilter:
     value: Any
 
 
+@dataclass(frozen=True)
+class Length:
+    """How many elements are in a JSON array already living inside the
+    current row's own `json_data` -- `len(primary_name.surname_list) > 1`
+    compiles to `Gt(Length(JsonPath(("primary_name", "surname_list"))), 1)`,
+    the same "column can be a computed value" shape `CollectionCount` uses
+    for `count(...)`.
+
+    Unlike `CollectionCount` (always crosses to another table via a
+    registered `Collection`), `Length` never leaves the current row -- no
+    target table, no condition on elements (that's `any(...)`'s job, see
+    ROADMAP.md). `inner` is a `JsonPath` for `len(attribute_list)`, or a
+    `RelatedObject` chain whose own innermost `field` is a `JsonPath` for
+    `len(father.aka_surnames)` -- see `_render_related_object`'s field
+    dispatch and `resolve_length_path`.
+
+    Missing path and a non-array JSON value both evaluate/render as `0`, not
+    `NULL` -- "no list recorded" reads as "zero", not "unknown" (see
+    ROADMAP.md's `len()` write-up for the alternative considered and
+    rejected).
+    """
+
+    inner: "ColumnRef"
+
+
+def resolve_length_path(spec: ObjectTypeSpec, segments: Sequence[Union[str, int]]) -> "ColumnRef":
+    """Resolve `len(path)`'s argument -- the same `resolve_column_path` used
+    for any other path, with the result wrapped in `Length`.
+
+    A same-row path resolves to a plain `JsonPath`, wrapped directly
+    (`Length(JsonPath(...))`). A path crossing a relationship
+    (`father.aka_surnames`) resolves to a `RelatedObject` chain instead --
+    `Length` only means something applied to the JSON array at the very end
+    of that chain, so it's pushed down onto the chain's innermost `field`
+    rather than wrapping the whole `RelatedObject` (which would ask "the
+    length of a related *object*", not of one of its fields).
+    """
+    ref = resolve_column_path(spec, segments)
+    if isinstance(ref, RelatedObject):
+        return replace(ref, field=_wrap_length(ref.field))
+    return _wrap_length(ref)
+
+
+def _wrap_length(field: "ColumnRef") -> "ColumnRef":
+    if isinstance(field, RelatedObject):
+        return replace(field, field=_wrap_length(field.field))
+    if not isinstance(field, JsonPath):
+        raise QueryError(
+            f"len(...) requires a JSON array path, not a flat column: {field!r}"
+        )
+    return Length(field)
+
+
 def _generic_collections(
     *, notes: bool = False, citations: bool = False, media: bool = False, tags: bool = False
 ) -> dict[str, Collection]:
@@ -876,7 +929,7 @@ class FlatColumnRef:
 # `FlatColumnRef`) a flat column marked as a field rather than a literal --
 # `field: ColumnRef` on `RelatedObject` makes this recursive, so a chain
 # like `birth.place.title` is itself a valid `ColumnRef`.
-ColumnRef = Union[str, JsonPath, RelatedObject, CollectionCount, FlatColumnRef]
+ColumnRef = Union[str, JsonPath, RelatedObject, CollectionCount, FlatColumnRef, Length]
 SelectRef = ColumnRef
 
 
@@ -937,6 +990,56 @@ def _render_json_path(
             params,
         )
     raise QueryError(f"unsupported dialect: {dialect!r}")
+
+
+def _render_length_of_json_path(path: JsonPath, dialect: Dialect) -> Tuple[str, list]:
+    """`len(x)`'s SQL rendering, given the `JsonPath` at the innermost end of
+    a (possibly relationship-crossing) `Length` -- how many elements are in
+    the JSON array there.
+
+    Missing path and a non-array JSON value both render as `0`, not `NULL`
+    or an error -- but the two dialects need different guards to get there.
+    SQLite's `json_array_length` already returns `0` outright for a
+    non-array JSON value, so only the missing-path case (`NULL`) needs an
+    explicit `COALESCE`. PostgreSQL's `jsonb_array_length` instead *errors*
+    ("cannot get array length of a non-array") on a non-array value, so the
+    `CASE`/`jsonb_typeof` guard here is required, not optional -- and once
+    it's there it covers the missing-path case for free too:
+    `jsonb_typeof(NULL)` is `NULL`, not `'array'`, so the same `ELSE 0`
+    branch fires for both.
+    """
+    if dialect == Dialect.SQLITE:
+        jsonpath = "$" + "".join(
+            f"[{segment}]" if isinstance(segment, int) else f".{segment}"
+            for segment in path.segments
+        )
+        return f"COALESCE(json_array_length({path.base_column}, ?), 0)", [jsonpath]
+    if dialect == Dialect.POSTGRESQL:
+        placeholders = ", ".join(["?"] * len(path.segments))
+        params = [str(segment) for segment in path.segments]
+        extract = f"jsonb_extract_path({path.base_column}::jsonb, {placeholders})"
+        return (
+            f"CASE WHEN jsonb_typeof({extract}) = 'array' "
+            f"THEN jsonb_array_length({extract}) ELSE 0 END",
+            params + params,
+        )
+    raise QueryError(f"unsupported dialect: {dialect!r}")
+
+
+def _render_length(length: "Length", dialect: Optional[Dialect]) -> Tuple[str, list]:
+    """Render a `Length`, dispatching on what its (possibly relationship-
+    pushed-down, see `resolve_length_path`) `inner` actually is.
+
+    A bare `Length(JsonPath(...))` (`len(attribute_list)`) renders directly
+    against the current row. A `Length` reached by crossing a relationship
+    (`len(father.aka_surnames)`) instead shows up as a `RelatedObject` whose
+    own innermost `field` is the `Length` -- `_render_related_object`'s field
+    dispatch calls back into `_render_length_of_json_path` directly for that
+    case, so this function only ever sees the plain-`JsonPath` shape.
+    """
+    if not isinstance(length.inner, JsonPath):
+        raise QueryError(f"len(...) requires a JSON array path, got {length.inner!r}")
+    return _render_length_of_json_path(length.inner, _require_dialect(dialect, length.inner))
 
 
 def _sqlite_handle_ref_path_sql(
@@ -1114,6 +1217,8 @@ def _render_related_object(
         )
     elif isinstance(related.field, JsonPath):
         field_sql, field_params = _render_json_path(related.field, dialect, value)
+    elif isinstance(related.field, Length):
+        field_sql, field_params = _render_length(related.field, dialect)
     else:
         _check_column(related.field, related.target.columns)
         field_sql, field_params = _quote_column(related.field, dialect), []
@@ -1184,6 +1289,8 @@ def _render_column(
         sql, params = _render_json_path(column, _require_dialect(dialect, column), value)
     elif isinstance(column, CollectionCount):
         sql, params = _render_collection_count(column, spec.table, dialect, treeid)
+    elif isinstance(column, Length):
+        sql, params = _render_length(column, dialect)
     else:
         if isinstance(column, FlatColumnRef):
             column = column.name

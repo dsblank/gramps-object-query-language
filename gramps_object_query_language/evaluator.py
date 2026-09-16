@@ -62,6 +62,7 @@ from .query import (
     FlatColumnRef,
     In,
     JsonPath,
+    Length,
     Not,
     ObjectTypeSpec,
     Or,
@@ -207,6 +208,8 @@ def resolve_column_ref(db: Any, obj: Any, ref: ColumnRef, spec: ObjectTypeSpec) 
         return get_json_path(obj, ref)
     if isinstance(ref, CollectionCount):
         return _collection_count(db, obj, ref)
+    if isinstance(ref, Length):
+        return _length_of(db, obj, ref, spec)
     if isinstance(ref, FlatColumnRef):
         return get_flat_column(obj, ref.name, spec)
     return get_flat_column(obj, ref, spec)
@@ -280,6 +283,24 @@ def _collection_count(db: Any, obj: Any, count: CollectionCount) -> int:
         ):
             matched += 1
     return matched
+
+
+def _length_of(db: Any, obj: Any, length: Length, spec: ObjectTypeSpec) -> int:
+    """`len(x)`, evaluated against a real object -- the evaluator counterpart
+    to `query.py`'s `Length` SQL rendering. Resolves `length.inner`
+    (a `JsonPath`, or a `RelatedObject` chain whose own innermost `field` is
+    the `Length` -- see `resolve_length_path`) exactly like any other
+    `ColumnRef`, via a plain recursive `resolve_column_ref` call, so a
+    relationship hop (`len(father.aka_surnames)`) is fetched through `db`
+    the same privacy-respecting way any other `RelatedObject` field is.
+
+    A missing path or a non-list value both come back as `0`, not `None` --
+    matching `query.py`'s SQL rendering (see `Length`'s own docstring for
+    why), rather than diverging on the one input SQL's `COALESCE`/`CASE`
+    guards were built specifically to handle.
+    """
+    value = resolve_column_ref(db, obj, length.inner, spec)
+    return len(value) if isinstance(value, list) else 0
 
 
 def _like_to_regex(pattern: str) -> re.Pattern:
