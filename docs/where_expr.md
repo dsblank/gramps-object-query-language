@@ -51,7 +51,7 @@ Person "birth.date.sortval > Date('Jan 1, 1968')"
 
 These two lines are the same query. (This doesn't extend to `count(...)`/
 `len(...)`, each only ever recognized as the left-hand operand -- see
-[Counting a collection](#counting-a-collection-count) and
+[Counting a collection](#counting-a-collection-len) and
 [Array length](#array-length-lenpath).)
 
 ## Combining conditions with `and`, `or`, and `not`
@@ -281,32 +281,25 @@ the literal. Works the same whether both fields cross a relationship (as
 above) or are plain columns on the same row (`Person "given_name in
 surname"`).
 
-## One-to-many relationships: `exists(...)`
-
-**`any(...)` (see [Array membership](#array-membership-anypath-condition)
-below) does everything this section describes too, and more -- it's the
-recommended spelling going forward.** `exists(...)` still works exactly as
-described here and isn't going away, but a new query is better off written
-with `any(...)` from the start; keep reading here for how the underlying
-collections/condition grammar works, since that part is identical either way.
+## One-to-many relationships: `any(...)`
 
 Every relationship in the table above is one-to-one -- a family has exactly
 *one* father, a person has exactly *one* birth event. Some relationships are
 naturally one-to-many instead -- a family has any number of children, a
 person can have any number of notes -- and those need a different construct:
-`exists(name, condition)`, a whitelisted function-call form (like
+`any(name, condition)`, a whitelisted function-call form (like
 `like(...)`), not an ordinary path:
 
 ```python
-Family "exists(children, given_name == 'Steve')"
-Family "not exists(children, given_name == 'Steve')"
-Family "exists(children)"
+Family "any(children, given_name == 'Steve')"
+Family "not any(children, given_name == 'Steve')"
+Family "any(children)"
 ```
 
 `children`/`notes`/... are **collection** names -- registered separately
 from the relationship table above, and never usable as a dotted-path
 segment (`children.surname` would be ambiguous: which child?), only as
-`exists`'s (or `count`'s, see below) first argument. Registered on every one
+`any`'s (or `len`'s, see below) first argument. Registered on every one
 of the ten record types, following Gramps' own object model exactly (a
 `Source` has no `citations` since a source doesn't cite other citations; a
 `Repository` has neither `citations` nor `media`; `Tag` has none at all --
@@ -339,69 +332,75 @@ a tag doesn't tag itself):
 `Person`) -- worth knowing only because it's the one case where the SQL
 compiler has to alias the related row's table so it doesn't collide with
 the outer row's own table name; nothing about writing the query itself
-changes, `exists(associations, ...)` reads and behaves exactly like any
+changes, `any(associations, ...)` reads and behaves exactly like any
 other collection.
 
 `condition` is a second, ordinary `where_expr` -- anything legal as a
 top-level expression is legal here too (`and`/`or`/`not`, chained
-relationships, even a nested `exists`) -- just evaluated against the
+relationships, even a nested `any`) -- just evaluated against the
 collection's target type (`Person`, for `children`) instead of the outer one.
-It can be left out entirely (`exists(children)`), meaning "at least one
+It can be left out entirely (`any(children)`), meaning "at least one
 related row at all," with no further condition on it.
 
-Under the hood, `exists(...)` compiles to a real `EXISTS (...)` subquery that
+Under the hood, `any(...)` compiles to a real `EXISTS (...)` subquery that
 iterates the JSON array (`json_each` on SQLite, `jsonb_array_elements`/
 `jsonb_array_elements_text` on PostgreSQL) joined against the target table by
 handle -- not a correlated *scalar* subquery the way every relationship above
 is, since there can be any number of matching rows, not just one.
 
-One consequence worth knowing: unlike an ordinary comparison, `exists(...)`
+One consequence worth knowing: unlike an ordinary comparison, `any(...)`
 never produces SQL's `UNKNOWN` -- a family with no children at all simply
 has zero matching rows in the subquery, the same as a family whose children
-don't happen to match `condition`, so `exists(...)` there is a definite
-`False` either way (never `None`/"missing"). That means `not exists(...)`
+don't happen to match `condition`, so `any(...)` there is a definite
+`False` either way (never `None`/"missing"). That means `not any(...)`
 is always plain negation, with none of the "a missing value under `not`
 stays excluded, not included" three-valued-logic subtlety described above
 for ordinary comparisons.
 
-## Counting a collection: `count(...)`
+`exists(...)` is an older, still-supported spelling for this exact same
+form -- `exists(children, ...)` and `any(children, ...)` compile to the
+identical query -- kept for backwards compatibility, not recommended for
+new queries.
 
-**`len(...)` (see [Array length](#array-length-lenpath) below) does
-everything this section describes too, and more -- it's the recommended
-spelling going forward**, the same way `any(...)` supersedes `exists(...)`.
+## Counting a collection: `len(...)`
 
-`exists(...)` only answers "at least one" -- `count(name, condition)` asks
+`any(...)` only answers "at least one" -- `len(name, condition)` asks
 "how many," over the same registered collections:
 
 ```python
-Family "count(children) > 2"
-Family "count(children, gender == Person.MALE) >= 1"
+Family "len(children) > 2"
+Family "len(children, gender == Person.MALE) >= 1"
 ```
 
-Unlike `exists(...)`, `count(...)` isn't itself a condition -- it produces a
+Unlike `any(...)`, `len(...)` isn't itself a condition -- it produces a
 *number*, so it has to appear as the left-hand side of an ordinary
-comparison (`count(children) > 2`, not a bare `count(children)`) the same
+comparison (`len(children) > 2`, not a bare `len(children)`) the same
 way a field reference does. `condition` is optional, exactly as with
-`exists`, and parses the same way (a full nested `where_expr` against the
-collection's target type); leaving it out (`count(children)`) counts every
+`any`, and parses the same way (a full nested `where_expr` against the
+collection's target type); leaving it out (`len(children)`) counts every
 related row, unfiltered.
 
 ```python
-Family "count(children) in [0, 1]"
+Family "len(children) in [0, 1]"
 ```
 
-`count(...)` is deliberately narrower than a plain field: it's only
+`len(...)`, here, is deliberately narrower than a plain field: it's only
 recognized on a comparison's left-hand side, never on the right and never
-compared against another field or another `count(...)` (`count(a) ==
-count(b)` isn't supported) -- the same restriction `len(...)`'s own
+compared against another field or another `len(...)` (`len(a) ==
+len(b)` isn't supported) -- the same restriction `len(...)`'s own
 array-length form has (see [Array length](#array-length-lenpath) below),
 kept consistent between the two.
 
-Under the hood, `count(...)` reuses `exists(...)`'s own subquery shape
+Under the hood, `len(...)` reuses `any(...)`'s own subquery shape
 verbatim, just wrapped as `(SELECT COUNT(*) FROM ...)` instead of
 `EXISTS (SELECT 1 FROM ...)` -- a missing collection (no children recorded
 at all) is `0`, not `NULL`, the same way `COUNT(*)` over zero matching rows
 always is in SQL.
+
+`count(...)` is an older, still-supported spelling for this exact same
+form -- `count(children, ...)` and `len(children, ...)` compile to the
+identical query -- kept for backwards compatibility, not recommended for
+new queries.
 
 ## Array length: `len(path)`
 
@@ -517,7 +516,7 @@ values (`note_list`, `tag_list`) has no sub-field to write one against, and
 is rejected with a clear error if you try (`any(path)`/`len(path) > 0`, no
 condition, already covers "has any at all" for those).
 
-## Reverse references: `exists(backlinks)`
+## Reverse references: `any(backlinks, ...)`
 
 Every collection above reaches *outward* -- a family's own `children`, a
 person's own `notes`. `backlinks` is the one collection that reaches the
@@ -530,9 +529,9 @@ comes from Gramps' own `reference` table, the same index
 `find_backlink_handles()` uses internally to answer "what points here":
 
 ```python
-Note "not exists(backlinks)"
-Note "exists(backlinks, _class == 'Person')"
-Note "exists(backlinks) and count(backlinks) > 1"
+Note "not any(backlinks)"
+Note "any(backlinks, _class == 'Person')"
+Note "any(backlinks) and len(backlinks) > 1"
 ```
 
 `_class` is the one field a `backlinks` condition can test -- the
@@ -546,20 +545,24 @@ against a class-name string (or a list of them, for `in`) is the whole
 vocabulary:
 
 ```python
-Note "exists(backlinks, _class in ['Person', 'Family'])"
-Note "exists(backlinks, _class != 'Media')"
+Note "any(backlinks, _class in ['Person', 'Family'])"
+Note "any(backlinks, _class != 'Media')"
 ```
 
-`count(backlinks)` works exactly like `count(...)` above -- `count(backlinks)
-== 0` is another way to spell `not exists(backlinks)`. Reaching into the
+`len(backlinks)` works exactly like `len(...)` above -- `len(backlinks)
+== 0` is another way to spell `not any(backlinks)`. Reaching into the
 referrer's own fields beyond its class (e.g. a Note referenced by a Person
 whose surname is Smith) isn't supported yet -- see `ROADMAP.md`'s "Reverse
 relationships" item for why that needs a genuinely different, per-class
 construct rather than a straightforward extension of this one.
 
+`exists(backlinks)`/`count(backlinks)` are older, still-supported spellings
+for this exact same collection -- kept for backwards compatibility, not
+recommended for new queries.
+
 ## A self-linked collection: `Person.child_refs`
 
-Every collection so far reads like `exists(children, given_name == 'Steve')`
+Every collection so far reads like `any(children, given_name == 'Steve')`
 -- a condition tested against the *joined row's own fields* (`children`'s
 condition sees a `Person`, `notes`' sees a `Note`). `child_refs` is the one
 exception: it's still a registered collection, reached the same way, but its
@@ -567,7 +570,7 @@ condition is about a field on the *link* between the two records, not
 either record itself:
 
 ```python
-Person "any(child_refs, frel.value == ChildRefType.ADOPTED or mrel.value == ChildRefType.ADOPTED)"
+Person "any(ref for ref in child_refs if ref.frel.value == ChildRefType.ADOPTED or ref.mrel.value == ChildRefType.ADOPTED)"
 ```
 
 This is the query behind "was this person adopted" -- Gramps records that
@@ -578,15 +581,21 @@ own parent families (`parent_family_list`, the same list `parent_families`
 above reaches) and, for each one, finds *the one entry in that family's own
 `child_ref_list` that names this person* -- `frel`/`mrel` (along with every
 other `ChildRef` field: `note_list`, `citation_list`, `private`) are that
-entry's own fields, not `Family`'s.
+entry's own fields, not `Family`'s. The comprehension form above (see
+[Comprehension sugar](#comprehension-sugar-any-and-len) below) is worth
+reaching for specifically here: writing `ref.frel`/`ref.mrel` visibly ties
+those two fields back to the bound loop variable, making it obvious they
+come from the `ChildRef` link itself, not from `Person` or `Family` --
+easy to miss in the equivalent direct call, `any(child_refs, frel.value ==
+ChildRefType.ADOPTED or mrel.value == ChildRefType.ADOPTED)`, where nothing
+in the spelling names what `frel`/`mrel` are attached to.
 
 `child_refs` composes with every keyword this page already covers --
-`exists(child_refs, ...)`, `count(child_refs, ...)`, and (per
-[Comprehension sugar](#comprehension-sugar-any-and-len) below) the
-`any`/`len` spellings all reach it identically, since it's a real
-registered collection like any other. What's different is entirely
-internal to how its own condition is resolved -- nothing about writing the
-query itself changes.
+`any(child_refs, ...)`, `len(child_refs, ...)`, and (older, still-supported
+spellings) `exists(child_refs, ...)`/`count(child_refs, ...)` all reach it
+identically, since it's a real registered collection like any other. What's
+different is entirely internal to how its own condition is resolved --
+nothing about writing the query itself changes.
 
 ## Comprehension sugar: `any(...)` and `len([...])`
 
@@ -706,36 +715,36 @@ Person "birth.place.title == death.place.title"
 Family "father.death.place.title == mother.death.place.title"
 ```
 
-**`exists(children, ...)`** -- a family with at least one child matching a
+**`any(children, ...)`** -- a family with at least one child matching a
 condition, and its negation:
 
 ```python
-Family "exists(children, given_name == 'Steve')"
-Family "not exists(children, given_name == 'Steve')"
+Family "any(children, given_name == 'Steve')"
+Family "not any(children, given_name == 'Steve')"
 ```
 
-**`exists(children)`** -- a family with any recorded child at all, condition
+**`any(children)`** -- a family with any recorded child at all, condition
 omitted:
 
 ```python
-Family "exists(children)"
+Family "any(children)"
 ```
 
-**`exists(notes)`** -- starting from `Person` instead of `Family`, and over a
+**`any(notes)`** -- starting from `Person` instead of `Family`, and over a
 flat handle list (`note_list`) rather than a list of ref objects
 (`child_ref_list`) -- the two collection shapes registered today, both
 spelled the same way from `where_expr`:
 
 ```python
-Person "not exists(notes)"
+Person "not any(notes)"
 ```
 
-**`count(children, ...)`** -- how many children match a condition (or none,
+**`len(children, ...)`** -- how many children match a condition (or none,
 to count every child):
 
 ```python
-Family "count(children) > 0"
-Family "count(children, given_name == 'Robert') == 1"
+Family "len(children) > 0"
+Family "len(children, given_name == 'Robert') == 1"
 ```
 
 **`Citation -> source -> Source`** -- the newest one-to-one relationship
@@ -750,14 +759,14 @@ Citation "source.title == 'Census Records'"
 at least one high-confidence citation:
 
 ```python
-Person "exists(citations, confidence >= Citation.CONF_HIGH)"
+Person "any(citations, confidence >= Citation.CONF_HIGH)"
 ```
 
 **`associations` (self-referencing)** -- a person linked to another person
 by name, via an association:
 
 ```python
-Person "exists(associations, given_name == 'Bob')"
+Person "any(associations, given_name == 'Bob')"
 ```
 
 ## Constants
@@ -861,7 +870,7 @@ parse_select(PERSON, [
     "handle",
     "birth.place.title as birthplace",
     "primary_name.surname_list[0].surname",
-    "count(events) as n_events",
+    "len(events) as n_events",
 ])
 ```
 
@@ -876,8 +885,8 @@ Three details are specific to `select`:
 
 - **`as <key>` renames the response key.** Without it the key is the path
   text itself (`"birth.place.title"`). An alias must be a plain name.
-- **`count(...)` requires an alias.** Unlike a path, it has no text to
-  derive a name from.
+- **`len(...)`/`count(...)` require an alias.** Unlike a path, they have no
+  text to derive a name from.
 - **Paths are checked, in `select` and `where` alike.** See
   [Every path is checked](#every-path-is-checked) below.
 

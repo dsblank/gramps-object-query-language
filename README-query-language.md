@@ -359,7 +359,7 @@ living on the record, not a search across another table. `any(path)` alone
 ### Goal: Find people who were adopted
 
 ```
-Person "any(child_refs, frel.value == ChildRefType.ADOPTED or mrel.value == ChildRefType.ADOPTED)"
+Person "any(ref for ref in child_refs if ref.frel.value == ChildRefType.ADOPTED or ref.mrel.value == ChildRefType.ADOPTED)"
 ```
 
 Gramps doesn't record "adopted" as a plain field on a person -- it's
@@ -370,14 +370,19 @@ person can be born into one family and later adopted into another.
 person's own parent families, it reaches the one entry in that family's
 own child list that names *this* person, so `frel`/`mrel` mean that link's
 own relationship type, not a field on the person or the family themselves.
+Writing it as a comprehension makes that provenance explicit -- `ref.frel`/
+`ref.mrel` visibly belong to the bound `ref`, i.e. the link, not to `Person`
+or `Family`; the equivalent direct call, `any(child_refs, frel.value ==
+ChildRefType.ADOPTED or mrel.value == ChildRefType.ADOPTED)`, means the
+same thing but doesn't show that as clearly.
 
 ### Goal: Find families that have a child named Steve
 
 ```
-Family "exists(children, given_name == 'Steve')"
+Family "any(children, given_name == 'Steve')"
 ```
 
-`exists(children, ...)` matches a family if *any* of its children satisfies
+`any(children, ...)` matches a family if *any* of its children satisfies
 the condition -- unlike `father`/`mother`, which each always reach exactly
 one person, a family can have any number of children, so this needs its own
 "does at least one of them match" check rather than an ordinary field
@@ -386,49 +391,49 @@ reference.
 ### Goal: Find families with no children recorded at all
 
 ```
-Family "not exists(children)"
+Family "not any(children)"
 ```
 
-Leaving out the condition (`exists(children)` alone) just asks "does this
+Leaving out the condition (`any(children)` alone) just asks "does this
 family have any recorded child at all" -- `not` in front flips that to "no
 children recorded."
 
 ### Goal: Find people who don't have any notes attached to their record
 
 ```
-Person "not exists(notes)"
+Person "not any(notes)"
 ```
 
 The same idea, starting from `Person` instead: `notes` reaches every note
-attached to a person's record, and `not exists(notes)` matches whenever
+attached to a person's record, and `not any(notes)` matches whenever
 there aren't any.
 
 ### Goal: Find families with more than two children
 
 ```
-Family "count(children) > 2"
+Family "len(children) > 2"
 ```
 
-`count(children)` counts how many children a family has recorded --
-`exists(children, ...)` can only tell you whether *at least one* child
-matches something, `count(...)` tells you *how many*.
+`len(children)` counts how many children a family has recorded --
+`any(children, ...)` can only tell you whether *at least one* child
+matches something, `len(...)` tells you *how many*.
 
 ### Goal: Find families with more than one son
 
 ```
-Family "count(children, gender == Person.MALE) > 1"
+Family "len(children, gender == Person.MALE) > 1"
 ```
 
-Adding a condition (the same kind of condition `exists(...)` takes) counts
+Adding a condition (the same kind of condition `any(...)` takes) counts
 only the children who match it -- here, only the sons.
 
 ### Goal: Find people with a well-sourced record
 
 ```
-Person "exists(citations, confidence >= Citation.CONF_HIGH)"
+Person "any(citations, confidence >= Citation.CONF_HIGH)"
 ```
 
-`exists(children, ...)`/`count(children, ...)` aren't the only collections
+`any(children, ...)`/`len(children, ...)` aren't the only collections
 recorded per-person -- `notes`, `citations`, `media`, and `tags` are
 available the same way on almost every record type, plus a few more
 specific to each type: a person's `families` (as a spouse), `parent_families`
@@ -438,7 +443,7 @@ recorded event, not just birth/death).
 ### Goal: Find people linked to someone named Bob via an association
 
 ```
-Person "exists(associations, given_name == 'Bob')"
+Person "any(associations, given_name == 'Bob')"
 ```
 
 ### Goal: Find citations for a specific source
@@ -568,21 +573,21 @@ letters aren't folded on either path.
 Every path you can filter on, you can also return — `father.surname`,
 `primary_name.surname_list[0].surname`, `birth.date.sortval`. Add `as
 <name>` to choose what the column is called in the result; without it, the
-column is named by the path itself. `count(events) as n_events` returns a
+column is named by the path itself. `len(events) as n_events` returns a
 count per row the same way (the alias is required there, since a count has
 no path to be named after).
 
 The "show me where they're buried" half needs a bit more care, for two reasons:
 
 1. where_expr is a filter language — every query it writes is a true/false test per person, not a report that hands back a value. Handing values back is `select`'s job instead, and `select` takes the *same* paths (see [Showing a value, not just filtering on it](#showing-a-value-not-just-filtering-on-it) above) — so "show me their birth place" is one query. Burial is the harder half, for reason 2 below: there's no path that reaches it, so there's nothing for `select` to name.
-2. Burial isn't a shortcut field the way birth/death are — birth/death reach a person's event directly by name, but a person's other events (burial included) are reached through the general events collection instead, using exists(events, ...).
+2. Burial isn't a shortcut field the way birth/death are — birth/death reach a person's event directly by name, but a person's other events (burial included) are reached through the general events collection instead, using any(events, ...).
 
 #### If you already know the cemetery
 
 in the Person view:
-> "birth.place.title == 'Chicago, Cook, Illinois, USA' and exists(events, type.value == EventType.BURIAL and place.title == 'Rosehill Cemetery, Chicago, Cook, Illinois, USA')"
+> "birth.place.title == 'Chicago, Cook, Illinois, USA' and any(events, type.value == EventType.BURIAL and place.title == 'Rosehill Cemetery, Chicago, Cook, Illinois, USA')"
 
-This matches everyone born in Chicago whose recorded burial event's place is exactly Rosehill Cemetery. The `type.value == EventType.BURIAL and place.title == '...'` part has to stay inside the exists(events, ...) parentheses — it's a condition checked against each of that person's events, not against the person directly.
+This matches everyone born in Chicago whose recorded burial event's place is exactly Rosehill Cemetery. The `type.value == EventType.BURIAL and place.title == '...'` part has to stay inside the any(events, ...) parentheses — it's a condition checked against each of that person's events, not against the person directly.
 
 #### If you don't know the cemetery — the two-part scan version
 
@@ -630,7 +635,7 @@ This is a "scan" in the sense that the inner loop isn't indexed or query-optimiz
 ### Goal: Find notes that aren't attached to anything
 
 ```
-Note "not exists(backlinks)"
+Note "not any(backlinks)"
 ```
 
 Every collection covered above reaches *outward* from a record --
@@ -642,14 +647,14 @@ once attached to (a person, a source, an event) was deleted or edited.
 ### Goal: Find notes that are only referenced by sources, not by people
 
 ```
-Note "exists(backlinks) and not exists(backlinks, _class == 'Person')"
+Note "any(backlinks) and not any(backlinks, _class == 'Person')"
 ```
 
 `_class` is the one field a `backlinks` condition can test -- the
 referrer's own type (`"Person"`, `"Source"`, ...), matching the same
 `_class` name every record's serialized JSON already carries. Combined
-with `count(backlinks)` (which works exactly like `count(...)` above),
-`count(backlinks) > 1` is another way to ask "is this note shared by more
+with `len(backlinks)` (which works exactly like `len(...)` above),
+`len(backlinks) > 1` is another way to ask "is this note shared by more
 than one record."
 
 ## Things GOQL can't do (yet)

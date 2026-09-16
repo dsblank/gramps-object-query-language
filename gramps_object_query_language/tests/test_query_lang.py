@@ -2160,6 +2160,13 @@ def test_parse_select_count_call_with_alias():
     assert key == "n_events"
 
 
+def test_parse_select_len_call_with_alias():
+    """len(...) is the canonical spelling for this same select-entry form."""
+    [(ref, key)] = parse_select(PERSON, ["len(events) as n_events"])
+    assert isinstance(ref, CollectionCount)
+    assert key == "n_events"
+
+
 def test_parse_select_count_call_with_condition():
     [(ref, _key)] = parse_select(
         FAMILY, ["count(children, gender == 1) as n_sons"]

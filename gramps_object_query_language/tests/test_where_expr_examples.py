@@ -503,44 +503,44 @@ def test_parents_died_in_same_place(db):
     assert result == [("fam2",)]
 
 
-# --- one-to-many relationships (exists) ---------------------------------------
+# --- one-to-many relationships (any) ------------------------------------------
 
 
-def test_exists_children_with_condition(db):
+def test_any_children_with_condition(db):
     # fam1's one recorded child is kid1 (Robert Smith) -- fam2 has none
     # recorded at all.
-    result = run(db, "Family", "exists(children, given_name == 'Steve')")
+    result = run(db, "Family", "any(children, given_name == 'Steve')")
     assert result == []
-    result = run(db, "Family", "exists(children, given_name == 'Robert')")
+    result = run(db, "Family", "any(children, given_name == 'Robert')")
     assert result == [("fam1",)]
 
 
-def test_not_exists_children_with_condition(db):
-    result = run(db, "Family", "not exists(children, given_name == 'Steve')")
+def test_not_any_children_with_condition(db):
+    result = run(db, "Family", "not any(children, given_name == 'Steve')")
     assert result == [("fam1",), ("fam2",)]
 
 
-def test_exists_children_no_condition(db):
+def test_any_children_no_condition(db):
     # "any recorded child at all" -- matches fam1 (kid1), not fam2 (no
     # json_data / no children recorded at all -- not an error, just no rows
     # for json_each to iterate).
-    result = run(db, "Family", "exists(children)")
+    result = run(db, "Family", "any(children)")
     assert result == [("fam1",)]
 
 
-def test_not_exists_children_no_condition(db):
-    result = run(db, "Family", "not exists(children)")
+def test_not_any_children_no_condition(db):
+    result = run(db, "Family", "not any(children)")
     assert result == [("fam2",)]
 
 
-def test_exists_notes(db):
+def test_any_notes(db):
     # dad1 has one note attached; everyone else has an empty note_list.
-    result = run(db, "Person", "exists(notes)")
+    result = run(db, "Person", "any(notes)")
     assert result == [("dad1",)]
 
 
-def test_not_exists_notes(db):
-    result = run(db, "Person", "not exists(notes)")
+def test_not_any_notes(db):
+    result = run(db, "Person", "not any(notes)")
     assert result == [
         ("granddad1",),
         ("grandma1",),
@@ -550,35 +550,46 @@ def test_not_exists_notes(db):
     ]
 
 
-def test_count_children(db):
+def test_len_children(db):
     # fam1 has exactly one recorded child (kid1); fam2 has none at all.
-    result = run(db, "Family", "count(children) > 0")
+    result = run(db, "Family", "len(children) > 0")
     assert result == [("fam1",)]
-    result = run(db, "Family", "count(children) == 0")
+    result = run(db, "Family", "len(children) == 0")
     assert result == [("fam2",)]
 
 
-def test_count_children_with_condition(db):
-    result = run(db, "Family", "count(children, given_name == 'Robert') == 1")
+def test_len_children_with_condition(db):
+    result = run(db, "Family", "len(children, given_name == 'Robert') == 1")
     assert result == [("fam1",)]
-    result = run(db, "Family", "count(children, given_name == 'Steve') == 1")
+    result = run(db, "Family", "len(children, given_name == 'Steve') == 1")
     assert result == []
 
 
-# --- comprehension sugar for exists(...)/count(...) --------------------------
+def test_exists_is_the_older_still_supported_spelling_for_any(db):
+    # exists(...)/count(...) aren't going away -- any(...)/len(...) are the
+    # canonical spellings going forward, not a replacement that breaks the
+    # old ones.
+    result = run(db, "Family", "exists(children, given_name == 'Robert')")
+    assert result == [("fam1",)]
+    result = run(db, "Family", "count(children, given_name == 'Robert') == 1")
+    assert result == [("fam1",)]
 
 
-def test_any_comprehension_matches_exists_children_with_condition(db):
-    # Same fixture, same result as test_exists_children_with_condition --
-    # any(...) is pure sugar for exists(...), so it has to answer identically.
+# --- comprehension sugar for any(...)/len(...) --------------------------------
+
+
+def test_any_comprehension_matches_any_children_with_condition(db):
+    # Same fixture, same result as test_any_children_with_condition --
+    # this comprehension form is pure sugar for the direct any(...) call, so
+    # it has to answer identically.
     result = run(db, "Family", "any(c.given_name == 'Steve' for c in children)")
     assert result == []
     result = run(db, "Family", "any(c.given_name == 'Robert' for c in children)")
     assert result == [("fam1",)]
 
 
-def test_len_listcomp_matches_count_children_with_condition(db):
-    # Same fixture, same result as test_count_children_with_condition.
+def test_len_listcomp_matches_len_children_with_condition(db):
+    # Same fixture, same result as test_len_children_with_condition.
     result = run(
         db, "Family", "len([c for c in children if c.given_name == 'Robert']) == 1"
     )
@@ -589,7 +600,7 @@ def test_len_listcomp_matches_count_children_with_condition(db):
     assert result == []
 
 
-def test_count_children_more_than_two_readme_example():
+def test_len_children_more_than_two_readme_example():
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE family (handle TEXT, json_data TEXT)")
     conn.execute("CREATE TABLE person (handle TEXT, gender INTEGER)")
@@ -605,11 +616,11 @@ def test_count_children_more_than_two_readme_example():
         (json.dumps({"child_ref_list": [{"ref": "anna"}]}),),
     )
 
-    result = run(conn, "Family", "count(children) > 2")
+    result = run(conn, "Family", "len(children) > 2")
     assert result == [("big-family",)]
 
 
-def test_count_children_gender_condition_readme_example():
+def test_len_children_gender_condition_readme_example():
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE family (handle TEXT, json_data TEXT)")
     conn.execute("CREATE TABLE person (handle TEXT, gender INTEGER)")
@@ -625,7 +636,7 @@ def test_count_children_gender_condition_readme_example():
         (json.dumps({"child_ref_list": [{"ref": "steve"}, {"ref": "anna"}]}),),
     )
 
-    result = run(conn, "Family", "count(children, gender == Person.MALE) > 1")
+    result = run(conn, "Family", "len(children, gender == Person.MALE) > 1")
     assert result == [("two-sons",)]
 
 
@@ -670,7 +681,7 @@ def test_place_enclosed_by_chained_self_reference_doc_example():
     assert result == [("city",)]
 
 
-def test_exists_citations_confidence_doc_example():
+def test_any_citations_confidence_doc_example():
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE person (handle TEXT, json_data TEXT)")
     conn.execute("CREATE TABLE citation (handle TEXT, confidence INTEGER)")
@@ -685,11 +696,11 @@ def test_exists_citations_confidence_doc_example():
         (json.dumps({"citation_list": ["c-low"]}),),
     )
 
-    result = run(conn, "Person", "exists(citations, confidence >= Citation.CONF_HIGH)")
+    result = run(conn, "Person", "any(citations, confidence >= Citation.CONF_HIGH)")
     assert result == [("well-sourced",)]
 
 
-def test_exists_associations_self_reference_doc_example():
+def test_any_associations_self_reference_doc_example():
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE person (handle TEXT, given_name TEXT, json_data TEXT)")
     conn.execute(
@@ -700,7 +711,7 @@ def test_exists_associations_self_reference_doc_example():
         "INSERT INTO person VALUES ('bob', 'Bob', ?)", (json.dumps({"person_ref_list": []}),)
     )
 
-    result = run(conn, "Person", "exists(associations, given_name == 'Bob')")
+    result = run(conn, "Person", "any(associations, given_name == 'Bob')")
     assert result == [("alice",)]
 
 
@@ -882,6 +893,17 @@ def test_child_refs_adopted_doc_example():
     person("jo1", ["fam-jo"])
     family("fam-jo", "dad-jo", [{"ref": "jo1", "frel": {"value": 1}, "mrel": {"value": 1}}])
 
+    result = run(
+        conn,
+        "Person",
+        "any(ref for ref in child_refs if ref.frel.value == ChildRefType.ADOPTED "
+        "or ref.mrel.value == ChildRefType.ADOPTED)",
+    )
+    assert result == [("pat1",)]
+
+    # The direct call is the identical query -- comprehension sugar, not a
+    # different feature -- kept working here too since it's still shown
+    # later on the same doc page as an equivalent spelling.
     result = run(
         conn,
         "Person",
@@ -1146,7 +1168,7 @@ def test_select_path_matches_where_expr_resolution(db):
 #
 # `backlinks` comes from Gramps' own `reference` table, not from a
 # `note`/`person`/etc. row's own json_data, so these use a standalone
-# connection (like the count(children) readme examples above) rather than
+# connection (like the len(children) readme examples above) rather than
 # the shared `db` fixture, which has no `reference` table.
 
 
@@ -1170,13 +1192,13 @@ def _backlinks_conn():
 
 def test_backlinks_orphan_notes_readme_example():
     conn = _backlinks_conn()
-    result = run(conn, "Note", "not exists(backlinks)")
+    result = run(conn, "Note", "not any(backlinks)")
     assert result == [("note-orphan",)]
 
 
 def test_backlinks_not_referenced_by_person_readme_example():
     conn = _backlinks_conn()
     result = run(
-        conn, "Note", "exists(backlinks) and not exists(backlinks, _class == 'Person')"
+        conn, "Note", "any(backlinks) and not any(backlinks, _class == 'Person')"
     )
     assert result == [("note-on-source",)]
