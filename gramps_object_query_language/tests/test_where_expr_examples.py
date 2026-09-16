@@ -1202,3 +1202,14 @@ def test_backlinks_not_referenced_by_person_readme_example():
         conn, "Note", "any(backlinks) and not any(backlinks, _class == 'Person')"
     )
     assert result == [("note-on-source",)]
+
+
+def test_backlinks_comprehension_sugar_matches_direct_call():
+    # any(...)'s comprehension form is generic over any collection name --
+    # never special-cased -- so it has to reach `backlinks` too, and answer
+    # identically to the direct call above, not just at parse time
+    # (test_backlinks_comprehension_sugar in test_query_lang.py) but end to
+    # end against real data.
+    conn = _backlinks_conn()
+    result = run(conn, "Note", "any(bl for bl in backlinks if bl._class == 'Person')")
+    assert result == [("note-on-person",)]
