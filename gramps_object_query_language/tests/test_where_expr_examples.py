@@ -833,6 +833,42 @@ def test_any_of_path_alternate_names_doc_example():
     assert result == [("pat1",)]
 
 
+def test_any_of_path_comprehension_matches_direct_call():
+    # Comprehension sugar isn't collection-only -- any(x for x in
+    # alternate_names if ...) has to reach the plain-array-path form of
+    # any()/len() too, not just registered collections, since the
+    # desugarer's rewrite target is any()/len() itself (see
+    # _ComprehensionDesugarer), not the narrower exists()/count().
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE person (handle TEXT, json_data TEXT)")
+
+    def person(handle, alternate_first_names):
+        conn.execute(
+            "INSERT INTO person VALUES (?, ?)",
+            (
+                handle,
+                json.dumps(
+                    {"alternate_names": [{"first_name": n} for n in alternate_first_names]}
+                ),
+            ),
+        )
+
+    person("pat1", ["Doyle"])
+    person("jo1", ["Smith"])
+
+    result = run(
+        conn, "Person", "any(x for x in alternate_names if x.first_name == 'Doyle')"
+    )
+    assert result == [("pat1",)]
+
+    result = run(
+        conn,
+        "Person",
+        "len([x for x in alternate_names if x.first_name == 'Doyle']) > 0",
+    )
+    assert result == [("pat1",)]
+
+
 def test_any_of_path_relationship_chained_doc_example():
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE person (handle TEXT, json_data TEXT)")
@@ -850,6 +886,33 @@ def test_any_of_path_relationship_chained_doc_example():
     conn.execute("INSERT INTO family VALUES ('fam-baker', 'baker1', NULL, '{}')")
 
     result = run(conn, "Family", "any(father.attribute_list, value == 'Blacksmith')")
+    assert result == [("fam-smith",)]
+
+
+def test_any_of_path_relationship_chained_comprehension_matches_direct_call():
+    # Same fixture/query as the direct-call test above, spelled as a
+    # comprehension -- a relationship hop before the array (father.
+    # attribute_list) is exactly one attribute off a bare name, the same
+    # shape _comprehension_generator already allows for a nested
+    # comprehension's own loop variable (c.events).
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE person (handle TEXT, json_data TEXT)")
+    conn.execute("CREATE TABLE family (handle TEXT, father_handle TEXT, mother_handle TEXT, json_data TEXT)")
+
+    def person(handle, attribute_values):
+        conn.execute(
+            "INSERT INTO person VALUES (?, ?)",
+            (handle, json.dumps({"attribute_list": [{"value": v} for v in attribute_values]})),
+        )
+
+    person("smith1", ["Blacksmith"])
+    person("baker1", ["Baker"])
+    conn.execute("INSERT INTO family VALUES ('fam-smith', 'smith1', NULL, '{}')")
+    conn.execute("INSERT INTO family VALUES ('fam-baker', 'baker1', NULL, '{}')")
+
+    result = run(
+        conn, "Family", "any(a for a in father.attribute_list if a.value == 'Blacksmith')"
+    )
     assert result == [("fam-smith",)]
 
 

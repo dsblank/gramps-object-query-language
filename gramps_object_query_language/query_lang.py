@@ -1131,16 +1131,25 @@ def _make_call(name: str, iter_node: ast.expr, condition: Union[ast.expr, None])
 
 
 class _ComprehensionDesugarer(ast.NodeTransformer):
-    """Rewrites `any(cond for x in rel [if ...])` into `exists(rel, cond)`,
-    and `len([... for x in rel if ...])` into `count(rel, ...)`, run once
+    """Rewrites `any(cond for x in rel [if ...])` into `any(rel, cond)`,
+    and `len([... for x in rel if ...])` into `len(rel, ...)`, run once
     over the whole tree before `_translate_top_level` -- see this section's
     module-level comment above.
+
+    The desugar target is `any`/`len`, not `exists`/`count` -- `rel` isn't
+    always a registered collection (`c.given_name`-style comprehensions over
+    `alternate_names`/`father.attribute_list`, a plain intra-record JSON
+    array, are just as legal a comprehension as one over `children`), and
+    only `any`/`len`'s own dispatch (`_translate_any_call`/
+    `_translate_len_call`) understands both shapes; `exists`/`count` only
+    ever understood collections, so targeting them here would silently
+    break every non-collection comprehension.
 
     Runs bottom-up (`generic_visit` before inspecting the current node), so
     a comprehension nested inside another gets desugared first -- by the
     time the outer level's own condition is stripped of its loop variable
-    (`_BoundNameStripper`), any inner `exists(...)`/`count(...)` call
-    already sitting in it gets its own loop-variable prefix (`c.events` ->
+    (`_BoundNameStripper`), any inner `any(...)`/`len(...)` call already
+    sitting in it gets its own loop-variable prefix (`c.events` ->
     `events`) stripped along with everything else, with no special-casing
     needed for "this child happens to be a call I generated a moment ago."
     """
@@ -1154,12 +1163,12 @@ class _ComprehensionDesugarer(ast.NodeTransformer):
             comp = node.args[0]
             generator = _comprehension_generator(comp, node)
             condition = _any_condition(comp, generator.target.id)
-            return ast.copy_location(_make_call("exists", generator.iter, condition), node)
+            return ast.copy_location(_make_call("any", generator.iter, condition), node)
         if name == "len" and len(node.args) == 1 and isinstance(node.args[0], ast.ListComp):
             comp = node.args[0]
             generator = _comprehension_generator(comp, node)
             condition = _len_condition(comp, generator.target.id)
-            return ast.copy_location(_make_call("count", generator.iter, condition), node)
+            return ast.copy_location(_make_call("len", generator.iter, condition), node)
         # `any(...)`/`len(...)` on anything other than a real comprehension
         # isn't this sugar's business -- it's the unified any()/len() form
         # (`any(name_or_path[, condition])`/`len(name_or_path[, condition])`,

@@ -579,6 +579,32 @@ this note originally anticipated. `any(...)`'s own array-membership form
 (`any(path, condition)`) is the one item of the two still open -- see
 "Possibilities" below.
 
+**Follow-up fix, after `any(path, condition)` shipped:** the desugarer
+above still rewrote into a literal `exists(rel, cond)`/`count(rel, ...)`
+call, written when `exists`/`count` were the only things a collection
+comprehension could mean. Once `any(path, condition)`/`len(path,
+condition)` shipped as a second, non-collection meaning for the exact same
+call names, that literal target became a real bug, not just a stale
+comment: `any(x for x in alternate_names if x.first_name == 'Doyle')`
+desugared to `exists(alternate_names, first_name == 'Doyle')`, and
+`exists(...)` never understood a plain array path, only a registered
+collection -- so it raised `unknown collection 'alternate_names'` instead
+of compiling, even though the direct call (`any(alternate_names, ...)`)
+worked fine. A relationship-hop path (`father.attribute_list`) hit a
+second, differently-worded failure the same way. Fixed by retargeting both
+branches of `_ComprehensionDesugarer.visit_Call` to emit `any`/`len`
+instead of `exists`/`count` -- their own dispatch
+(`_translate_any_call`/`_translate_len_call`) already handles both a
+collection name and a plain path, so this sugar now does too, uniformly.
+`_BoundNameStripper`/nested-comprehension behavior is unaffected (it's a
+blind syntactic substitution, indifferent to which call name the inner
+level produced). Caught by a user question during a docs review, not by
+the test suite -- the existing tests only ever exercised the comprehension
+form over registered collections (`children`, `citations`, `backlinks`,
+...), never over a plain array path, so the gap had no failing test to
+surface it. Regression tests added in both `test_query_lang.py` (parse-level
+equality) and `test_where_expr_examples.py` (executed against real data).
+
 ### Path expressions in `select` (`birth.place.title`, `count(events) as n`)
 
 Implemented -- a `select` entry can now be written in the same path grammar

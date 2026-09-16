@@ -527,11 +527,15 @@ Family "any(c.given_name == 'Steve' for c in children)"
 
 The same query as the "child named Steve" example above, just spelled the
 way real Python would write "does any of these match" -- `any(...)`
-wrapping a generator expression is sugar for `exists(...)` and compiles to
-the exact same query, not merely an equivalent one. `count(...)` has a
-matching spelling too, as a list comprehension inside `len(...)`:
+wrapping a generator expression is sugar for the direct `any(children, ...)`
+call and compiles to the exact same query, not merely an equivalent one.
+`len([...])` has a matching spelling too, as a list comprehension:
 `len([c for c in children if c.given_name == 'Robert']) == 1` means the
-same thing as `count(children, given_name == 'Robert') == 1`.
+same thing as `len(children, given_name == 'Robert') == 1`. This sugar
+isn't collection-only either -- `any(n.first_name == 'Doyle' for n in
+alternate_names)` means the same thing as `any(alternate_names,
+first_name == 'Doyle')` above, a plain intra-record array, not a
+registered collection.
 
 ### Goal: Find everyone born in Chicago – and show me where they're buried
 

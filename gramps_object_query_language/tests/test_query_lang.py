@@ -1539,6 +1539,34 @@ def test_any_of_path_produces_any_wire_shape():
     ]
 
 
+def test_any_comprehension_of_path_matches_direct_call():
+    # Comprehension sugar's desugar target is any()/len() itself, not the
+    # narrower exists()/count() -- it has to reach the plain-array-path form
+    # of any() too (alternate_names isn't a registered collection), not
+    # just registered collections. Regression test for a bug where the
+    # desugarer always emitted exists(...)/count(...), which only ever
+    # understood collections, so this comprehension raised "unknown
+    # collection 'alternate_names'" instead of compiling.
+    assert parse_expr("person", "any(x for x in alternate_names if x.first_name == 'Doyle')") == parse_expr(
+        "person", "any(alternate_names, first_name == 'Doyle')"
+    )
+
+
+def test_len_comprehension_of_path_matches_direct_call():
+    assert parse_expr(
+        "person", "len([x for x in alternate_names if x.first_name == 'Doyle']) > 1"
+    ) == parse_expr("person", "len(alternate_names, first_name == 'Doyle') > 1")
+
+
+def test_any_comprehension_of_relationship_chained_path_matches_direct_call():
+    # A relationship hop before the array (father.attribute_list) is one
+    # attribute off a bare name -- same shape _comprehension_generator
+    # already allows for a nested comprehension's own loop variable.
+    assert parse_expr(
+        "family", "any(a for a in father.attribute_list if a.value == 'Blacksmith')"
+    ) == parse_expr("family", "any(father.attribute_list, value == 'Blacksmith')")
+
+
 def test_any_of_path_no_condition_matches_len_greater_than_zero():
     # any(path) alone -- "has any element at all" -- reuses len(path) > 0's
     # own wire shape rather than a fresh EXISTS-over-json_each (cheaper, see

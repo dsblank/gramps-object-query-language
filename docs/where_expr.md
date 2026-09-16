@@ -599,7 +599,7 @@ nothing about writing the query itself changes.
 
 ## Comprehension sugar: `any(...)` and `len([...])`
 
-`exists(children, given_name == 'Steve')` reads reasonably close to plain
+`any(children, given_name == 'Steve')` reads reasonably close to plain
 English, but for anyone more used to reaching for Python's own idiom, the
 same query can be spelled as a generator expression instead:
 
@@ -608,26 +608,38 @@ Family "any(c.given_name == 'Steve' for c in children)"
 ```
 
 This is pure syntax sugar -- parsed and immediately rewritten into exactly
-the `exists(...)` form above before anything else runs, so it compiles to
-the identical query, not merely an equivalent one. `count(...)` has a
-matching spelling, as a list comprehension inside `len(...)`:
+the `any(children, given_name == 'Steve')` form above before anything else
+runs, so it compiles to the identical query, not merely an equivalent one.
+`len([...])` has a matching spelling, as a list comprehension:
 
 ```python
 Family "len([c for c in children if c.given_name == 'Robert']) == 1"
 ```
 
-which rewrites to `count(children, given_name == 'Robert') == 1`. Both
+which rewrites to `len(children, given_name == 'Robert') == 1`. Both
 directions are checked directly in
 [`test_query_lang.py`](../gramps_object_query_language/tests/test_query_lang.py)
-(`parse_expr("any(...)") == parse_expr("exists(...)")`, and likewise for
-`len([...])`/`count(...)`), not just documented as equivalent.
+(`parse_expr("any(...)") == parse_expr("any(name, ...)")`, and likewise for
+`len([...])`), not just documented as equivalent.
 
-A few rules of thumb, all mirroring what `exists(...)`/`count(...)`
-already support written by hand rather than adding anything new underneath:
+The rewrite target is `any(...)`/`len(...)` themselves, not `exists(...)`/
+`count(...)` -- so this sugar isn't collection-only either: it reaches
+[Array membership](#array-membership-anypath-condition)'s plain
+intra-record array form too, the same way the direct call does:
+
+```python
+Person "any(n.first_name == 'Doyle' for n in alternate_names)"
+```
+
+rewrites to `any(alternate_names, first_name == 'Doyle')`, not a
+registered collection at all.
+
+A few rules of thumb, all mirroring what `any(...)`/`len(...)`'s own direct
+call already supports rather than adding anything new underneath:
 
 - `any(...)`'s comprehension `elt` *is* the condition (`any(c.a == 1 for c
   in rel)`); a bare loop variable with no attribute after it (`any(c for c
-  in rel)`) has no condition of its own, matching `exists(rel)` with
+  in rel)`) has no condition of its own, matching `any(rel)` with
   nothing to filter on. An `if` clause on the generator ANDs in as an
   additional condition either way (`any(c for c in rel if c.a == 1)` and
   `any(c.a == 1 for c in rel)` compile identically).
@@ -636,20 +648,21 @@ already support written by hand rather than adding anything new underneath:
   `any(...)`'s `elt`, it was never a condition to begin with; the condition
   comes entirely from the comprehension's `if` clause(s), if any.
 - Only one `for` clause is allowed, and the loop variable must be a plain
-  name (no tuple-unpacking) -- exactly what a single `exists`/`count` call
+  name (no tuple-unpacking) -- exactly what a single `any`/`len` call
   already assumes.
-- Nested comprehensions work, mapping onto nested `exists`/`count` calls
+- Nested comprehensions work, mapping onto nested `any`/`len` calls
   the same way a hand-written nested call would --
   `any(any(e.type.value == EventType.BIRTH for e in c.events) for c in
-  children)` is `exists(children, exists(events, type.value ==
+  children)` is `any(children, any(events, type.value ==
   EventType.BIRTH))` -- but the inner `for ... in ...` is restricted to a
-  bare collection name or exactly one attribute off the *enclosing*
-  comprehension's own loop variable (`c.events`, not a longer chain), the
-  same restriction `exists`'s own first argument already has.
+  bare name (a collection or a path, like `alternate_names`) or exactly one
+  attribute off the *enclosing* comprehension's own loop variable
+  (`c.events`, not a longer chain), the same restriction `any`/`len`'s own
+  first argument already has.
 
 `all(...)`/`sum(...)` aren't recognized -- there's no established
 motivating query for them yet, and `all(...)` in particular would need a
-double negation (`not exists(rel, not cond)`) under the hood to mean the
+double negation (`not any(rel, not cond)`) under the hood to mean the
 same thing SQL's `NOT EXISTS` doesn't already give you a shorter way to
 reach for.
 
