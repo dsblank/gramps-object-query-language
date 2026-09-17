@@ -605,6 +605,40 @@ form over registered collections (`children`, `citations`, `backlinks`,
 surface it. Regression tests added in both `test_query_lang.py` (parse-level
 equality) and `test_where_expr_examples.py` (executed against real data).
 
+**Second follow-up, same session -- error-message consistency for a
+relationship hop before a collection name:** auditing every any()/len()
+argument shape (prompted by the same "check every spelling x shape"
+question that found the bug above) turned up a related rough edge, not a
+wrong-answer bug this time: `exists(father.notes, ...)`/`count(father.notes)
+> 0` were always rejected immediately at parse time with a clear "must be a
+bare relationship name" error -- this has never been supported, collections
+are only ever reachable directly on the type being queried, never through a
+relationship hop. `any`/`len` couldn't reuse that same blind rejection,
+though, since a non-bare first argument is *also* their legitimate
+relationship-hop-path shape (`father.attribute_list`, already documented
+and tested) -- so instead of rejecting, `any(father.notes)`/`len(father.
+notes) > 0` silently fell through to treating `father.notes` as an ordinary
+(nonexistent) JSON path. Never actually wrong -- `compile_expr`'s schema
+validation (`walk_schema`) always catches it before any SQL runs -- but it
+fails later than it should, with a confusing "unknown field 'notes' on
+Person" message that never explains the real issue (that `notes` **is** a
+real collection, just not reachable this way).
+
+Fixed with `query.py`'s new `relationship_target(spec, name)`
+(`_RELATIONSHIPS`'s own lookup, exposed standalone) and `query_lang.py`'s new
+`_collection_reached_via_relationship_hop`, which walks a first argument's
+full dotted chain one hop at a time and checks whether the *last* segment
+would resolve as a registered collection on the type at the far end --
+called from `_translate_any_call`/`_translate_len_call` right where
+`_try_resolve_bare_collection` already fails, so a real relationship-hop
+path (`father.attribute_list`) is completely unaffected and only a
+hop-then-collection shape (`father.notes`, single- or multi-hop) gets the
+new, clear rejection. Documented in `where_expr.md`'s "What's not
+supported" (this limitation was never written down anywhere before, for
+any of the four spellings). Tests in `test_query_lang.py` cover the
+rejection (single hop, multi-hop, with and without a condition) and confirm
+the legitimate path forms still compile unchanged.
+
 ### Path expressions in `select` (`birth.place.title`, `count(events) as n`)
 
 Implemented -- a `select` entry can now be written in the same path grammar

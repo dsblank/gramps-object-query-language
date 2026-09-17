@@ -1653,6 +1653,38 @@ def test_any_len_of_path_with_condition_rejects_list_of_scalars():
         parse_expr("person", "len(note_list, value == 'X') > 0")
 
 
+def test_any_len_rejects_collection_reached_via_relationship_hop():
+    # `notes` is a real collection on Person, just not reachable through
+    # `father.` -- exists()/count() reject any non-bare-name first argument
+    # outright ("must be a bare relationship name"); any()/len() have a
+    # second, legitimate meaning for a non-bare argument (a relationship-
+    # hop path, e.g. father.attribute_list), so they can't reject that
+    # blindly -- but they still have to reject *this* specific shape
+    # clearly, not silently fall through to a confusing "unknown field"
+    # error from treating it as a plain (nonexistent) path instead.
+    with pytest.raises(QueryLangError, match="relationship hop"):
+        parse_expr("family", "any(father.notes)")
+    with pytest.raises(QueryLangError, match="relationship hop"):
+        parse_expr("family", "any(father.notes, gramps_id == 'N001')")
+    with pytest.raises(QueryLangError, match="relationship hop"):
+        parse_expr("family", "len(father.notes) > 0")
+    with pytest.raises(QueryLangError, match="relationship hop"):
+        parse_expr("family", "len(father.notes, gramps_id == 'N001') > 0")
+    # A multi-hop chain is caught the same way.
+    with pytest.raises(QueryLangError, match="relationship hop"):
+        parse_expr("family", "any(father.death.notes)")
+
+
+def test_any_len_relationship_hop_path_forms_still_work():
+    # The check above must not catch a *real* relationship-hop path (not a
+    # collection) -- father.attribute_list is a plain array on Person,
+    # reached through father, and has to keep compiling exactly as before.
+    assert parse_expr("family", "len(father.attribute_list) > 0") == [
+        {"column": {"length_of": {"json_path": ["father", "attribute_list"]}}, "op": "gt", "value": 0}
+    ]
+    parse_expr("family", "any(father.attribute_list, value == 'Blacksmith')")
+
+
 def test_any_len_wrong_arity_rejected():
     with pytest.raises(QueryLangError):
         parse_expr("person", "any() ")

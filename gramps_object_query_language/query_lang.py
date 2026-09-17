@@ -174,6 +174,7 @@ from .query import (
     Regex,
     SelectRef,
     default_ref_key,
+    relationship_target,
     resolve_any_path,
     resolve_collection,
     resolve_column_path,
@@ -454,6 +455,44 @@ def _try_resolve_bare_collection(node: ast.AST, spec: ObjectTypeSpec) -> Optiona
         return None
 
 
+def _collection_reached_via_relationship_hop(node: ast.AST, spec: ObjectTypeSpec) -> bool:
+    """True if `node` is `<relationship chain>.<name>` (one or more hops)
+    where `<name>` would resolve as a registered `Collection`/`Backlinks` on
+    the far end -- `father.notes`, say (`notes` is a real collection on
+    `Person`, just not reachable this way).
+
+    Crossing a relationship to reach a collection isn't supported (not by
+    `exists`/`count` either -- see their own "must be a bare relationship
+    name" check), but unlike those, `any`/`len` have a second, legitimate
+    meaning for a non-bare first argument (a plain array path, optionally
+    relationship-prefixed, e.g. `father.attribute_list`) -- so they can't
+    reject every non-`Name` outright the way `exists`/`count` do. Without
+    this check, `any(father.notes)`/`len(father.notes) > 0` would silently
+    fall through to treating `father.notes` as an ordinary (nonexistent)
+    JSON path instead, failing later -- if at all before hitting the
+    database -- with a confusing "unknown field" error that never explains
+    the real issue. This check exists purely to give that same rejection a
+    clear reason, matching `exists`/`count`'s own directness.
+    """
+    try:
+        segments = _translate_path(node)
+    except QueryLangError:
+        return False
+    if len(segments) < 2 or not all(isinstance(segment, str) for segment in segments):
+        return False
+    current = spec
+    for name in segments[:-1]:
+        target = relationship_target(current, name)
+        if target is None:
+            return False
+        current = target
+    try:
+        resolve_collection(current, segments[-1])
+    except QueryError:
+        return False
+    return True
+
+
 def _collection_condition_spec(collection: "Collection") -> ObjectTypeSpec:
     """The spec a `Collection`'s own `condition` resolves against --
     ordinarily `collection.target` itself, but for a *self-linked*
@@ -523,6 +562,12 @@ def _translate_len_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:
     collection = _try_resolve_bare_collection(first, spec)
     if collection is not None:
         return {"count_of": _translate_collection_payload(node, collection, spec)}
+    if _collection_reached_via_relationship_hop(first, spec):
+        raise QueryLangError(
+            f"len(...)'s first argument can't reach a collection through a "
+            f"relationship hop yet -- {ast.dump(first)} names a real "
+            f"collection, just not directly on the type being queried: {ast.dump(node)}"
+        )
     if len(node.args) == 1:
         return {"length_of": _translate_column(first, spec)}
     segments = _translate_path(first)
@@ -877,6 +922,12 @@ def _translate_any_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:
     collection = _try_resolve_bare_collection(first, spec)
     if collection is not None:
         return {"exists": _translate_collection_payload(node, collection, spec)}
+    if _collection_reached_via_relationship_hop(first, spec):
+        raise QueryLangError(
+            f"any(...)'s first argument can't reach a collection through a "
+            f"relationship hop yet -- {ast.dump(first)} names a real "
+            f"collection, just not directly on the type being queried: {ast.dump(node)}"
+        )
     if len(node.args) == 1:
         return {"column": {"length_of": _translate_column(first, spec)}, "op": "gt", "value": 0}
     segments = _translate_path(first)

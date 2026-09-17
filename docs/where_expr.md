@@ -1024,6 +1024,13 @@ changes.
   (a bare list/set/dict comprehension not wrapped in `any(...)`/`len(...)`,
   more than one `for` clause, a tuple-unpacking loop target, `all(...)`/
   `sum(...)`, ...) is rejected the same as any other unrecognized node.
+- A collection reached through a relationship hop -- `any(father.notes,
+  ...)`/`exists(father.notes, ...)` are both rejected with a clear error,
+  even though `father.notes` looks just like the relationship-hop *paths*
+  this page covers elsewhere (`father.attribute_list`, a plain array, works
+  fine). `notes`/`children`/etc. are only ever reachable directly on the
+  type being queried today, never one hop away -- not a design decision so
+  much as nobody has needed it yet.
 
 ## Using it from Python
 

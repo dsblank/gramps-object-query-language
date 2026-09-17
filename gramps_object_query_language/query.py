@@ -483,6 +483,19 @@ _RELATIONSHIPS: dict[str, dict[str, Tuple[ObjectTypeSpec, ColumnRef]]] = {
 }
 
 
+def relationship_target(spec: ObjectTypeSpec, name: str) -> Optional[ObjectTypeSpec]:
+    """The `ObjectTypeSpec` `name` reaches from `spec`'s table via
+    `_RELATIONSHIPS`, or `None` if `name` isn't a relationship there --
+    `resolve_column_path`'s own relationship lookup, exposed standalone for
+    callers that only need "what type is on the far side of this hop,"
+    not a full path resolution (see `query_lang.py`'s
+    `_collection_reached_via_relationship_hop`, which walks a multi-hop
+    chain one name at a time using this).
+    """
+    hop = _RELATIONSHIPS.get(spec.table, {}).get(name)
+    return None if hop is None else hop[0]
+
+
 @dataclass(frozen=True)
 class Collection:
     """A one-to-many relationship -- a list of handles (or handle-bearing ref
