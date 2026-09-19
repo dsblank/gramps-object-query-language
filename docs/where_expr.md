@@ -49,8 +49,8 @@ Person "Date('Jan 1, 1968') < birth.date.sortval"
 Person "birth.date.sortval > Date('Jan 1, 1968')"
 ```
 
-These two lines are the same query. (This doesn't extend to `count(...)`/
-`len(...)`, each only ever recognized as the left-hand operand -- see
+These two lines are the same query. (This doesn't extend to `len(...)`,
+only ever recognized as the left-hand operand -- see
 [Counting a collection](#counting-a-collection-len) and
 [Array length](#array-length-lenpath).)
 
@@ -406,16 +406,16 @@ new queries.
 
 `len(...)` is actually two things at once, disambiguated by what its first
 argument is: `len(name)`/`len(name, condition)`, where `name` is a
-registered collection, is a direct synonym for `count(name)`/`count(name,
-condition)` -- `len(children) > 2` and `count(children) > 2` compile to the
-identical query. This section is about the *other* thing: `len(path)`, where
-`path` isn't a collection name at all.
+registered collection, is the collection form documented in
+[Counting a collection](#counting-a-collection-len) above. This section is
+about the *other* thing: `len(path)`, where `path` isn't a collection name
+at all.
 
-`count(...)` measures a *collection* -- a list of handles reaching into
-another table (`Family.children`, `Person.notes`). `len(path)` measures a
-plain JSON array already living inside the current row itself, no second
-table involved -- an attribute list, a URL list, or (the motivating case)
-a person's *other* recorded surnames:
+The collection form of `len(...)` measures a *collection* -- a list of
+handles reaching into another table (`Family.children`, `Person.notes`).
+`len(path)` measures a plain JSON array already living inside the current
+row itself, no second table involved -- an attribute list, a URL list, or
+(the motivating case) a person's *other* recorded surnames:
 
 ```python
 Person "len(primary_name.surname_list) > 1"
@@ -430,9 +430,9 @@ particular index position was filled in
 "at least two," and breaks down for "at least three" or more. `len(...)`
 counts how many are actually there.
 
-Like `count(...)`, `len(...)` produces a *number*, so it appears as the
-left-hand side of a comparison (`len(note_list) > 0`, not a bare
-`len(note_list)`), supports `in` (`len(note_list) in [0, 1]`), and is
+Like the collection form above, this `len(...)` produces a *number*, so it
+appears as the left-hand side of a comparison (`len(note_list) > 0`, not a
+bare `len(note_list)`), supports `in` (`len(note_list) in [0, 1]`), and is
 deliberately narrower than a plain field: only ever the left-hand operand,
 never compared against another field or another `len(...)`.
 
@@ -445,10 +445,11 @@ Family "len(father.attribute_list) > 0"
 
 A missing path and a non-array value at that path both count as `0`, not
 `NULL` or an error -- "no list recorded" reads as "zero," not "unknown,"
-matching `count(...)`'s own "missing collection is `0`" behavior above.
+matching the collection form's own "missing collection is `0`" behavior
+above.
 
-`len(...)` is a different feature from `count(...)`'s own list-comprehension
-sugar spelling, `len([... for x in rel])` (see
+This array-length form is a different feature from the collection form's
+own list-comprehension sugar spelling, `len([... for x in rel])` (see
 [Comprehension sugar](#comprehension-sugar-any-and-len) below) -- Python's
 own call syntax keeps the two apart: `len(...)` wrapping a real list
 comprehension is that sugar; `len(...)` wrapping a plain path is this
@@ -458,29 +459,30 @@ array-length form instead.
 
 `any(...)`, like `len(...)`, is two things disambiguated by its first
 argument: `any(name)`/`any(name, condition)` over a registered collection is
-a direct synonym for `exists(name)`/`exists(name, condition)`. This section
-is the other thing, `any(...)`'s own new capability: a *condition* on one
-element of a plain intra-record JSON array, the thing `len(path)` alone
-can't express -- `len(path) > 0` only ever answers "is the array non-empty,"
-never "does *this specific* element match something":
+the collection form documented in
+[One-to-many relationships](#one-to-many-relationships-any) above. This
+section is the other thing, `any(...)`'s own capability beyond that: a
+*condition* on one element of a plain intra-record JSON array, the thing
+`len(path)` alone can't express -- `len(path) > 0` only ever answers "is the
+array non-empty," never "does *this specific* element match something":
 
 ```python
 Person "any(alternate_names, first_name == 'Doyle')"
 Family "any(children, gender == Person.MALE)"
 ```
 
-The second line reads identically to `exists(children, gender ==
-Person.MALE)` -- `children` is a registered collection, so `any(...)`
-resolves it exactly the way `exists(...)` always has. The first line is new:
-`alternate_names` isn't a collection (a `Name` has no `gramps_id`, no page
-of its own -- it only ever exists embedded inside the person record it
-belongs to), so no `exists(...)`/`count(...)` form could reach it before
-`any(...)`/`len(...)` existed. Rule of thumb for telling the two apart: if
-the thing you're filtering on would show up as its own record elsewhere in
-the tree (a child, a note, a citation), it's a collection, reachable the
-`exists`/`any` way already documented above; if it's just one of several
-alternative values recorded directly on this same field (a name, an
-address, an attribute), it's an array, and needs this section's form.
+The second line is just `any(...)`'s already-documented collection form --
+`children` is a registered collection, so `any(...)` resolves it the way
+it always does. The first line is different: `alternate_names` isn't a
+collection (a `Name` has no `gramps_id`, no page of its own -- it only ever
+exists embedded inside the person record it belongs to), so only this
+array-membership form can reach it, not the collection form above. Rule of
+thumb for telling the two apart: if the thing you're filtering on would show
+up as its own record elsewhere in the tree (a child, a note, a citation),
+it's a collection, reachable the `any(...)` way already documented above; if
+it's just one of several alternative values recorded directly on this same
+field (a name, an address, an attribute), it's an array, and needs this
+section's form.
 
 `any(path)` -- one argument, no condition -- means "the array has at least
 one element at all," exactly what `len(path) > 0` already means (and
@@ -508,7 +510,7 @@ Family "any(father.attribute_list, value == 'Blacksmith')"
 A condition's fields resolve *relative to one array element*, not the
 outer row -- inside `any(alternate_names, first_name == 'Doyle')`,
 `first_name` means that specific alternate name's own `first_name`, the
-same way `condition` inside `exists(children, ...)` resolves against one
+same way `condition` inside `any(children, ...)` resolves against one
 child, not the family. Only a **list-of-structs** array -- one whose
 elements are themselves records with their own fields (`Name`, `Attribute`,
 `Address`, `Surname`) -- can take a condition this way; a plain list of
@@ -898,8 +900,8 @@ Three details are specific to `select`:
 
 - **`as <key>` renames the response key.** Without it the key is the path
   text itself (`"birth.place.title"`). An alias must be a plain name.
-- **`len(...)`/`count(...)` require an alias.** Unlike a path, they have no
-  text to derive a name from.
+- **`len(...)` requires an alias.** Unlike a path, it has no text to derive
+  a name from.
 - **Paths are checked, in `select` and `where` alike.** See
   [Every path is checked](#every-path-is-checked) below.
 
@@ -1025,12 +1027,12 @@ changes.
   more than one `for` clause, a tuple-unpacking loop target, `all(...)`/
   `sum(...)`, ...) is rejected the same as any other unrecognized node.
 - A collection reached through a relationship hop -- `any(father.notes,
-  ...)`/`exists(father.notes, ...)` are both rejected with a clear error,
-  even though `father.notes` looks just like the relationship-hop *paths*
-  this page covers elsewhere (`father.attribute_list`, a plain array, works
-  fine). `notes`/`children`/etc. are only ever reachable directly on the
-  type being queried today, never one hop away -- not a design decision so
-  much as nobody has needed it yet.
+  ...)` is rejected with a clear error, even though `father.notes` looks
+  just like the relationship-hop *paths* this page covers elsewhere
+  (`father.attribute_list`, a plain array, works fine). `notes`/`children`/
+  etc. are only ever reachable directly on the type being queried today,
+  never one hop away -- not a design decision so much as nobody has needed
+  it yet.
 
 ## Using it from Python
 
