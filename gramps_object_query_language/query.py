@@ -598,6 +598,7 @@ class JsonArrayExists:
         spec: ObjectTypeSpec,
         dialect: Optional[Dialect] = None,
         treeid: Optional[int] = None,
+        collation: Optional[str] = None,
     ) -> Tuple[str, list]:
         if dialect is None:
             raise QueryError(
@@ -605,7 +606,7 @@ class JsonArrayExists:
                 "but none was given"
             )
         body, params = _json_array_subquery_body(
-            self.array, self.condition, self.element_spec, spec.table, dialect, treeid
+            self.array, self.condition, self.element_spec, spec.table, dialect, treeid, collation
         )
         return f"EXISTS (SELECT 1 FROM {body})", params
 
@@ -1613,6 +1614,7 @@ class Comparison:
         spec: ObjectTypeSpec,
         dialect: Optional[Dialect] = None,
         treeid: Optional[int] = None,
+        collation: Optional[str] = None,
     ) -> Tuple[str, list]:
         is_field_comparison = isinstance(self.value, (JsonPath, RelatedObject, FlatColumnRef))
         # A field-vs-field comparison has no literal runtime value to infer
@@ -1632,10 +1634,24 @@ class Comparison:
         column_sql, column_params = _render_column(
             self.column, spec, dialect, value=cast_hint, treeid=treeid
         )
+        # `<`/`<=`/`>`/`>=` against a text column only means what it says
+        # about that column's `ORDER BY` position if it's evaluated under
+        # the exact same collation `ORDER BY` itself would use -- see
+        # `_collate_suffix`'s own docstring for the bug this fixes (a
+        # client-computed "rows before this one" rank, used to know which
+        # row to highlight, silently landing on a different row than the
+        # one actually selected). `=`/`!=` are deliberately left alone: a
+        # case-insensitive equality would change *matching* semantics, not
+        # just ordering, which nothing here asks for.
+        if self.op in _ORDERING_OPS and not is_field_comparison:
+            column_sql += _collate_suffix(_is_text_ref(self.column, spec), collation, dialect)
         if is_field_comparison:
             value_sql, value_params = _render_column(
                 self.value, spec, dialect, value=cast_hint, treeid=treeid
             )
+            if self.op in _ORDERING_OPS:
+                column_sql += _collate_suffix(_is_text_ref(self.column, spec), collation, dialect)
+                value_sql += _collate_suffix(_is_text_ref(self.value, spec), collation, dialect)
             comparison_sql = f"{column_sql} {sql_op} {value_sql}"
             comparison_params = column_params + value_params
         else:
@@ -1724,7 +1740,12 @@ class Regex(Comparison):
         spec: ObjectTypeSpec,
         dialect: Optional[Dialect] = None,
         treeid: Optional[int] = None,
+        collation: Optional[str] = None,
     ) -> Tuple[str, list]:
+        # `collation` is accepted, not used -- REGEXP/`~` has no
+        # collation-sensitive form on either dialect, but every leaf
+        # reachable from `And`/`Or`'s generic `expr.compile(...)` (see
+        # there) has to accept the same call shape.
         if dialect == Dialect.SQLITE:
             sql_op = "REGEXP"
         elif dialect == Dialect.POSTGRESQL:
@@ -1778,7 +1799,11 @@ class Contains(Comparison):
         spec: ObjectTypeSpec,
         dialect: Optional[Dialect] = None,
         treeid: Optional[int] = None,
+        collation: Optional[str] = None,
     ) -> Tuple[str, list]:
+        # `collation` is accepted, not used -- a substring test has no
+        # collation-sensitive form; see Regex.compile's own note on why
+        # every leaf still has to accept it.
         if isinstance(self.value, (JsonPath, RelatedObject, FlatColumnRef)):
             # Any string content works as the cast hint here -- Contains
             # always wants a TEXT extraction (LIKE has no numeric/boolean
@@ -1822,7 +1847,11 @@ class In:
         spec: ObjectTypeSpec,
         dialect: Optional[Dialect] = None,
         treeid: Optional[int] = None,
+        collation: Optional[str] = None,
     ) -> Tuple[str, list]:
+        # `collation` is accepted, not used -- `IN` is exact-match
+        # membership, not an ordering comparison; see Regex.compile's own
+        # note on why every leaf still has to accept it.
         column_sql, column_params = _render_column(
             self.column, spec, dialect, value=self.values[0], treeid=treeid
         )
@@ -1855,11 +1884,12 @@ class And:
         spec: ObjectTypeSpec,
         dialect: Optional[Dialect] = None,
         treeid: Optional[int] = None,
+        collation: Optional[str] = None,
     ) -> Tuple[str, list]:
         parts = []
         params: list = []
         for expr in self.exprs:
-            sql, p = expr.compile(spec, dialect, treeid)
+            sql, p = expr.compile(spec, dialect, treeid, collation)
             parts.append(f"({sql})")
             params.extend(p)
         return " AND ".join(parts), params
@@ -1879,11 +1909,12 @@ class Or:
         spec: ObjectTypeSpec,
         dialect: Optional[Dialect] = None,
         treeid: Optional[int] = None,
+        collation: Optional[str] = None,
     ) -> Tuple[str, list]:
         parts = []
         params: list = []
         for expr in self.exprs:
-            sql, p = expr.compile(spec, dialect, treeid)
+            sql, p = expr.compile(spec, dialect, treeid, collation)
             parts.append(f"({sql})")
             params.extend(p)
         return " OR ".join(parts), params
@@ -1901,8 +1932,9 @@ class Not:
         spec: ObjectTypeSpec,
         dialect: Optional[Dialect] = None,
         treeid: Optional[int] = None,
+        collation: Optional[str] = None,
     ) -> Tuple[str, list]:
-        sql, params = self.expr.compile(spec, dialect, treeid)
+        sql, params = self.expr.compile(spec, dialect, treeid, collation)
         return f"NOT ({sql})", params
 
     def __repr__(self) -> str:
@@ -1982,6 +2014,7 @@ def _collection_subquery_body(
     condition: Optional[Any],
     dialect: Dialect,
     treeid: Optional[int],
+    collation: Optional[str] = None,
 ) -> Tuple[str, list]:
     """`<target_table> AS <alias>, <source>[, <self-link source>] WHERE
     <handle correlation>[ AND <self-link correlation>][ AND (<condition>)]
@@ -2038,7 +2071,7 @@ def _collection_subquery_body(
         from_parts.append(link_source)
         where_parts.append(f"{link_correlation} = {outer_table}.handle")
     if condition is not None:
-        cond_sql, cond_params = condition.compile(target, dialect, treeid)
+        cond_sql, cond_params = condition.compile(target, dialect, treeid, collation)
         where_parts.append(f"({cond_sql})")
         params.extend(cond_params)
     if treeid is not None:
@@ -2206,6 +2239,7 @@ def _json_array_subquery_body(
     outer_table: str,
     dialect: Dialect,
     treeid: Optional[int],
+    collation: Optional[str] = None,
 ) -> Tuple[str, list]:
     """`<join entries>, <unnest source> [WHERE <join correlation>[ AND
     (<condition>)]]` -- the subquery body shared by `JsonArrayExists`
@@ -2236,7 +2270,7 @@ def _json_array_subquery_body(
     params = list(join_params) + list(source_params)
     where_parts = list(where_parts)
     if condition is not None:
-        cond_sql, cond_params = condition.compile(element_spec, dialect, treeid)
+        cond_sql, cond_params = condition.compile(element_spec, dialect, treeid, collation)
         where_parts.append(f"({cond_sql})")
         params.extend(cond_params)
     from_clause = ", ".join(from_parts + [source])
@@ -2299,8 +2333,11 @@ class Exists:
         spec: ObjectTypeSpec,
         dialect: Optional[Dialect] = None,
         treeid: Optional[int] = None,
+        collation: Optional[str] = None,
     ) -> Tuple[str, list]:
         if isinstance(self.collection, Backlinks):
+            # `self.condition` here is a `BacklinkClassFilter`, not a WHERE
+            # AST node -- no `.compile()` call, so no collation to forward.
             body, params = _backlinks_subquery_body(spec.table, self.condition, treeid)
             return f"EXISTS (SELECT 1 FROM {body})", params
         if dialect is None:
@@ -2309,7 +2346,7 @@ class Exists:
                 "but none was given"
             )
         body, params = _collection_subquery_body(
-            self.collection, spec.table, self.condition, dialect, treeid
+            self.collection, spec.table, self.condition, dialect, treeid, collation
         )
         return f"EXISTS (SELECT 1 FROM {body})", params
 
@@ -2516,6 +2553,34 @@ def _is_text_ref(ref: "ColumnRef", spec: ObjectTypeSpec) -> bool:
     return isinstance(ref, str) and ref in spec.text_columns
 
 
+def _collate_suffix(
+    is_text: bool, collation: Optional[str], dialect: Optional[Dialect]
+) -> str:
+    """` COLLATE "<name>"` for a text column reference, or `""` for a
+    non-text one -- shared by every SQL fragment that has to agree on a
+    text column's collation with `ORDER BY` (`_column_expr`, below, and
+    `Comparison.compile`'s ordering operators): a `WHERE` test like
+    `surname < ?` only means what it says about a row's *position* in an
+    `ORDER BY surname` result if it's evaluated under that exact same
+    collation. Before this was shared, `Comparison.compile` used no
+    `COLLATE` clause at all (plain `<`/`>`/... have no ordering-sensitive
+    treatment the way `ORDER BY`/keyset rendering do), so a client asking
+    "how many rows sort before this one" (gramps-connect's
+    `ViewStore.globalRankOfItem`, computing which row index to highlight)
+    got an answer computed under binary/codepoint order while the actual
+    `ORDER BY` used `NOCASE`/a locale collation -- silently landing the
+    answer on a different row than the one actually selected whenever the
+    two orderings disagreed for the rows in between (any surname with a
+    lowercase-folding-sensitive prefix, e.g. "de Vos" vs "Clark" under
+    NOCASE vs binary order). See `_column_expr`'s own docstring for why the
+    `NOCASE` fallback exists at all.
+    """
+    if not is_text:
+        return ""
+    effective_collation = collation or ("NOCASE" if dialect in (None, Dialect.SQLITE) else None)
+    return f' COLLATE "{effective_collation}"' if effective_collation else ""
+
+
 def _column_expr(
     column: "ColumnRef",
     spec: ObjectTypeSpec,
@@ -2557,13 +2622,7 @@ def _column_expr(
     sql, params = _render_column(
         column, spec, dialect, value=_cast_hint(ref_value_type(spec, column)), treeid=treeid
     )
-    if _is_text_ref(column, spec):
-        effective_collation = collation or (
-            "NOCASE" if dialect in (None, Dialect.SQLITE) else None
-        )
-        if effective_collation:
-            return f'{sql} COLLATE "{effective_collation}"', params
-    return sql, params
+    return sql + _collate_suffix(_is_text_ref(column, spec), collation, dialect), params
 
 
 def _keyset_tie_sql(
@@ -2709,6 +2768,7 @@ def _where_clauses(
     where: Optional[Any],
     dialect: Optional[Dialect] = None,
     treeid: Optional[int] = None,
+    collation: Optional[str] = None,
 ) -> Tuple[list, list]:
     """Shared `WHERE`-clause + tree-scoping predicate building.
 
@@ -2728,11 +2788,21 @@ def _where_clauses(
     backends (`SQLite`, the single-user `PostgreSQL` addon) that have no
     `treeid` column at all -- see `resources/object_query.py`'s
     `_resolve_treeid`.
+
+    `collation`, forwarded verbatim to `where.compile()` (and, through
+    `And`/`Or`/`Not`, to every leaf comparison in the tree): a `<`/`<=`/
+    `>`/`>=` comparison against a text column needs the exact same
+    collation `ORDER BY`/keyset rendering apply to that column (see
+    `_collate_suffix`'s own docstring), or a "how many rows sort before
+    this one" count-only query (`compile_count_query`, below -- used by
+    gramps-connect's `ViewStore.globalRankOfItem` to know which row to
+    highlight after a search/filter/sort change) can silently disagree
+    with the row's actual `ORDER BY` position.
     """
     clauses = []
     params: list = []
     if where is not None:
-        sql, p = where.compile(spec, dialect, treeid)
+        sql, p = where.compile(spec, dialect, treeid, collation)
         clauses.append(f"({sql})")
         params.extend(p)
     if treeid is not None:
@@ -2801,7 +2871,7 @@ def compile_query(
         select_parts.append(sql_frag)
         params.extend(p)
 
-    where_clauses, where_params = _where_clauses(spec, query.where, dialect, treeid)
+    where_clauses, where_params = _where_clauses(spec, query.where, dialect, treeid, collation)
     params.extend(where_params)
 
     if query.after is not None:
@@ -2836,6 +2906,7 @@ def compile_count_query(
     spec: ObjectTypeSpec,
     query: Query,
     *,
+    collation: Optional[str] = None,
     dialect: Optional[Dialect] = None,
     treeid: Optional[int] = None,
 ) -> Tuple[str, list]:
@@ -2846,8 +2917,15 @@ def compile_count_query(
     since a count has no columns, sort order, or page to return. In
     particular this is a count of *all* matching rows, not of just the
     current keyset page.
+
+    `collation`: see `compile_query`'s own docstring -- matters here too,
+    and arguably more: a count-only query is exactly how a caller answers
+    "how many rows come before this one under the current sort" (see
+    `_where_clauses`'s own doc comment), which only means what it says if
+    `where`'s own ordering comparisons use the same collation `ORDER BY`
+    would.
     """
-    where_clauses, params = _where_clauses(spec, query.where, dialect, treeid)
+    where_clauses, params = _where_clauses(spec, query.where, dialect, treeid, collation)
     sql = f"SELECT COUNT(*) FROM {spec.table}"
     if where_clauses:
         sql += " WHERE " + " AND ".join(where_clauses)

@@ -1407,6 +1407,107 @@ def test_collate_applied_to_keyset_comparisons_for_text_columns():
     assert params == ["Smith", "Smith", 1, "Smith", 1, "h123", 50]
 
 
+# --- COLLATE on WHERE ordering comparisons (gramps-connect issue #12: ------
+# --- "wrong row highlighted after clearing a search") ----------------------
+#
+# gramps-connect's ViewStore.globalRankOfItem() asks "how many rows sort
+# before this one?" via an ordinary WHERE comparison (Lt/Gt on the sort
+# columns) to learn which row index to highlight after a search/filter/sort
+# change -- see gramps-connect's viewStore.ts. That count only answers the
+# question it's asked if it's evaluated under the exact same collation the
+# real ORDER BY uses; before this, Comparison.compile() applied none at
+# all, so it silently disagreed with ORDER BY's COLLATE NOCASE/locale
+# collation whenever case-folding (or locale collation) changed two rows'
+# relative order -- landing the highlight on a different row than the one
+# actually selected.
+
+
+def test_ordering_comparison_gets_nocase_default_collation_on_sqlite():
+    query = Query(select=["handle"], where=Lt(FlatColumnRef("surname"), "Smith"))
+    sql, _ = compile_query(PERSON, query, dialect=Dialect.SQLITE)
+    assert 'surname COLLATE "NOCASE" < ?' in sql
+
+
+def test_ordering_comparison_gets_no_default_collation_on_postgresql():
+    # No built-in NOCASE on PostgreSQL -- same fallback rule ORDER BY uses.
+    query = Query(select=["handle"], where=Lt(FlatColumnRef("surname"), "Smith"))
+    sql, _ = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
+    assert "COLLATE" not in sql
+
+
+def test_ordering_comparison_uses_explicit_collation():
+    query = Query(select=["handle"], where=Gte(FlatColumnRef("surname"), "Smith"))
+    sql, _ = compile_query(PERSON, query, collation="de_DE")
+    assert 'surname COLLATE "de_DE" >= ?' in sql
+
+
+def test_equality_comparison_never_gets_a_collate_clause():
+    # `=`/`!=` are deliberately left alone -- a case-insensitive equality
+    # would change *matching* semantics (two differently-cased surnames
+    # would start comparing equal), which nothing asks for; only ordering
+    # needs to agree with ORDER BY. Checked against the count query (no
+    # implicit ORDER BY of its own) so the assertion isn't tripped up by
+    # compile_query's own always-collated trailing handle tiebreak.
+    query = Query(where=Eq(FlatColumnRef("surname"), "Smith"))
+    sql, _ = compile_count_query(PERSON, query, collation="de_DE")
+    assert "COLLATE" not in sql
+
+
+def test_ordering_comparison_collation_reaches_leaves_through_and_or_not():
+    query = Query(
+        select=["handle"],
+        where=Not(And(Or(Lt(FlatColumnRef("surname"), "Smith"), Eq(FlatColumnRef("gender"), 1)))),
+    )
+    sql, _ = compile_query(PERSON, query, collation="de_DE")
+    assert 'surname COLLATE "de_DE" < ?' in sql
+    assert "gender COLLATE" not in sql  # non-text column, and an Eq besides
+
+
+def test_count_query_ordering_comparison_also_gets_collation():
+    # compile_count_query is exactly what gramps-connect's
+    # ViewStore.globalRankOfItem() drives (a count-only "rows before this
+    # one" query) -- it has to apply the same collation compile_query's
+    # ORDER BY does, or the count silently doesn't match the real ORDER BY
+    # position at all.
+    query = Query(where=Lt(FlatColumnRef("surname"), "Smith"))
+    sql, _ = compile_count_query(PERSON, query, collation="de_DE")
+    assert 'surname COLLATE "de_DE" < ?' in sql
+
+
+def test_before_count_matches_real_order_by_position_under_nocase_sqlite_execution():
+    # The actual regression: three real rows where NOCASE-folded order
+    # ("Adams", "brown", "Clark") disagrees with plain codepoint order
+    # ("Adams", "Clark", "brown", since 'C' < 'b' in ASCII). Before this
+    # fix, a client asking "how many rows sort before Clark" via a plain
+    # `surname < ?` WHERE count got 1 (miscounting "brown" as after Clark),
+    # not Clark's real 0-based position (2) in the NOCASE-sorted list that
+    # ORDER BY actually returns -- exactly the gap that let gramps-connect
+    # highlight the wrong row.
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE person (handle TEXT, surname TEXT)")
+    conn.executemany(
+        "INSERT INTO person VALUES (?, ?)",
+        [("h_adams", "Adams"), ("h_brown", "brown"), ("h_clark", "Clark")],
+    )
+
+    order_sql, order_params = compile_query(
+        PERSON,
+        Query(select=["handle"], order_by=[OrderBy("surname", "asc")]),
+        dialect=Dialect.SQLITE,
+    )
+    displayed_order = [row[0] for row in conn.execute(order_sql, order_params).fetchall()]
+    clark_index = displayed_order.index("h_clark")
+    assert clark_index == 2  # Adams, brown, Clark
+
+    count_sql, count_params = compile_count_query(
+        PERSON, Query(where=Lt(FlatColumnRef("surname"), "Clark")), dialect=Dialect.SQLITE
+    )
+    rows_before_clark = conn.execute(count_sql, count_params).fetchone()[0]
+    assert rows_before_clark == clark_index
+
+
 def test_unknown_column_in_where_rejected():
     query = Query(where=Eq("; DROP TABLE person; --", 1))
     with pytest.raises(QueryError):
