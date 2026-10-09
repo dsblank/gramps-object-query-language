@@ -1576,7 +1576,7 @@ def test_order_by_gets_trailing_handle_tiebreaker():
     # which isn't what this test is about.
     query = Query(select=["handle"], order_by=[OrderBy("surname", "asc")])
     sql, _ = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
-    assert "ORDER BY surname ASC, handle ASC" in sql
+    assert "ORDER BY surname ASC NULLS FIRST, handle ASC" in sql
 
 
 def test_order_by_does_not_duplicate_explicit_handle():
@@ -1586,8 +1586,36 @@ def test_order_by_does_not_duplicate_explicit_handle():
     )
     sql, _ = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
     order_by_clause = sql.split("ORDER BY", 1)[1]
-    assert order_by_clause.startswith(" surname ASC, handle DESC")
+    assert order_by_clause.startswith(" surname ASC NULLS FIRST, handle DESC")
     assert order_by_clause.count("handle") == 1  # not duplicated
+
+
+def test_postgresql_order_by_pins_null_is_smallest():
+    # Issue #4: PostgreSQL's default puts NULL last in ASC and first in DESC,
+    # the opposite of SQLite's and of what _keyset_leg_sql/_null_safe_cmp
+    # assume -- so results reordered and keyset paging dropped rows. The
+    # PostgreSQL dialect must pin NULL-is-smallest explicitly, both
+    # directions, for plain columns and JSON paths alike.
+    query = Query(
+        select=["handle"],
+        order_by=[OrderBy("birth.place.title", "desc"), OrderBy("surname", "asc")],
+    )
+    sql, _ = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
+    order_by_clause = sql.split("ORDER BY", 1)[1]
+    assert order_by_clause.count("DESC NULLS LAST") == 1
+    assert "surname ASC NULLS FIRST" in order_by_clause
+    # The NOT NULL primary-key tiebreaker stays bare (index-friendly).
+    assert "handle ASC NULLS" not in order_by_clause
+
+
+def test_sqlite_order_by_has_no_nulls_clause():
+    # SQLite's default already is NULL-is-smallest; output stays unchanged.
+    query = Query(
+        select=["handle"],
+        order_by=[OrderBy("birth.place.title", "desc"), OrderBy("surname", "asc")],
+    )
+    sql, _ = compile_query(PERSON, query, dialect=Dialect.SQLITE)
+    assert "NULLS" not in sql
 
 
 def test_default_order_by_is_handle_only():
