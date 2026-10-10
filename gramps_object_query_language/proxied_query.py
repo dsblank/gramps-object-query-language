@@ -67,7 +67,9 @@ section's recommended v1:
 `NULL` placement, for both plain sorting and keyset seeking, matches
 SQLite's own verified default (confirmed empirically, not assumed): `NULL`
 sorts as the smallest value in both directions, so `DESC` is the exact
-reverse of `ASC`, `NULL`s included. Keyset seeking (`after`) mirrors
+reverse of `ASC`, `NULL`s included. PostgreSQL's default is the opposite,
+so the SQL path pins this order there with explicit `NULLS FIRST`/`NULLS
+LAST` (`query.py`'s `_order_direction_sql`). Keyset seeking (`after`) mirrors
 `query.py`'s `_compile_keyset` SQL, which (after its own NULL-safety fix --
 see that function's docstring) applies this identical NULL-is-smallest rule
 to the seek predicate too, rather than relying on SQL's raw three-valued

@@ -2650,8 +2650,9 @@ def _keyset_leg_sql(
 ) -> Optional[Tuple[str, list]]:
     """NULL-safe "ranks strictly after the cursor" fragment for the one
     `order_by` column a seek's OR-term actually advances past, matching
-    `ORDER BY`'s own verified default total order (`NULL` is the smallest
-    value in both directions -- see `_null_safe_cmp` in `proxied_query.py`,
+    `ORDER BY`'s total order (`NULL` is the smallest value in both
+    directions -- SQLite's default, pinned explicitly on PostgreSQL by
+    `_order_direction_sql`; see also `_null_safe_cmp` in `proxied_query.py`,
     which mirrors this same order for the evaluator path).
 
     A plain `col > ?`/`col < ?` against a real SQL `NULL` is always
@@ -2811,6 +2812,25 @@ def _where_clauses(
     return clauses, params
 
 
+def _order_direction_sql(ob: OrderBy, dialect: Optional[Dialect]) -> str:
+    """`ASC`/`DESC` for one `ORDER BY` column, pinned to the "`NULL` is
+    smallest" total order that `_keyset_leg_sql` and `proxied_query.py`'s
+    `_null_safe_cmp` both assume.
+
+    That is SQLite's default, so SQLite gets the bare keyword. PostgreSQL's
+    default is the opposite (`NULL` is largest: last in `ASC`, first in
+    `DESC`), which both reordered results relative to SQLite and made the
+    keyset seek skip rows -- so it gets an explicit `NULLS FIRST`/`NULLS
+    LAST`. `handle` is left bare: it's the `NOT NULL` primary key, so the
+    clause changes nothing there, and a bare `ASC`/`DESC` keeps the
+    default-ordered primary-key index usable for the sort.
+    """
+    keyword = ob.direction.upper()
+    if dialect != Dialect.POSTGRESQL or ob.column == "handle":
+        return keyword
+    return f"{keyword} NULLS FIRST" if ob.direction == "asc" else f"{keyword} NULLS LAST"
+
+
 def compile_query(
     spec: ObjectTypeSpec,
     query: Query,
@@ -2886,7 +2906,7 @@ def compile_query(
     order_params: list = []
     for ob in ordering:
         order_sql, p = _column_expr(ob.column, spec, collation, dialect, treeid)
-        order_parts.append(f"{order_sql} {ob.direction.upper()}")
+        order_parts.append(f"{order_sql} {_order_direction_sql(ob, dialect)}")
         order_params.extend(p)
 
     sql = f"SELECT {', '.join(select_parts)} FROM {spec.table}"
