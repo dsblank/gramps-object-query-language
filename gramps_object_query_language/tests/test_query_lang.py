@@ -208,6 +208,16 @@ def test_like_call_non_string_pattern_rejected():
         parse_expr("person", "like(gender, 5)")
 
 
+def test_like_call_trailing_unescaped_backslash_rejected():
+    with pytest.raises(QueryError, match="unescaped"):
+        compile_expr("person", r"like(primary_name.first_name, 'Jo\\')")
+
+
+def test_like_call_escaped_wildcard_kept_as_written():
+    result = parse_expr("person", r"like(primary_name.first_name, '100\\%')")
+    assert result[0]["value"] == "100\\%"
+
+
 def test_regex_call():
     result = parse_expr("person", "regex(primary_name.first_name, '^Jo')")
     assert result == [

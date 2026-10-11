@@ -1005,6 +1005,106 @@ def test_ordering_and_like_and_in_ops_unaffected_by_null_safe_rewrite():
     assert "gender IN (?, ?)" in sql
 
 
+# --- LIKE case-insensitivity across dialects ----------------------------------
+#
+# SQLite's plain LIKE is case-insensitive (ASCII); PostgreSQL's is
+# case-sensitive, so both `Like` and `Contains` render `ILIKE` there instead.
+
+
+def test_like_sqlite_renders_plain_like():
+    sql, params = compile_query(
+        PERSON, Query(select=["handle"], where=Like("surname", "a%")), dialect=Dialect.SQLITE
+    )
+    assert "surname LIKE ?" in sql
+    assert "ILIKE" not in sql
+    assert params[0] == "a%"
+
+
+def test_like_postgresql_renders_ilike():
+    sql, params = compile_query(
+        PERSON, Query(select=["handle"], where=Like("surname", "a%")), dialect=Dialect.POSTGRESQL
+    )
+    assert "surname ILIKE ?" in sql
+    assert params[0] == "a%"
+
+
+def test_like_field_vs_field_postgresql_renders_ilike():
+    sql, _ = compile_query(
+        PERSON,
+        Query(select=["handle"], where=Like("surname", FlatColumnRef("given_name"))),
+        dialect=Dialect.POSTGRESQL,
+    )
+    assert "surname ILIKE given_name" in sql
+
+
+def test_contains_postgresql_renders_ilike():
+    sql, params = compile_query(
+        PERSON, Query(select=["handle"], where=Contains("surname", "mit")), dialect=Dialect.POSTGRESQL
+    )
+    assert "surname ILIKE ? ESCAPE '\\'" in sql
+    assert params[0] == "%mit%"
+
+
+def test_contains_field_vs_field_postgresql_renders_ilike():
+    sql, _ = compile_query(
+        PERSON,
+        Query(select=["handle"], where=Contains("surname", FlatColumnRef("given_name"))),
+        dialect=Dialect.POSTGRESQL,
+    )
+    assert "surname ILIKE '%' || " in sql
+    assert " LIKE " not in sql
+
+
+def test_like_renders_backslash_escape_clause_on_both_dialects():
+    # PostgreSQL treats `\` as LIKE's escape character by default, SQLite
+    # only with an explicit ESCAPE -- spelled out on both so `\%` means a
+    # literal `%` everywhere, the same as in the evaluator.
+    for dialect, op in [(Dialect.SQLITE, "LIKE"), (Dialect.POSTGRESQL, "ILIKE")]:
+        sql, params = compile_query(
+            PERSON, Query(select=["handle"], where=Like("surname", "100\\%")), dialect=dialect
+        )
+        assert f"surname {op} ? ESCAPE '\\'" in sql
+        assert params[0] == "100\\%"
+
+
+def test_like_field_vs_field_renders_backslash_escape_clause():
+    sql, _ = compile_query(
+        PERSON,
+        Query(select=["handle"], where=Like("surname", FlatColumnRef("given_name"))),
+        dialect=Dialect.POSTGRESQL,
+    )
+    assert "surname ILIKE given_name ESCAPE '\\'" in sql
+
+
+@pytest.mark.parametrize("pattern", ["abc\\", "abc\\\\\\"])
+def test_like_rejects_trailing_unescaped_backslash(pattern):
+    with pytest.raises(QueryError, match="unescaped"):
+        Like("surname", pattern)
+
+
+def test_like_accepts_trailing_escaped_backslash():
+    assert Like("surname", "abc\\\\").value == "abc\\\\"
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        "not like(primary_name.first_name, 'a%')",
+        "like(birth.place.title, 'a%')",
+        "any(like(n.first_name, 'a%') for n in alternate_names)",
+        "len(alternate_names, like(first_name, 'a%')) > 0",
+    ],
+)
+def test_like_in_nested_where_expr_renders_ilike_on_postgresql(expr):
+    # Negated, JSON-path, related-object and per-element `like(...)` all go
+    # through `Like.compile` -- guards against any of them growing its own
+    # operator string that would stay case-sensitive on PostgreSQL.
+    spec, where = compile_expr("person", expr)
+    sql, _ = compile_query(spec, Query(select=["handle"], where=where), dialect=Dialect.POSTGRESQL)
+    assert " ILIKE " in sql
+    assert " LIKE " not in sql
+
+
 # --- Regex --------------------------------------------------------------
 #
 # Dialect-sensitive, like JsonPath/RelatedObject rendering -- SQLite has no

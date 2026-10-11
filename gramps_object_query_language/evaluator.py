@@ -386,22 +386,32 @@ def _json_array_count(db: Any, obj: Any, count: "JsonArrayCount", spec: ObjectTy
 
 
 def _like_to_regex(pattern: str) -> re.Pattern:
-    """Translate a SQL `LIKE` pattern (`%`/`_` wildcards) to a regex.
+    """Translate a SQL `LIKE ... ESCAPE '\\'` pattern (`%`/`_` wildcards) to a
+    regex, the way `query.py`'s `Like` renders it on both dialects.
 
-    Case-insensitive, matching SQLite's default `LIKE` behavior for ASCII --
-    the backend every test fixture and single-tree/dev deployment actually
-    runs (see `object_query.py`'s `_resolve_dialect`). Any other character
-    is escaped literally via `re.escape` before the wildcard translation.
+    `\\` makes the next character literal (`\\%` is a literal `%`); a
+    trailing lone `\\` -- which `Like` rejects up front for a literal
+    pattern, but a field-vs-field pattern can still produce at runtime --
+    matches nothing, same as SQLite. `re.DOTALL` because SQL's `%`/`_`
+    match a newline too. Case-insensitive like SQLite's `LIKE` and
+    PostgreSQL's `ILIKE`, though `re.IGNORECASE` folds non-ASCII letters as
+    well, which SQLite doesn't -- see `query.py`'s `_like_op`.
     """
     out = []
-    for char in pattern:
-        if char == "%":
+    chars = iter(pattern)
+    for char in chars:
+        if char == "\\":
+            escaped = next(chars, None)
+            if escaped is None:
+                return re.compile(r"(?!)")
+            out.append(re.escape(escaped))
+        elif char == "%":
             out.append(".*")
         elif char == "_":
             out.append(".")
         else:
             out.append(re.escape(char))
-    return re.compile("^" + "".join(out) + "$", re.IGNORECASE)
+    return re.compile("".join(out), re.IGNORECASE | re.DOTALL)
 
 
 _ORDERING_OPS = {
@@ -423,7 +433,7 @@ def _compare(op: str, left: Any, right: Any) -> Optional[bool]:
     if op == "LIKE":
         if left is None or right is None:
             return None
-        return _like_to_regex(str(right)).match(str(left)) is not None
+        return _like_to_regex(str(right)).fullmatch(str(left)) is not None
     if op == "REGEXP":
         # Mirrors gramps core's `dbapi/sqlite.py` `regexp(expr, value)` UDF
         # exactly (`re.search(expr, value, re.MULTILINE)`) -- an unanchored,
@@ -528,8 +538,8 @@ def _evaluate_tri(db: Any, obj: Any, expr: Any, spec: ObjectTypeSpec) -> Optiona
     if isinstance(expr, Contains):
         # A plain substring test -- unlike `Like`'s SQL-pattern matching
         # (`_like_to_regex`), `expr.value` (when a literal) has no wildcard
-        # characters to reinterpret, so a direct (case-insensitive, matching
-        # SQLite's default `LIKE` behavior) Python `in` check is both
+        # characters to reinterpret, so a direct (case-insensitive, like
+        # `_like_to_regex`) Python `in` check is both
         # correct and simpler than routing through the LIKE/regex machinery.
         # `expr.value` can also be a `JsonPath`/`RelatedObject` -- a
         # field-vs-field substring test -- resolved the same way `expr.column`

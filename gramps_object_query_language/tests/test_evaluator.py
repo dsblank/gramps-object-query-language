@@ -565,6 +565,85 @@ def test_sql_and_evaluator_agree_on_regex(db_handles):
             assert actual == expected, f"{where!r} on {key!r}: SQL={expected} eval={actual}"
 
 
+@pytest.fixture(scope="module")
+def like_db():
+    """A separate SQLite DB whose surnames exercise `LIKE`'s edge cases --
+    kept apart from `db_handles` so its people don't shift that fixture's
+    counts."""
+    dbman = CLIDbManager(DbState())
+    dirpath, db_name = dbman.create_new_db_cli("_test_evaluator_like", dbid="sqlite")
+    db = make_database("sqlite")
+    db.load(dirpath)
+    surnames = {
+        "smith": "Smith",
+        "percent": "Paid 100%",
+        "hundred": "Paid 1000",
+        "backslash": "Back\\slash",
+        "no_backslash": "Backslash",
+        "underscore": "Under_score",
+        "newline": "Multi\nline",
+        "accented": "Élise",
+    }
+    handles = {}
+    with DbTxn("setup", db) as trans:
+        for key, surname in surnames.items():
+            person = Person()
+            person.set_primary_name(_name("X", surname))
+            handles[key] = db.add_person(person, trans)
+    yield db, handles
+    db.close()
+    dbman.remove_database(db_name)
+
+
+def test_sql_and_evaluator_agree_on_like_and_contains(like_db):
+    """Same style of regression guard as test_sql_and_evaluator_agree_on_regex,
+    for `Like`/`Contains`: case-insensitivity, `\\` escapes, wildcards across
+    a newline, and literal `%`/`_`/`\\` in a substring. Leaves out a
+    case-*mismatched* non-ASCII pattern (`'é%'` vs `"Élise"`) -- SQLite
+    only folds ASCII, the evaluator folds everything; see `_like_op`.
+    """
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+
+    db, handles = like_db
+    wheres = [
+        Like("surname", "smi%"),
+        Like("surname", "SMITH"),
+        Like("surname", "paid 100\\%"),  # literal % -- not "Paid 1000"
+        Like("surname", "paid 100%"),  # wildcard % -- both
+        Like("surname", "back\\\\slash"),  # escaped backslash
+        Like("surname", "back\\slash"),  # lone backslash escapes 's' -- no literal '\'
+        Like("surname", "under\\_score"),
+        Like("surname", "multi%"),  # % spans the newline
+        Like("surname", "multi_line"),  # _ matches the newline
+        Like("surname", "Él%"),
+        Not(Like("surname", "%a%")),
+        Contains("surname", "MIT"),
+        Contains("surname", "100%"),
+        Contains("surname", "k\\s"),
+        Contains("surname", "r_s"),
+    ]
+    people = {key: db.get_person_from_handle(handle) for key, handle in handles.items()}
+    for where in wheres:
+        sql, params = compile_query(
+            PERSON, Query(select=["handle"], where=where), dialect=Dialect.SQLITE
+        )
+        db.dbapi.execute(sql, params)
+        sql_matches = {row[0] for row in db.dbapi.fetchall()}
+        for key, person in people.items():
+            expected = handles[key] in sql_matches
+            actual = evaluate_where(db, person, where, PERSON)
+            assert actual == expected, f"{where!r} on {key!r}: SQL={expected} eval={actual}"
+    # Spot-check the cases above actually discriminate, not just agree.
+    assert evaluate_where(db, people["percent"], Like("surname", "paid 100\\%"), PERSON)
+    assert not evaluate_where(db, people["hundred"], Like("surname", "paid 100\\%"), PERSON)
+    assert evaluate_where(db, people["newline"], Like("surname", "multi%"), PERSON)
+    # A lone `\` before an ordinary character escapes it rather than
+    # matching a literal backslash -- a change from SQLite's old no-ESCAPE
+    # rendering, where the pattern `back\slash` matched "Back\slash" instead.
+    assert evaluate_where(db, people["no_backslash"], Like("surname", "back\\slash"), PERSON)
+    assert not evaluate_where(db, people["backslash"], Like("surname", "back\\slash"), PERSON)
+
+
 # --- CollectionCount / count(...) (Collection cardinality) --------------------
 
 

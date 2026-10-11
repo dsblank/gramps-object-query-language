@@ -162,6 +162,18 @@ substring literally -- if it happens to contain a `%` or `_`, that
 character is escaped so it's matched literally too, not reinterpreted as
 a wildcard.
 
+To match a literal `%` or `_` with `like(...)`, put a backslash in front of
+it: `like(description, '%100\\%%')` matches `"paid 100%"` but not
+`"paid 1000"` (the backslash is doubled because it's inside a Python string
+literal; `r'%100\%%'` works too). A literal backslash needs escaping the
+same way (`r'C:\\%'` matches anything starting with `C:\`), and a pattern
+can't end in a lone backslash.
+
+Both `like(...)` and the substring form of `in` ignore case on every
+backend -- `like(surname, 'smi%')` matches `"Smith"`. On SQLite, that only
+applies to the ASCII letters `A`-`Z`: `like(surname, 'é%')` matches
+`"Élise"` on PostgreSQL but not on SQLite.
+
 ## `regex(...)`
 
 ```python

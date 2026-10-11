@@ -783,6 +783,8 @@ def _translate_like_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:
     pattern = _translate_value(node.args[1])
     if not isinstance(pattern, str):
         raise QueryLangError("like(...)'s second argument must be a string literal")
+    # The pattern's escaping is validated by `query.py`'s `Like` constructor,
+    # not here -- see `_validate_like_pattern`.
     return {"column": column, "op": "like", "value": pattern}
 
 
