@@ -82,13 +82,23 @@ class ObjectTypeSpec:
     collection's own condition, or vice versa), each needing its *own*
     unnest alias.
 
+    `element_depth` is how many `any()` unnests enclose this element spec's
+    own one: 0 for `je` (or `link`, a self-linked `Collection`'s), `n` for
+    `je<n>` -- see `_next_element_depth`/`_element_alias`. Kept as an
+    integer rather than re-parsed out of `element_base_column`.
+
     `sql_alias` is `None` for every real spec too -- set only while
     compiling a `Collection`'s condition, to the alias its target row is
     joined under (`event__target`), since that row isn't in scope under
-    its bare table name. Every place that names the current row in SQL
-    (`event__target.json_data`, `event__target.place`) goes through
-    `_sql_table()`, never `table` directly -- see
-    `_collection_subquery_body`.
+    its bare table name. Every reference to the current row compiled
+    against such a spec is qualified with it: the row's own handle/
+    `json_data` (`_sql_table()`) and its plain fields too (`_render_column`
+    qualifies a `json_data`-based `JsonPath` and a flat column as
+    `event__target.json_data`/`event__target.place`) -- see
+    `_collection_subquery_body`. `collection_depth` is how many
+    `Collection` subqueries enclose that row, so a collection nested in
+    another one's condition gets its own alias (`place__target1` inside
+    `place__target`) instead of shadowing the outer row's.
     """
 
     table: str
@@ -97,7 +107,9 @@ class ObjectTypeSpec:
     bool_columns: frozenset[str]
     cls: type[TableObject]
     element_base_column: Optional[str] = None
+    element_depth: int = 0
     sql_alias: Optional[str] = None
+    collection_depth: int = 0
 
 
 def _sql_table(spec: ObjectTypeSpec) -> str:
@@ -545,8 +557,8 @@ class Collection:
     condition's own `JsonPath`s already carry `base_column="link.value"`
     (set once, at parse time -- see `query_lang.py`'s handling of
     `self_link_field`), the same trick `any()`'s `base_column="je.value"`
-    already uses, just a second alias since a self-linked collection's own
-    `list_path` unnest already claims `je`.
+    (`je1.value`, ... when nested) already uses, just a second alias since
+    a self-linked collection's own `list_path` unnest already claims `je`.
     """
 
     name: str
@@ -592,11 +604,13 @@ class JsonArrayExists:
     in one -- see `resolve_any_path`. `element_spec`: the synthetic
     `ObjectTypeSpec` (`table=""`, no flat columns) `condition`'s own fields
     resolve against, `resolve_any_path`'s own return -- every field inside
-    `condition` is a `JsonPath` with `base_column="je.value"` (see
-    `resolve_column_path`), so `condition.compile()` needs no special
+    `condition` is a `JsonPath` with `base_column` set to the element's
+    unnest alias (`je.value` at the top level, `je1.value`, `je2.value`,
+    ... for an `any()` nested in another's condition -- see
+    `_next_element_depth`), so `condition.compile()` needs no special
     handling at all, just an ordinary `Comparison`/`And`/`Or`/`Not` tree
     whose `JsonPath`s happen to render against the array-element alias
-    (`je.value`) instead of `json_data` -- see `_json_array_subquery_body`.
+    instead of `json_data` -- see `_json_array_subquery_body`.
     `condition=None` means "the array has at least one element at all" --
     not how `any(path)` (no condition) is actually compiled today (see
     `query_lang.py`'s `_translate_any_call`, which routes that case through
@@ -621,7 +635,7 @@ class JsonArrayExists:
                 "but none was given"
             )
         body, params = _json_array_subquery_body(
-            self.array, self.condition, self.element_spec, _sql_table(spec), dialect, treeid, collation
+            self.array, self.condition, self.element_spec, spec, dialect, treeid, collation
         )
         return f"EXISTS (SELECT 1 FROM {body})", params
 
@@ -764,20 +778,24 @@ def _terminal_json_path(ref: "ColumnRef", spec: ObjectTypeSpec) -> Tuple[JsonPat
     raise QueryError(f"any(...)/len(...) requires a JSON array path, got {ref!r}")
 
 
-def _next_element_column(spec: ObjectTypeSpec) -> str:
-    """The alias an `any()`/`len(..., condition)` over `spec` unnests its
-    array under: `je.value` at the top level, then `je1.value`,
-    `je2.value`, ... for each `any()` nested inside another one's
-    condition (or inside a self-linked `Collection`'s, `link.value`) --
-    each level needs its own, since the inner unnest reads the outer
-    level's element (`json_each(je.value, ...) AS je1`) and its condition
-    must still reach its own one."""
-    outer = spec.element_base_column
-    if outer is None:
-        return "je.value"
-    match = re.fullmatch(r"je(\d*)\.value", outer)
-    depth = int(match.group(1) or 0) + 1 if match else 1
-    return f"je{depth}.value"
+def _element_alias(depth: int) -> str:
+    """The unnest alias for an `any()` at nesting `depth`: `je`, then
+    `je1`, `je2`, ..."""
+    return f"je{depth}" if depth else "je"
+
+
+def _next_element_depth(spec: ObjectTypeSpec) -> int:
+    """The nesting depth an `any()`/`len(..., condition)` over `spec`
+    unnests its array at: 0 (`je`) at the top level or directly inside a
+    `Collection`'s condition (its own subquery, where no other `je` is
+    read), then one deeper than `spec`'s own for each `any()` nested inside
+    another one's condition (or inside a self-linked `Collection`'s,
+    `link`) -- each level needs its own alias, since the inner unnest reads
+    the outer level's element (`json_each(je.value, ...) AS je1`) and its
+    condition must still reach its own one."""
+    if spec.element_base_column is None:
+        return 0
+    return spec.element_depth + 1
 
 
 def resolve_any_path(
@@ -791,7 +809,7 @@ def resolve_any_path(
     alone already cover "has any at all" for them), and the synthetic
     `ObjectTypeSpec` the condition itself resolves against.
 
-    `base_column` (almost always left unset, for `_next_element_column`'s
+    `base_column` (almost always left unset, for `_next_element_depth`'s
     `je.value`/`je1.value`/... by nesting depth) is stored on the
     returned `element_spec` (see `ObjectTypeSpec.element_base_column`'s own
     docstring) -- the one exception is a *self-linked* `Collection`'s own
@@ -820,8 +838,9 @@ def resolve_any_path(
     carries for exactly this purpose (see `Backlinks`'s own `_class`
     condition field).
     """
+    element_depth = _next_element_depth(spec)
     if base_column is None:
-        base_column = _next_element_column(spec)
+        base_column = f"{_element_alias(element_depth)}.value"
     # Inside another any()'s condition, the array lives on that level's
     # element, not on the row's json_data.
     ref = resolve_column_path(spec, segments, spec.element_base_column or "json_data")
@@ -855,6 +874,7 @@ def resolve_any_path(
         bool_columns=frozenset(),
         cls=element_cls,
         element_base_column=base_column,
+        element_depth=element_depth,
     )
     return ref, element_spec
 
@@ -1545,6 +1565,16 @@ def _check_bindings(sql: str, params: Sequence[Any], what: str) -> None:
         )
 
 
+def _qualify_json_path(path: JsonPath, spec: ObjectTypeSpec) -> JsonPath:
+    """`path` rendered against `spec.sql_alias.json_data` instead of a bare
+    `json_data` when `spec` is a `Collection`'s joined target row (see
+    `ObjectTypeSpec.sql_alias`) -- left bare otherwise, including an
+    array-element path (`je.value`), already unambiguous."""
+    if spec.sql_alias and path.base_column == "json_data":
+        return replace(path, base_column=f"{spec.sql_alias}.json_data")
+    return path
+
+
 def _render_column(
     column: ColumnRef,
     spec: ObjectTypeSpec,
@@ -1565,18 +1595,23 @@ def _render_column(
     if isinstance(column, RelatedObject):
         sql, params = _render_related_object(column, _sql_table(spec), dialect, treeid, value)
     elif isinstance(column, JsonPath):
+        column = _qualify_json_path(column, spec)
         sql, params = _render_json_path(column, _require_dialect(dialect, column), value)
     elif isinstance(column, CollectionCount):
-        sql, params = _render_collection_count(column, _sql_table(spec), dialect, treeid)
+        sql, params = _render_collection_count(column, spec, dialect, treeid)
     elif isinstance(column, Length):
+        if isinstance(column.inner, JsonPath):
+            column = replace(column, inner=_qualify_json_path(column.inner, spec))
         sql, params = _render_length(column, dialect)
     elif isinstance(column, JsonArrayCount):
-        sql, params = _render_json_array_count(column, _sql_table(spec), dialect, treeid)
+        sql, params = _render_json_array_count(column, spec, dialect, treeid)
     else:
         if isinstance(column, FlatColumnRef):
             column = column.name
         _check_column(column, spec.columns)
         sql, params = _quote_column(column, dialect), []
+        if spec.sql_alias:
+            sql = f"{spec.sql_alias}.{sql}"
     # Checked per fragment, not only on the finished query: a column
     # reference is re-rendered in up to four places for a paged sort
     # (select list, both seek branches, ORDER BY), so catching drift here
@@ -2127,7 +2162,7 @@ def _self_link_source_postgresql(collection: Collection, target_alias: str) -> T
 
 def _collection_subquery_body(
     collection: Collection,
-    outer_table: str,
+    outer_spec: ObjectTypeSpec,
     condition: Optional[Any],
     dialect: Dialect,
     treeid: Optional[int],
@@ -2145,7 +2180,8 @@ def _collection_subquery_body(
     `condition`'s own `JsonPath`s already carrying `base_column=
     "link.value"` from parse time (`query_lang.py`), so `condition.compile()`
     needs no special handling here at all -- the same reason `any()`'s own
-    `base_column="je.value"` trick needed no new rendering code either.
+    `base_column="je.value"` (`je1.value`, ... when nested) trick needed no
+    new rendering code either.
 
     The target row is *always* aliased, even when `target_table !=
     outer_table` (the common case) -- a self-referencing collection (e.g.
@@ -2161,10 +2197,19 @@ def _collection_subquery_body(
     Aliasing unconditionally (not just when the names happen to collide)
     keeps this one code path correct regardless of which collection targets
     its own table, rather than needing a separate self-reference check.
+
+    For the same reason, a collection nested in another one's condition
+    gets a depth-suffixed alias (`place__target1` inside `place__target`,
+    from `outer_spec.collection_depth`): reusing the parent's alias would
+    shadow the parent's row, the very row `source` must unnest -- so
+    `any(enclosing_places, any(enclosing_places))` would ask whether a
+    place encloses itself.
     """
+    outer_table = _sql_table(outer_spec)
+    depth = outer_spec.collection_depth
     target = collection.target
     target_table = target.table
-    target_alias = f"{target_table}__target"
+    target_alias = f"{target_table}__target{depth or ''}"
 
     if dialect == Dialect.SQLITE:
         source, handle_expr, source_params = _collection_source_sqlite(collection, outer_table)
@@ -2193,7 +2238,10 @@ def _collection_subquery_body(
         # relationship hop's handle) must reach `target_alias`, the only
         # name that row has in this FROM clause.
         cond_sql, cond_params = condition.compile(
-            replace(target, sql_alias=target_alias), dialect, treeid, collation
+            replace(target, sql_alias=target_alias, collection_depth=depth + 1),
+            dialect,
+            treeid,
+            collation,
         )
         where_parts.append(f"({cond_sql})")
         params.extend(cond_params)
@@ -2247,7 +2295,7 @@ def _backlinks_subquery_body(
 
 def _render_collection_count(
     count: "CollectionCount",
-    outer_table: str,
+    outer_spec: ObjectTypeSpec,
     dialect: Optional[Dialect],
     treeid: Optional[int],
 ) -> Tuple[str, list]:
@@ -2256,7 +2304,7 @@ def _render_collection_count(
     dispatch to their own renderers.
     """
     if isinstance(count.collection, Backlinks):
-        body, params = _backlinks_subquery_body(outer_table, count.condition, treeid)
+        body, params = _backlinks_subquery_body(_sql_table(outer_spec), count.condition, treeid)
         return f"(SELECT COUNT(*) FROM {body})", params
     if dialect is None:
         raise QueryError(
@@ -2264,7 +2312,7 @@ def _render_collection_count(
             "but none was given"
         )
     body, params = _collection_subquery_body(
-        count.collection, outer_table, count.condition, dialect, treeid
+        count.collection, outer_spec, count.condition, dialect, treeid
     )
     return f"(SELECT COUNT(*) FROM {body})", params
 
@@ -2274,6 +2322,7 @@ def _resolve_array_location(
     outer_table: str,
     dialect: Dialect,
     treeid: Optional[int],
+    element_column: Optional[str] = None,
     _depth: int = 0,
 ) -> Tuple[List[str], List[str], list, str, Tuple[Union[str, int], ...]]:
     """Peel `array`'s (possibly relationship-crossing) `RelatedObject` chain
@@ -2293,11 +2342,15 @@ def _resolve_array_location(
     `_collection_subquery_body`'s own single-hop join exactly, just
     correlated to `outer_table` instead of unnesting a `Collection`'s
     `list_path`.
+
+    `element_column` is the enclosing `any()`'s own element alias
+    (`je.value`) when this `any()` sits in its condition -- an array on
+    that element is unnested from it directly, unqualified (it's already
+    unambiguous, and there's no table to qualify it with); any other base
+    column is a real column of `outer_table`'s row and is qualified.
     """
     if isinstance(array, JsonPath):
-        if array.base_column != "json_data":
-            # Another any()'s element alias (je.value), already unambiguous
-            # -- and there's no outer table to qualify it with anyway.
+        if element_column is not None and array.base_column == element_column:
             return [], [], [], array.base_column, array.segments
         return [], [], [], f"{outer_table}.{array.base_column}", array.segments
     if isinstance(array, RelatedObject):
@@ -2367,7 +2420,7 @@ def _json_array_subquery_body(
     array: "ColumnRef",
     condition: Optional[Any],
     element_spec: ObjectTypeSpec,
-    outer_table: str,
+    outer_spec: ObjectTypeSpec,
     dialect: Dialect,
     treeid: Optional[int],
     collation: Optional[str] = None,
@@ -2381,8 +2434,10 @@ def _json_array_subquery_body(
     same-row array needs no join at all (no target table to alias), only a
     relationship-crossing one does.
 
-    `condition`'s own `JsonPath`s already carry `base_column="je.value"`
-    (see `resolve_any_path`/`resolve_column_path`), so it compiles via the
+    `condition`'s own `JsonPath`s already carry `base_column` set to
+    `element_spec`'s unnest alias (`je.value`, or `je<n>.value` at nesting
+    depth `n` -- see `resolve_any_path`/`_next_element_depth`), which is
+    also the alias the unnest below is declared under, so it compiles via the
     ordinary `Comparison`/`And`/`Or`/`Not.compile()` every other condition
     uses, with no special-casing here -- `element_spec` is passed through
     only because `.compile()` requires *some* `ObjectTypeSpec`; it's
@@ -2390,11 +2445,9 @@ def _json_array_subquery_body(
     `JsonArrayExists`'s own docstring).
     """
     from_parts, where_parts, join_params, json_data_ref, segments = _resolve_array_location(
-        array, outer_table, dialect, treeid
+        array, _sql_table(outer_spec), dialect, treeid, outer_spec.element_base_column
     )
-    # The alias element_spec's own fields already render against
-    # ("je1" for "je1.value") -- see _next_element_column.
-    alias = element_spec.element_base_column.split(".")[0]
+    alias = _element_alias(element_spec.element_depth)
     if dialect == Dialect.SQLITE:
         source, source_params = _json_array_source_sqlite(json_data_ref, segments, alias)
     elif dialect == Dialect.POSTGRESQL:
@@ -2414,7 +2467,7 @@ def _json_array_subquery_body(
 
 def _render_json_array_count(
     count: "JsonArrayCount",
-    outer_table: str,
+    outer_spec: ObjectTypeSpec,
     dialect: Optional[Dialect],
     treeid: Optional[int],
 ) -> Tuple[str, list]:
@@ -2427,7 +2480,7 @@ def _render_json_array_count(
             "array, but none was given"
         )
     body, params = _json_array_subquery_body(
-        count.array, count.condition, count.element_spec, outer_table, dialect, treeid
+        count.array, count.condition, count.element_spec, outer_spec, dialect, treeid
     )
     return f"(SELECT COUNT(*) FROM {body})", params
 
@@ -2480,7 +2533,7 @@ class Exists:
                 "but none was given"
             )
         body, params = _collection_subquery_body(
-            self.collection, _sql_table(spec), self.condition, dialect, treeid, collation
+            self.collection, spec, self.condition, dialect, treeid, collation
         )
         return f"EXISTS (SELECT 1 FROM {body})", params
 

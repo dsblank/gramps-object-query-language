@@ -27,6 +27,8 @@ is the point: the evaluator's correctness under a proxy comes from actually
 going through one, not from reimplementing what it does.
 """
 
+import os
+
 import pytest
 from gramps.cli.clidbman import CLIDbManager
 from gramps.gen.db import DbTxn
@@ -1408,24 +1410,188 @@ def nested_any_db():
         ("any(event_ref_list, any(attribute_list, value == 'x' or any(citation_list)))", {"ref_cited"}),
     ],
 )
-def test_sql_and_evaluator_agree_on_nested_any(nested_any_db, where_expr, expected):
+def test_sql_and_evaluator_agree_on_nested_any(nested_any_db, pg_conn, where_expr, expected):
     """Compiles each where_expr to SQL and runs it on the fixture's real
-    SQLite backend, checks the result against what's expected, and checks
-    evaluate_where agrees person by person -- test_query_lang.py only
-    checks how a nested any() *parses*, which is how both bugs above got
-    past it."""
+    SQLite backend (and on PostgreSQL, if configured -- see `pg_conn`),
+    checks the result against what's expected, and checks evaluate_where
+    agrees person by person -- test_query_lang.py only checks how a nested
+    any() *parses*, which is how both bugs above got past it."""
+    db, handles = nested_any_db
+    _assert_sql_and_evaluator_agree(
+        db, handles, PERSON, ("event_cited", "ref_cited", "uncited"), where_expr, expected, pg_conn
+    )
+
+
+# --- a collection nested in a collection over the same table ----------------
+
+
+@pytest.fixture(scope="module")
+def self_nested_db():
+    """Two same-table chains, each one link longer than any query below
+    needs to see through: places B -> C -> D -> E (each enclosed by the
+    next) plus an unenclosed F, and people A -> B -> {C, D} by association.
+    A nested collection whose alias shadows its parent's row asks about the
+    wrong row (a place enclosing itself, a person associated with
+    themselves) and matches nobody."""
+    from gramps.gen.lib import PlaceRef
+
+    dbman = CLIDbManager(DbState())
+    dirpath, db_name = dbman.create_new_db_cli("_test_evaluator_self_nested", dbid="sqlite")
+    db = make_database("sqlite")
+    db.load(dirpath)
+    handles = {}
+    with DbTxn("setup", db) as trans:
+        enclosing = None
+        for key in ("E", "D", "C", "B", "F"):
+            place = Place()
+            place.set_gramps_id(key)
+            place.set_name(PlaceName(value=f"Place {key}"))
+            if enclosing is not None and key != "F":
+                ref = PlaceRef()
+                ref.set_reference_handle(enclosing)
+                place.add_placeref(ref)
+            handles[f"place_{key}"] = enclosing = db.add_place(place, trans)
+
+        for key, associates in (("D", ()), ("C", ()), ("B", ("C", "D")), ("A", ("B",))):
+            person = Person()
+            person.set_gramps_id(key)
+            person.set_primary_name(_name(key, "Self"))
+            for associate in associates:
+                ref = PersonRef()
+                ref.set_reference_handle(handles[f"person_{associate}"])
+                person.add_person_ref(ref)
+            handles[f"person_{key}"] = db.add_person(person, trans)
+    yield db, handles
+    db.close()
+    dbman.remove_database(db_name)
+
+
+@pytest.mark.parametrize(
+    "where_expr, expected",
+    [
+        ("any(enclosing_places)", {"B", "C", "D"}),
+        ("any(enclosing_places, any(enclosing_places))", {"B", "C"}),
+        ("any(enclosing_places, not any(enclosing_places))", {"D"}),
+        ("any(enclosing_places, any(enclosing_places, any(enclosing_places)))", {"B"}),
+        # CollectionCount (len() of a collection) inside the same-table
+        # collection's condition, same cause.
+        ("any(enclosing_places, len(enclosing_places) > 0)", {"B", "C"}),
+        # Flat and JSON fields of the inner row, qualified by its own alias.
+        ("any(enclosing_places, any(enclosing_places, gramps_id == 'E'))", {"C"}),
+        ("any(enclosing_places, any(enclosing_places, name.value == 'Place D'))", {"B"}),
+        ("any(enclosing_places, gramps_id == 'C' and any(enclosing_places))", {"B"}),
+    ],
+)
+def test_sql_and_evaluator_agree_on_nested_same_table_places(
+    self_nested_db, pg_conn, where_expr, expected
+):
+    db, handles = self_nested_db
+    _assert_sql_and_evaluator_agree(
+        db,
+        handles,
+        PLACE,
+        tuple(f"place_{key}" for key in "BCDEF"),
+        where_expr,
+        {f"place_{key}" for key in expected},
+        pg_conn,
+    )
+
+
+@pytest.mark.parametrize(
+    "where_expr, expected",
+    [
+        ("any(associations, any(associations))", {"A"}),
+        ("any(associations, len(associations) > 1)", {"A"}),
+        ("any(associations, len(associations) == 0)", {"B"}),
+        ("any(associations, any(associations, gramps_id == 'D'))", {"A"}),
+    ],
+)
+def test_sql_and_evaluator_agree_on_nested_same_table_people(
+    self_nested_db, pg_conn, where_expr, expected
+):
+    db, handles = self_nested_db
+    _assert_sql_and_evaluator_agree(
+        db,
+        handles,
+        PERSON,
+        tuple(f"person_{key}" for key in "ABCD"),
+        where_expr,
+        {f"person_{key}" for key in expected},
+        pg_conn,
+    )
+
+
+# --- SQL/evaluator parity helpers --------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def pg_conn():
+    """A psycopg2 connection for also running the parity tests above on
+    PostgreSQL, or `None` (PostgreSQL skipped, SQLite still runs) unless
+    `GOQL_TEST_POSTGRES_DSN` is set (e.g. `host=localhost user=gramps
+    password=gramps dbname=gramps`). Read-only against that database: each
+    query runs against TEMP copies of the fixture's tables, which shadow
+    the real ones, inside a transaction that is rolled back."""
+    dsn = os.environ.get("GOQL_TEST_POSTGRES_DSN")
+    if not dsn:
+        yield None
+        return
+    psycopg2 = pytest.importorskip("psycopg2")
+    conn = psycopg2.connect(dsn)
+    yield conn
+    conn.close()
+
+
+_PRIMARY_TABLES = (
+    "person", "family", "event", "place", "citation",
+    "source", "repository", "media", "note", "tag",
+)
+
+
+def _run_on_postgresql(conn, db, sql: str, params: list) -> set:
+    """Runs PostgreSQL-dialect `sql` against TEMP copies of `db`'s tables,
+    then rolls back. Every column is copied as TEXT -- enough for the
+    handle/json_data/text-column comparisons these fixtures' queries make,
+    not for an integer or boolean flat column."""
+    try:
+        with conn.cursor() as cur:
+            for table in _PRIMARY_TABLES:
+                db.dbapi.execute(f"PRAGMA table_info({table})")
+                columns = [row[1] for row in db.dbapi.fetchall()]
+                quoted = [f'"{column}"' for column in columns]  # e.g. media's "desc"
+                cur.execute(
+                    f"CREATE TEMP TABLE {table} ({', '.join(f'{c} TEXT' for c in quoted)})"
+                )
+                db.dbapi.execute(f"SELECT {', '.join(quoted)} FROM {table}")
+                rows = db.dbapi.fetchall()
+                if rows:
+                    placeholders = ", ".join(["%s"] * len(columns))
+                    cur.executemany(f"INSERT INTO {table} VALUES ({placeholders})", rows)
+            cur.execute(sql.replace("?", "%s"), params)
+            return {row[0] for row in cur.fetchall()}
+    finally:
+        conn.rollback()
+
+
+def _assert_sql_and_evaluator_agree(db, handles, spec, keys, where_expr, expected, pg_conn):
+    """Compiles `where_expr` against `spec`, runs it on `db`'s SQLite backend
+    (and, given `pg_conn`, on PostgreSQL too), and checks that the matching
+    `keys` (into `handles`) are exactly `expected` on each, and that
+    `evaluate_where` agrees object by object."""
     from gramps_object_query_language.query import Dialect, Query, compile_query
     from gramps_object_query_language.query_lang import parse_expr_for_spec, where_list_to_ast
 
-    db, handles = nested_any_db
-    where = where_list_to_ast(parse_expr_for_spec(PERSON, where_expr), PERSON)
-    sql, params = compile_query(
-        PERSON, Query(select=["handle"], where=where), dialect=Dialect.SQLITE
-    )
+    where = where_list_to_ast(parse_expr_for_spec(spec, where_expr), spec)
+    query = Query(select=["handle"], where=where)
+    sql, params = compile_query(spec, query, dialect=Dialect.SQLITE)
     db.dbapi.execute(sql, params)
     sql_matches = {row[0] for row in db.dbapi.fetchall()}
-    people = ("event_cited", "ref_cited", "uncited")
-    assert {key for key in people if handles[key] in sql_matches} == expected
-    for key in people:
-        actual = evaluate_where(db, db.get_person_from_handle(handles[key]), where, PERSON)
+    assert {key for key in keys if handles[key] in sql_matches} == set(expected), "SQLite"
+    if pg_conn is not None:
+        sql, params = compile_query(spec, query, dialect=Dialect.POSTGRESQL)
+        pg_matches = _run_on_postgresql(pg_conn, db, sql, params)
+        assert {key for key in keys if handles[key] in pg_matches} == set(expected), "PostgreSQL"
+    get_object = getattr(db, f"get_{spec.table}_from_handle")
+    for key in keys:
+        actual = evaluate_where(db, get_object(handles[key]), where, spec)
         assert actual == (key in expected), f"{where_expr!r} on {key!r}: eval={actual}"
