@@ -81,6 +81,14 @@ class ObjectTypeSpec:
     active in the same query (`any(...)` nested inside a self-linked
     collection's own condition, or vice versa), each needing its *own*
     unnest alias.
+
+    `sql_alias` is `None` for every real spec too -- set only while
+    compiling a `Collection`'s condition, to the alias its target row is
+    joined under (`event__target`), since that row isn't in scope under
+    its bare table name. Every place that names the current row in SQL
+    (`event__target.json_data`, `event__target.place`) goes through
+    `_sql_table()`, never `table` directly -- see
+    `_collection_subquery_body`.
     """
 
     table: str
@@ -89,6 +97,13 @@ class ObjectTypeSpec:
     bool_columns: frozenset[str]
     cls: type[TableObject]
     element_base_column: Optional[str] = None
+    sql_alias: Optional[str] = None
+
+
+def _sql_table(spec: ObjectTypeSpec) -> str:
+    """The name `spec`'s current row is in scope under in SQL: its join
+    alias inside a `Collection`'s condition, its table name otherwise."""
+    return spec.sql_alias or spec.table
 
 
 def _spec_for(
@@ -606,7 +621,7 @@ class JsonArrayExists:
                 "but none was given"
             )
         body, params = _json_array_subquery_body(
-            self.array, self.condition, self.element_spec, spec.table, dialect, treeid, collation
+            self.array, self.condition, self.element_spec, _sql_table(spec), dialect, treeid, collation
         )
         return f"EXISTS (SELECT 1 FROM {body})", params
 
@@ -699,7 +714,9 @@ class Length:
     inner: "ColumnRef"
 
 
-def resolve_length_path(spec: ObjectTypeSpec, segments: Sequence[Union[str, int]]) -> "ColumnRef":
+def resolve_length_path(
+    spec: ObjectTypeSpec, segments: Sequence[Union[str, int]], base_column: str = "json_data"
+) -> "ColumnRef":
     """Resolve `len(path)`'s argument -- the same `resolve_column_path` used
     for any other path, with the result wrapped in `Length`.
 
@@ -710,8 +727,13 @@ def resolve_length_path(spec: ObjectTypeSpec, segments: Sequence[Union[str, int]
     of that chain, so it's pushed down onto the chain's innermost `field`
     rather than wrapping the whole `RelatedObject` (which would ask "the
     length of a related *object*", not of one of its fields).
+
+    `base_column` is `resolve_column_path`'s own: inside an `any()`
+    condition it's the array element (`je.value`), not the row's
+    `json_data` -- `any(event_ref_list, any(citation_list))` measures each
+    event reference's `citation_list`, not the person's.
     """
-    ref = resolve_column_path(spec, segments)
+    ref = resolve_column_path(spec, segments, base_column)
     if isinstance(ref, RelatedObject):
         return replace(ref, field=_wrap_length(ref.field))
     return _wrap_length(ref)
@@ -742,8 +764,24 @@ def _terminal_json_path(ref: "ColumnRef", spec: ObjectTypeSpec) -> Tuple[JsonPat
     raise QueryError(f"any(...)/len(...) requires a JSON array path, got {ref!r}")
 
 
+def _next_element_column(spec: ObjectTypeSpec) -> str:
+    """The alias an `any()`/`len(..., condition)` over `spec` unnests its
+    array under: `je.value` at the top level, then `je1.value`,
+    `je2.value`, ... for each `any()` nested inside another one's
+    condition (or inside a self-linked `Collection`'s, `link.value`) --
+    each level needs its own, since the inner unnest reads the outer
+    level's element (`json_each(je.value, ...) AS je1`) and its condition
+    must still reach its own one."""
+    outer = spec.element_base_column
+    if outer is None:
+        return "je.value"
+    match = re.fullmatch(r"je(\d*)\.value", outer)
+    depth = int(match.group(1) or 0) + 1 if match else 1
+    return f"je{depth}.value"
+
+
 def resolve_any_path(
-    spec: ObjectTypeSpec, segments: Sequence[Union[str, int]], base_column: str = "je.value"
+    spec: ObjectTypeSpec, segments: Sequence[Union[str, int]], base_column: Optional[str] = None
 ) -> Tuple["ColumnRef", ObjectTypeSpec]:
     """Resolve `any(path, condition)`'s/`len(path, condition)`'s array-path
     argument -- the same `resolve_column_path` used for any other path,
@@ -753,7 +791,8 @@ def resolve_any_path(
     alone already cover "has any at all" for them), and the synthetic
     `ObjectTypeSpec` the condition itself resolves against.
 
-    `base_column` (almost always left at its default) is stored on the
+    `base_column` (almost always left unset, for `_next_element_column`'s
+    `je.value`/`je1.value`/... by nesting depth) is stored on the
     returned `element_spec` (see `ObjectTypeSpec.element_base_column`'s own
     docstring) -- the one exception is a *self-linked* `Collection`'s own
     condition (`Person.child_refs`, see `Collection`'s docstring), which
@@ -781,7 +820,11 @@ def resolve_any_path(
     carries for exactly this purpose (see `Backlinks`'s own `_class`
     condition field).
     """
-    ref = resolve_column_path(spec, segments)
+    if base_column is None:
+        base_column = _next_element_column(spec)
+    # Inside another any()'s condition, the array lives on that level's
+    # element, not on the row's json_data.
+    ref = resolve_column_path(spec, segments, spec.element_base_column or "json_data")
     array_path, owning_spec = _terminal_json_path(ref, spec)
     schema = walk_schema(owning_spec, array_path.segments)
     path_text = ".".join(str(s) for s in segments)
@@ -1520,15 +1563,15 @@ def _render_column(
     tree-scoping independent of the outer query's.
     """
     if isinstance(column, RelatedObject):
-        sql, params = _render_related_object(column, spec.table, dialect, treeid, value)
+        sql, params = _render_related_object(column, _sql_table(spec), dialect, treeid, value)
     elif isinstance(column, JsonPath):
         sql, params = _render_json_path(column, _require_dialect(dialect, column), value)
     elif isinstance(column, CollectionCount):
-        sql, params = _render_collection_count(column, spec.table, dialect, treeid)
+        sql, params = _render_collection_count(column, _sql_table(spec), dialect, treeid)
     elif isinstance(column, Length):
         sql, params = _render_length(column, dialect)
     elif isinstance(column, JsonArrayCount):
-        sql, params = _render_json_array_count(column, spec.table, dialect, treeid)
+        sql, params = _render_json_array_count(column, _sql_table(spec), dialect, treeid)
     else:
         if isinstance(column, FlatColumnRef):
             column = column.name
@@ -2145,7 +2188,13 @@ def _collection_subquery_body(
         from_parts.append(link_source)
         where_parts.append(f"{link_correlation} = {outer_table}.handle")
     if condition is not None:
-        cond_sql, cond_params = condition.compile(target, dialect, treeid, collation)
+        # Compiled against the alias, not `target.table`: anything in the
+        # condition that names its row (a nested collection's unnest, a
+        # relationship hop's handle) must reach `target_alias`, the only
+        # name that row has in this FROM clause.
+        cond_sql, cond_params = condition.compile(
+            replace(target, sql_alias=target_alias), dialect, treeid, collation
+        )
         where_parts.append(f"({cond_sql})")
         params.extend(cond_params)
     if treeid is not None:
@@ -2246,6 +2295,10 @@ def _resolve_array_location(
     `list_path`.
     """
     if isinstance(array, JsonPath):
+        if array.base_column != "json_data":
+            # Another any()'s element alias (je.value), already unambiguous
+            # -- and there's no outer table to qualify it with anyway.
+            return [], [], [], array.base_column, array.segments
         return [], [], [], f"{outer_table}.{array.base_column}", array.segments
     if isinstance(array, RelatedObject):
         target_table = array.target.table
@@ -2270,7 +2323,9 @@ def _resolve_array_location(
     raise QueryError(f"any(...)/len(...) requires a JSON array path, got {array!r}")
 
 
-def _json_array_source_sqlite(json_data_ref: str, segments: Tuple[Union[str, int], ...]) -> Tuple[str, list]:
+def _json_array_source_sqlite(
+    json_data_ref: str, segments: Tuple[Union[str, int], ...], alias: str
+) -> Tuple[str, list]:
     """`(source, params)` for unnesting a JSON array on SQLite -- reuses
     `_render_json_path`'s own JSONPath-string construction verbatim
     (`json_each` takes the identical path syntax `json_extract` does), just
@@ -2279,10 +2334,12 @@ def _json_array_source_sqlite(json_data_ref: str, segments: Tuple[Union[str, int
     jsonpath = "$" + "".join(
         f"[{segment}]" if isinstance(segment, int) else f".{segment}" for segment in segments
     )
-    return f"json_each({json_data_ref}, ?) AS je", [jsonpath]
+    return f"json_each({json_data_ref}, ?) AS {alias}", [jsonpath]
 
 
-def _json_array_source_postgresql(json_data_ref: str, segments: Tuple[Union[str, int], ...]) -> str:
+def _json_array_source_postgresql(
+    json_data_ref: str, segments: Tuple[Union[str, int], ...], alias: str
+) -> str:
     """The `->` chain for unnesting a JSON array on PostgreSQL --
     `jsonb_array_elements` needs the full chain built out (reusing
     `_postgresql_handle_ref_path_sql`'s inlining pattern, not
@@ -2303,7 +2360,7 @@ def _json_array_source_postgresql(json_data_ref: str, segments: Tuple[Union[str,
             expr += f" -> {segment}"
         else:
             expr += f" -> '{segment}'"
-    return f"jsonb_array_elements({expr}) AS je(value)"
+    return f"jsonb_array_elements({expr}) AS {alias}(value)"
 
 
 def _json_array_subquery_body(
@@ -2335,10 +2392,13 @@ def _json_array_subquery_body(
     from_parts, where_parts, join_params, json_data_ref, segments = _resolve_array_location(
         array, outer_table, dialect, treeid
     )
+    # The alias element_spec's own fields already render against
+    # ("je1" for "je1.value") -- see _next_element_column.
+    alias = element_spec.element_base_column.split(".")[0]
     if dialect == Dialect.SQLITE:
-        source, source_params = _json_array_source_sqlite(json_data_ref, segments)
+        source, source_params = _json_array_source_sqlite(json_data_ref, segments, alias)
     elif dialect == Dialect.POSTGRESQL:
-        source, source_params = _json_array_source_postgresql(json_data_ref, segments), []
+        source, source_params = _json_array_source_postgresql(json_data_ref, segments, alias), []
     else:
         raise QueryError(f"unsupported dialect: {dialect!r}")
     params = list(join_params) + list(source_params)
@@ -2412,7 +2472,7 @@ class Exists:
         if isinstance(self.collection, Backlinks):
             # `self.condition` here is a `BacklinkClassFilter`, not a WHERE
             # AST node -- no `.compile()` call, so no collation to forward.
-            body, params = _backlinks_subquery_body(spec.table, self.condition, treeid)
+            body, params = _backlinks_subquery_body(_sql_table(spec), self.condition, treeid)
             return f"EXISTS (SELECT 1 FROM {body})", params
         if dialect is None:
             raise QueryError(
@@ -2420,7 +2480,7 @@ class Exists:
                 "but none was given"
             )
         body, params = _collection_subquery_body(
-            self.collection, spec.table, self.condition, dialect, treeid, collation
+            self.collection, _sql_table(spec), self.condition, dialect, treeid, collation
         )
         return f"EXISTS (SELECT 1 FROM {body})", params
 

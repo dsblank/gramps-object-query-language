@@ -1317,3 +1317,115 @@ def test_sql_and_evaluator_agree_on_child_refs(child_refs_db_handles):
             expected = handles[key] in sql_matches
             actual = evaluate_where(db, person, where, PERSON)
             assert actual == expected, f"{where!r} on {key!r}: SQL={expected} eval={actual}"
+
+
+# --- any() nested inside any() ---------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def nested_any_db():
+    """A person per way of being sourced -- through an event's own
+    citation, through the event reference's citation, or not at all --
+    each with exactly one event, so a nested any() that looks at the wrong
+    row (the person's instead of the event's or the reference's) gives a
+    different answer from one that looks at the right one. Two of the event
+    references also carry an attribute -- a cited "witness" one and an
+    uncited "other" one -- for any() over a list inside a list."""
+    from gramps.gen.lib import EventRef
+
+    dbman = CLIDbManager(DbState())
+    dirpath, db_name = dbman.create_new_db_cli("_test_evaluator_nested_any", dbid="sqlite")
+    db = make_database("sqlite")
+    db.load(dirpath)
+    handles = {}
+    with DbTxn("setup", db) as trans:
+        handles["source"] = db.add_source(Source(), trans)
+        citation = Citation()
+        citation.set_reference_handle(handles["source"])
+        handles["citation"] = db.add_citation(citation, trans)
+        place = Place()
+        place.set_title("Chicago")
+        handles["place"] = db.add_place(place, trans)
+
+        for key, event_cited, ref_cited in (
+            ("event_cited", True, False),
+            ("ref_cited", False, True),
+            ("uncited", False, False),
+        ):
+            event = Event()
+            event.set_type(EventType.BIRTH)
+            if event_cited:
+                event.add_citation(handles["citation"])
+                event.set_place_handle(handles["place"])
+            event_handle = db.add_event(event, trans)
+            ref = EventRef()
+            ref.set_reference_handle(event_handle)
+            if ref_cited:
+                ref.add_citation(handles["citation"])
+            if key != "event_cited":
+                attribute = Attribute()
+                attribute.set_value("witness" if ref_cited else "other")
+                if ref_cited:
+                    attribute.add_citation(handles["citation"])
+                ref.add_attribute(attribute)
+            person = Person()
+            person.set_primary_name(_name(key, "Nested"))
+            person.add_event_ref(ref)
+            handles[key] = db.add_person(person, trans)
+    yield db, handles
+    db.close()
+    dbman.remove_database(db_name)
+
+
+@pytest.mark.parametrize(
+    "where_expr, expected",
+    [
+        # Collection inside a Collection: the inner unnest must read the
+        # joined event (event__target), not a bare "event" that isn't in
+        # scope -- used to fail with "no such column: event.json_data".
+        ("any(events, any(citations))", {"event_cited"}),
+        ("not any(events, any(citations))", {"ref_cited", "uncited"}),
+        ("any(events, len(citations) > 0)", {"event_cited"}),
+        # A relationship hop inside a Collection's condition, same cause.
+        ("any(events, place.title == 'Chicago')", {"event_cited"}),
+        # any(path) with no condition inside an any() over a JSON array:
+        # must measure each event reference's citation_list, not the
+        # person's own -- used to run, but silently match nobody.
+        ("any(event_ref_list, any(citation_list))", {"ref_cited"}),
+        ("any(event_ref_list, len(citation_list) > 0)", {"ref_cited"}),
+        (
+            "not any(citations) and not any(events, any(citations))"
+            " and not any(event_ref_list, any(citation_list))",
+            {"uncited"},
+        ),
+        # A list inside a list: each level unnests under its own alias
+        # (je, je1, ...) and reads the level above's element -- used to
+        # render json_each(.json_data, ...), a syntax error.
+        ("any(event_ref_list, any(attribute_list, value == 'witness'))", {"ref_cited"}),
+        ("any(event_ref_list, len(attribute_list, value == 'witness') > 0)", {"ref_cited"}),
+        ("any(event_ref_list, any(attribute_list))", {"ref_cited", "uncited"}),
+        ("any(event_ref_list, any(attribute_list, any(citation_list)))", {"ref_cited"}),
+        ("any(event_ref_list, any(attribute_list, value == 'x' or any(citation_list)))", {"ref_cited"}),
+    ],
+)
+def test_sql_and_evaluator_agree_on_nested_any(nested_any_db, where_expr, expected):
+    """Compiles each where_expr to SQL and runs it on the fixture's real
+    SQLite backend, checks the result against what's expected, and checks
+    evaluate_where agrees person by person -- test_query_lang.py only
+    checks how a nested any() *parses*, which is how both bugs above got
+    past it."""
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+    from gramps_object_query_language.query_lang import parse_expr_for_spec, where_list_to_ast
+
+    db, handles = nested_any_db
+    where = where_list_to_ast(parse_expr_for_spec(PERSON, where_expr), PERSON)
+    sql, params = compile_query(
+        PERSON, Query(select=["handle"], where=where), dialect=Dialect.SQLITE
+    )
+    db.dbapi.execute(sql, params)
+    sql_matches = {row[0] for row in db.dbapi.fetchall()}
+    people = ("event_cited", "ref_cited", "uncited")
+    assert {key for key in people if handles[key] in sql_matches} == expected
+    for key in people:
+        actual = evaluate_where(db, db.get_person_from_handle(handles[key]), where, PERSON)
+        assert actual == (key in expected), f"{where_expr!r} on {key!r}: eval={actual}"

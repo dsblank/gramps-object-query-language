@@ -1358,7 +1358,7 @@ def json_column_to_ref(column: Union[str, dict], spec: ObjectTypeSpec) -> Column
     if "length_of" in column:
         inner = column["length_of"]
         segments = (inner,) if isinstance(inner, str) else tuple(inner["json_path"])
-        return resolve_length_path(spec, segments)
+        return resolve_length_path(spec, segments, base_column)
     if "length_of_matching" in column:
         payload = column["length_of_matching"]
         array_ref, element_spec = resolve_any_path(spec, payload["path"])
