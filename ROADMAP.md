@@ -725,7 +725,7 @@ the query is even run.
 
 Implemented -- `run_query` (proxied_query.py) accepts `order_by`, `limit`,
 `after`, and `select` directly now, applied entirely in Python over the
-match list `Filter.apply()`/the direct-loop path already collects, so a
+match list `run_query` already collects, so a
 `Query` means the same thing on this path as it does through `query.py`'s
 compiled SQL, matching this section's own motivation exactly.
 
