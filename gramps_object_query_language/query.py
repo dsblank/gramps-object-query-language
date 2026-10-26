@@ -37,9 +37,10 @@ the caller's job; see `after_columns()`.
 from __future__ import annotations
 
 import enum
+import json
 import re
 from dataclasses import dataclass, replace
-from typing import Any, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple, Union
 
 import gramps.gen.lib as gramps_lib
 from gramps.gen.lib import (
@@ -1686,13 +1687,17 @@ def _coerce_bool_literal(column: ColumnRef, value: Any, spec: ObjectTypeSpec) ->
     native boolean type), never a real SQL `BOOLEAN`. SQLite tolerates a
     Python `bool` param against an `INTEGER` column (it coerces `True`/
     `False` to `1`/`0` itself), but PostgreSQL is strictly typed and raises
-    `operator does not exist: integer = boolean`. `JsonPath`/`RelatedObject`
-    reach into `json_data` instead, where a JSON boolean round-trips
-    correctly (see `_render_json_path`'s own bool handling) and needs no
-    coercion here.
+    `operator does not exist: integer = boolean`. A `JsonPath` reaches into
+    `json_data` instead, where a JSON boolean round-trips correctly (see
+    `_render_json_path`'s own bool handling) and needs no coercion here. A
+    `RelatedObject` is followed to whatever it ends in: `birth.private` is
+    the target table's own flat `private` column, so it is coerced against
+    that table's spec, at any depth (`birth.place.private`).
     """
     if not isinstance(value, bool):
         return value
+    while isinstance(column, RelatedObject):
+        column, spec = column.field, column.target
     name = column.name if isinstance(column, FlatColumnRef) else column
     if isinstance(name, str) and name in spec.bool_columns:
         return int(value)
@@ -2915,6 +2920,9 @@ def _compile_keyset(
             f"{len(effective_order_by)} "
             f"({', '.join(order_by_key(ob.column) for ob in effective_order_by)})"
         )
+    # A cursor taken on the evaluator path holds `True`/`False` for a flat
+    # bool column, which PostgreSQL won't compare to its INTEGER column.
+    after = [_coerce_bool_literal(ob.column, v, spec) for ob, v in zip(effective_order_by, after)]
     or_terms = []
     params: list = []
     for i, ob in enumerate(effective_order_by):
@@ -3138,3 +3146,82 @@ def compile_count_query(
         sql += " WHERE " + " AND ".join(where_clauses)
     _check_bindings(sql, params, "compiled count query")
     return sql, params
+
+
+def _non_null_type(value_type: Any) -> Any:
+    """`value_type` without `"null"`: a nullable field's type is a list
+    (`["integer", "null"]`), which converts the same way as its one other
+    member. A list naming more than one other type is left as a list."""
+    if isinstance(value_type, list):
+        types = [t for t in value_type if t != "null"]
+        return types[0] if len(types) == 1 else types
+    return value_type
+
+
+def _to_bool(value: Any) -> Any:
+    if isinstance(value, str):
+        value = _parse_json_text(value)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return bool(value)
+    return value
+
+
+def _parse_json_text(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except ValueError:
+        return value
+
+
+def _select_converter(column: "ColumnRef", spec: ObjectTypeSpec) -> Optional[Any]:
+    """How to turn one `select` column's database value into its schema
+    type, or `None` when it already arrives as one."""
+    while isinstance(column, RelatedObject):
+        column, spec = column.field, column.target
+    name = column.name if isinstance(column, FlatColumnRef) else column
+    if isinstance(name, str):
+        return _to_bool if name in spec.bool_columns else None
+    value_type = _non_null_type(ref_value_type(spec, column))
+    if value_type == "boolean":
+        return _to_bool
+    if value_type in ("integer", "number") or is_composite_type(value_type):
+        return _parse_json_text
+    return None
+
+
+def select_normalizer(
+    spec: ObjectTypeSpec, select: Optional[Sequence["SelectRef"]]
+) -> Callable[[Sequence[Any]], tuple]:
+    """A function turning one row of `compile_query`'s result for `select`
+    into the same values the evaluator path (`proxied_query.run_query`)
+    returns: each value as the type Gramps' schema gives it, whatever the
+    database handed back.
+
+    The database alone gets this wrong in three ways: a boolean is `0`/`1`
+    on SQLite (it has no boolean type, and Gramps stores flat `private` as
+    INTEGER everywhere); PostgreSQL's `jsonb_extract_path_text` returns
+    every JSON scalar as text (`'2389036'`, `'true'`); and SQLite's
+    `json_extract` returns an object or array as JSON text. So a boolean
+    comes back as `True`/`False`, a number as a number, and an object or
+    array parsed. `None` stays `None`, and a string column is never
+    touched -- a person named "123" stays the string "123".
+
+    `select` is what was passed as `Query.select` (`None` meaning every flat
+    column, as there), so path strings resolve exactly as `compile_query`
+    resolved them. Resolved once, here, not per row.
+    """
+    columns = [
+        resolve_ref_string(spec, entry) if isinstance(entry, str) else entry
+        for entry in (select if select else sorted(spec.columns))
+    ]
+    converters = [_select_converter(column, spec) for column in columns]
+
+    def normalize(row: Sequence[Any]) -> tuple:
+        return tuple(
+            value if convert is None or value is None else convert(value)
+            for convert, value in zip(converters, row)
+        )
+
+    return normalize

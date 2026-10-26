@@ -1064,6 +1064,23 @@ intermediate JSON shape (e.g. to send over an HTTP API as a `where_expr`
 request field), use `parse_expr`/`parse_expr_for_spec` from the same module
 instead.
 
+Selecting more than `handle`? The database returns some values in its own
+form, not their Gramps type: a boolean is `0`/`1` on SQLite, every JSON
+number or boolean is text on PostgreSQL (`'2389036'`, `'true'`), and an
+object or list from SQLite is JSON text. `select_normalizer` turns each row
+into the values the evaluator path gives -- `True`/`False`, numbers, parsed
+objects -- on any backend:
+
+```python
+from gramps_object_query_language.query import select_normalizer
+
+select = ["handle", "private", "birth.date.sortval", "birth.date"]
+sql, params = compile_query(spec, Query(select=select, where=where), dialect=Dialect.POSTGRESQL)
+normalize = select_normalizer(spec, select)
+rows = [normalize(row) for row in connection.execute(sql, params).fetchall()]
+# e.g. ("a1b2...", False, 2433283, {"dateval": [1, 1, 1950, False], ...})
+```
+
 For a database you can't run raw SQL against (a proxied/privacy-filtered
 database), `gramps_object_query_language.evaluator.evaluate_where` evaluates
 the same AST directly against real Gramps objects instead of compiling to

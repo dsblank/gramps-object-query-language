@@ -39,6 +39,7 @@ from gramps.gen.lib import (
     ChildRef,
     ChildRefType,
     Citation,
+    Date,
     Event,
     EventType,
     Family,
@@ -1521,6 +1522,150 @@ def test_sql_and_evaluator_agree_on_nested_same_table_people(
     )
 
 
+# --- a bool flat column reached across a relationship -------------------------
+
+
+@pytest.fixture(scope="module")
+def related_private_db():
+    """People whose birth event, or its place, is private or not. A
+    related row's `private` is that table's own INTEGER column, so a bool
+    literal compared to it must be coerced -- PostgreSQL rejected
+    `birth.private == False` with `integer = boolean`."""
+    dbman = CLIDbManager(DbState())
+    dirpath, db_name = dbman.create_new_db_cli("_test_evaluator_related_private", dbid="sqlite")
+    db = make_database("sqlite")
+    db.load(dirpath)
+    handles = {}
+    with DbTxn("setup", db) as trans:
+        for key, private in (("public", False), ("private", True)):
+            place = Place()
+            place.set_name(PlaceName(value=f"{key} place"))
+            place.set_privacy(private)
+            handles[f"place_{key}"] = db.add_place(place, trans)
+        for key, event_private, place_key in (
+            ("public_birth", False, "public"),
+            ("private_birth", True, "public"),
+            ("private_place", False, "private"),
+        ):
+            event = Event()
+            event.set_type(EventType.BIRTH)
+            event.set_privacy(event_private)
+            event.set_place_handle(handles[f"place_{place_key}"])
+            event.set_date_object(Date(1950, 1, 1))
+            event_handle = db.add_event(event, trans)
+            person = Person()
+            person.set_primary_name(_name(key, "Related"))
+            person.set_birth_ref(_event_ref(event_handle))
+            handles[key] = db.add_person(person, trans)
+        person = Person()
+        person.set_primary_name(_name("No", "Birth"))
+        handles["no_birth"] = db.add_person(person, trans)
+        person = Person()
+        person.set_primary_name(_name("123", "Numeric"))
+        person.set_privacy(True)
+        handles["numeric_name"] = db.add_person(person, trans)
+    yield db, handles
+    db.close()
+    dbman.remove_database(db_name)
+
+
+@pytest.mark.parametrize(
+    "where_expr, expected",
+    [
+        ("birth.private == False", {"public_birth", "private_place"}),
+        ("birth.private == True", {"private_birth"}),
+        ("birth.private != True", {"public_birth", "private_place", "no_birth"}),
+        ("birth.private in [True]", {"private_birth"}),
+        ("birth.place.private == False", {"public_birth", "private_birth"}),
+        ("birth.place.private == True", {"private_place"}),
+    ],
+)
+def test_sql_and_evaluator_agree_on_related_bool_column(
+    related_private_db, pg_conn, where_expr, expected
+):
+    db, handles = related_private_db
+    _assert_sql_and_evaluator_agree(
+        db,
+        handles,
+        PERSON,
+        ("public_birth", "private_birth", "private_place", "no_birth"),
+        where_expr,
+        expected,
+        pg_conn,
+    )
+
+
+@pytest.mark.parametrize("column", ["private", "birth.private"])
+def test_keyset_bool_cursor_on_flat_bool_column(related_private_db, pg_conn, column):
+    """A `False` cursor value seeks past every non-private row on both
+    backends -- PostgreSQL used to reject it (`integer > boolean`)."""
+    from gramps_object_query_language.query import Dialect, OrderBy, Query, compile_query
+
+    db, handles = related_private_db
+    # The largest handle as the tiebreak: hex strings sort alike under
+    # every collation, so both backends see the same page boundary.
+    last = max(handles.values())
+    query = Query(select=["handle"], order_by=[OrderBy(column)], after=(False, last), limit=None)
+    sql, params = compile_query(PERSON, query, dialect=Dialect.SQLITE)
+    db.dbapi.execute(sql, params)
+    sqlite_matches = {row[0] for row in db.dbapi.fetchall()}
+    expected = {"private_birth"} if column == "birth.private" else {"numeric_name"}
+    assert {key for key in handles if handles[key] in sqlite_matches} == expected
+    if pg_conn is not None:
+        sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
+        assert _run_on_postgresql(pg_conn, db, sql, params) == sqlite_matches
+
+
+_TYPED_SELECT = [
+    "handle",
+    "private",
+    "gender",
+    "birth.private",
+    "birth.place.private",
+    "primary_name.private",
+    "primary_name.first_name",
+    "birth.date.sortval",
+    "birth.date",
+    "primary_name.surname_list",
+]
+
+
+def test_select_values_have_schema_types_on_every_path(related_private_db, pg_conn):
+    """The same `select` gives equal values of equal types on SQLite, on
+    PostgreSQL and on the evaluator path, once SQL rows go through
+    `select_normalizer` -- a boolean is True/False everywhere, a number a
+    number, an object or list parsed, and a name of "123" a string."""
+    from gramps_object_query_language.proxied_query import run_query
+    from gramps_object_query_language.query import Dialect, Query, compile_query, select_normalizer
+    from gramps_object_query_language.query_lang import compile_expr_for_spec
+
+    db, handles = related_private_db
+    where = compile_expr_for_spec(PERSON, "gender >= 0")
+    query = Query(select=_TYPED_SELECT, where=where, limit=None)
+    normalize = select_normalizer(PERSON, _TYPED_SELECT)
+
+    sql, params = compile_query(PERSON, query, dialect=Dialect.SQLITE)
+    db.dbapi.execute(sql, params)
+    results = {"sqlite": [normalize(row) for row in db.dbapi.fetchall()]}
+    if pg_conn is not None:
+        sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
+        results["postgresql"] = [normalize(row) for row in _rows_on_postgresql(pg_conn, db, sql, params)]
+    results["evaluator"] = run_query(db, PERSON, where, select=_TYPED_SELECT)
+
+    def typed(rows):
+        return sorted((tuple((type(v).__name__, v) for v in row) for row in rows), key=repr)
+
+    expected = typed(results.pop("evaluator"))
+    assert len(expected) == len(handles) - 2  # every person, not the places
+    for name, rows in results.items():
+        assert typed(rows) == expected, name
+    by_handle = {row[0]: row for row in results["sqlite"]}
+    numeric = by_handle[handles["numeric_name"]]
+    assert numeric[1] is True and numeric[6] == "123"
+    assert by_handle[handles["private_birth"]][3] is True
+    assert by_handle[handles["public_birth"]][7] > 0
+
+
 # --- SQL/evaluator parity helpers --------------------------------------------
 
 
@@ -1549,26 +1694,34 @@ _PRIMARY_TABLES = (
 
 
 def _run_on_postgresql(conn, db, sql: str, params: list) -> set:
+    """The first column of every row `_rows_on_postgresql` returns."""
+    return {row[0] for row in _rows_on_postgresql(conn, db, sql, params)}
+
+
+def _rows_on_postgresql(conn, db, sql: str, params: list) -> list:
     """Runs PostgreSQL-dialect `sql` against TEMP copies of `db`'s tables,
-    then rolls back. Every column is copied as TEXT -- enough for the
-    handle/json_data/text-column comparisons these fixtures' queries make,
-    not for an integer or boolean flat column."""
+    then rolls back. INTEGER columns (`private`, `gender`, ...) stay
+    INTEGER, as on a real PostgreSQL backend, so a literal of the wrong
+    type fails here as it would there; every other column is copied as
+    TEXT."""
     try:
         with conn.cursor() as cur:
             for table in _PRIMARY_TABLES:
                 db.dbapi.execute(f"PRAGMA table_info({table})")
-                columns = [row[1] for row in db.dbapi.fetchall()]
-                quoted = [f'"{column}"' for column in columns]  # e.g. media's "desc"
+                info = db.dbapi.fetchall()
+                quoted = [f'"{row[1]}"' for row in info]  # e.g. media's "desc"
+                types = ["INTEGER" if row[2].upper() == "INTEGER" else "TEXT" for row in info]
                 cur.execute(
-                    f"CREATE TEMP TABLE {table} ({', '.join(f'{c} TEXT' for c in quoted)})"
+                    f"CREATE TEMP TABLE {table} "
+                    f"({', '.join(f'{c} {t}' for c, t in zip(quoted, types))})"
                 )
                 db.dbapi.execute(f"SELECT {', '.join(quoted)} FROM {table}")
                 rows = db.dbapi.fetchall()
                 if rows:
-                    placeholders = ", ".join(["%s"] * len(columns))
+                    placeholders = ", ".join(["%s"] * len(info))
                     cur.executemany(f"INSERT INTO {table} VALUES ({placeholders})", rows)
             cur.execute(sql.replace("?", "%s"), params)
-            return {row[0] for row in cur.fetchall()}
+            return cur.fetchall()
     finally:
         conn.rollback()
 
