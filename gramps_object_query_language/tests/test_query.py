@@ -77,6 +77,7 @@ from gramps_object_query_language.query import (
     resolve_column_path,
     resolve_length_path,
     resolve_ref_string,
+    select_normalizer,
     walk_schema,
 )
 from gramps_object_query_language.query_lang import compile_expr
@@ -310,12 +311,89 @@ def test_compile_flat_bool_column_where_in_postgresql_casts_to_int():
     assert params[1] == 0 and type(params[1]) is int
 
 
+@pytest.mark.parametrize(
+    "expr",
+    ["birth.private == False", "birth.place.private == False", "father.private == False"],
+)
+def test_compile_related_flat_bool_column_where_eq_postgresql_casts_to_int(expr):
+    # A RelatedObject ending in a flat column reads the *target* table's
+    # INTEGER `private` column, so the literal is coerced against that
+    # table's spec, at any depth -- otherwise PostgreSQL raises
+    # `integer = boolean`.
+    spec, where = compile_expr("Family" if expr.startswith("father") else "Person", expr)
+    sql, params = compile_query(spec, Query(select=["handle"], where=where), dialect=Dialect.POSTGRESQL)
+    assert 0 in params
+    assert not any(type(p) is bool for p in params)
+
+
+def test_compile_related_flat_bool_column_where_in_postgresql_casts_to_int():
+    spec, where = compile_expr("Person", "birth.private in [True, False]")
+    sql, params = compile_query(spec, Query(select=["handle"], where=where), dialect=Dialect.POSTGRESQL)
+    assert not any(type(p) is bool for p in params)
+    assert 1 in params and 0 in params
+
+
+def test_compile_related_json_bool_where_eq_stays_bool():
+    # A RelatedObject ending in a JsonPath reads `json_data`, where a JSON
+    # boolean round-trips -- no coercion there.
+    spec, where = compile_expr("Family", "father.primary_name.private == False")
+    _, params = compile_query(spec, Query(select=["handle"], where=where), dialect=Dialect.POSTGRESQL)
+    assert any(p is False for p in params)
+
+
 def test_compile_flat_non_bool_column_where_eq_unaffected():
     # A non-bool flat column's literal is passed through untouched --
     # coercion only kicks in for `bool_columns` members.
     query = Query(select=["handle"], where=Eq("surname", "Smith"))
     sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
     assert params[0] == "Smith"
+
+
+# --- select_normalizer: database values as their schema types ---------------
+
+_NORMALIZED_SELECT = [
+    "private",  # flat bool column
+    "birth.private",  # flat bool column across a relationship
+    "primary_name.private",  # JSON boolean
+    "birth.date.sortval",  # JSON integer
+    "primary_name.first_name",  # JSON string
+    "primary_name.surname_list",  # JSON array
+    "gender",  # flat integer column
+]
+_NORMALIZED_ROW = (True, False, True, 2389036, "123", [{"surname": "Smith"}], 1)
+
+
+@pytest.mark.parametrize(
+    "backend, row",
+    [
+        # SQLite: no boolean type, composite values as JSON text
+        ("sqlite", (1, 0, 1, 2389036, "123", '[{"surname": "Smith"}]', 1)),
+        # PostgreSQL: every JSON scalar as text, flat bools as integers
+        ("postgresql", (1, 0, "true", "2389036", "123", '[{"surname": "Smith"}]', 1)),
+        # the evaluator path: already the schema's types
+        ("evaluator", _NORMALIZED_ROW),
+    ],
+)
+def test_select_normalizer_returns_schema_types(backend, row):
+    normalize = select_normalizer(PERSON, _NORMALIZED_SELECT)
+    result = normalize(row)
+    assert result == _NORMALIZED_ROW
+    assert [type(v) for v in result] == [type(v) for v in _NORMALIZED_ROW]
+
+
+def test_select_normalizer_keeps_none_and_numeric_looking_strings():
+    normalize = select_normalizer(PERSON, ["private", "primary_name.first_name", "birth.date.sortval"])
+    assert normalize((None, "123", None)) == (None, "123", None)
+    assert normalize((0, "true", "0")) == (False, "true", 0)
+
+
+def test_select_normalizer_without_select_covers_every_flat_column():
+    # No `select` means every flat column, sorted -- as compile_query does.
+    columns = sorted(PERSON.columns)
+    normalize = select_normalizer(PERSON, None)
+    row = normalize(tuple(1 if c in ("private", "gender") else "x" for c in columns))
+    assert row[columns.index("private")] is True
+    assert row[columns.index("gender")] == 1 and type(row[columns.index("gender")]) is int
 
 
 def test_compile_query_jsonpath_where_eq_str_postgresql_stays_text():
@@ -1762,6 +1840,16 @@ def test_keyset_pagination_single_column_asc():
     assert "surname > ?" in sql
     assert "Smith" in params
     assert "h123" in params
+
+
+@pytest.mark.parametrize("column", ["private", "birth.private"])
+def test_keyset_bool_cursor_on_flat_bool_column_casts_to_int(column):
+    # A cursor taken on the evaluator path holds True/False for `private`;
+    # PostgreSQL rejects `integer > boolean`.
+    query = Query(select=["handle"], order_by=[OrderBy(column)], after=(True, "h123"))
+    sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
+    assert not any(type(p) is bool for p in params)
+    assert 1 in params
 
 
 def test_keyset_pagination_mixed_directions_seek_expansion():
