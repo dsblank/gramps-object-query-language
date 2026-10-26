@@ -19,29 +19,24 @@
 
 """Run a `where` expression against a possibly-proxied `db`.
 
-Compiles a `Query.where` expression into a Gramps `Rule`, wrapped in the
-matching core `Filter` class (`GenericFilterFactory`), and calls
-`Filter.apply(db)` -- the same mechanism Gramps' own Custom Filters use.
-`Filter.apply()` fetches each candidate through `db` before testing it
-(`GenericFilter.get_object`), so when `db` is a proxy, everything this
-module ever hands to `evaluate_where` has already been through that
-proxy's own `include_*`/`sanitize_*` rules, at any relationship depth --
-see `evaluator.py`'s module docstring for why that's sufficient on its own,
+Reads every record of the type through `db`'s public methods (a
+`RecordReader`'s `iter_records`) and tests it with `evaluate_where`. A
+proxy or restricted database only returns the records the user may see,
+already cleaned, so everything this module ever hands to `evaluate_where`
+has already been through `db`'s own rules, at any relationship depth -- see
+`evaluator.py`'s module docstring for why that's sufficient on its own,
 with no separate privacy handling needed here.
 
-Not fast: `Filter.apply()` enumerates every handle of the type before
-narrowing, and every enumerated handle is fetched (deserialized) to test
-it. See `object_query.py`'s dispatch for when this path is used instead of
-`query.py`'s SQL compiler.
-
-`Filter.apply()` only ever returns handles, not the objects it built and
-tested them with -- `_PredicateRule` holds onto each matched object itself
-(`matched_objects`, keyed by handle) so `run_query` can hand them back
-directly instead of fetching (and re-sanitizing) every match a second
-time. Confirmed via profiling that this second fetch was ~70% of this
-module's entire overhead relative to a hand-written equivalent loop: under
-a proxy, re-fetching a handle means re-running the proxy's own
-`sanitize_*`, not a cheap cache hit.
+Not fast: every record of the type is read (and, under a proxy or
+restricted database, cleaned) to test it. See `object_query.py`'s dispatch
+for when this path is used instead of `query.py`'s SQL compiler. By default
+records are read as Gramps objects (`ObjectReader`); a caller whose
+database hands out raw data cheaply passes `reader=RawDataReader(db)`,
+which reads the whole table through its cursor and never builds an object
+per record -- only the final page is turned into objects, when no `select`
+is given. A caller that also needs the total number of matches (a paged
+listing's count) calls `run_query_with_total`, which returns it from the
+same pass instead of a second, unlimited `run_query`.
 
 `run_query` also implements `order_by`/`limit`/`after` (keyset pagination)
 and `select`, entirely in Python over the already-fetched match list, so a
@@ -86,12 +81,11 @@ from __future__ import annotations
 
 import functools
 import string
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
-from gramps.gen.filters import GenericFilterFactory
-from gramps.gen.filters.rules import Rule
+from gramps.gen.lib.json_utils import data_to_object
 
-from .evaluator import GETTER_BY_TABLE, evaluate_where, resolve_column_ref
+from .evaluator import ObjectReader, RecordReader, evaluate_where, resolve_column_ref
 from .query import (
     ColumnRef,
     ObjectTypeSpec,
@@ -102,62 +96,6 @@ from .query import (
     resolve_order_by,
     resolve_ref_string,
 )
-
-# Core `Filter` namespace for each `ObjectTypeSpec.table` that has one.
-# `Tag` is deliberately absent: `GenericFilterFactory("Tag")` returns `None`
-# (Gramps core has no Filter class for it), and it has no privacy concept to
-# delegate to a proxy for anyway (`TAG.has_privacy` is `False`) -- see the
-# fallback in `run_query`.
-_FILTER_NAMESPACE_BY_TABLE: dict[str, str] = {
-    "person": "Person",
-    "family": "Family",
-    "event": "Event",
-    "place": "Place",
-    "repository": "Repository",
-    "source": "Source",
-    "citation": "Citation",
-    "media": "Media",
-    "note": "Note",
-}
-
-
-class _PredicateRule(Rule):
-    """A `Rule` wrapping an already-compiled `where` expression.
-
-    Not a new rule "language" -- `apply_to_one` just hands `obj` to the same
-    `Query.where` AST evaluator every query endpoint already builds
-    (`evaluator.evaluate_where`), so a query's `where`/`where_expr` means
-    exactly the same thing on both the SQL and proxied paths.
-
-    Also doubles as the match-object cache `run_query` reads afterward
-    (`matched_objects`) -- `apply_to_one` is hand the real, already-fetched-
-    and-sanitized object anyway, so keeping a reference here is free, and
-    saves `run_query` from fetching (and re-sanitizing, under a proxy) every
-    match a second time just to get the object back.
-    """
-
-    def __init__(self, where: Any, spec: ObjectTypeSpec) -> None:
-        super().__init__([])
-        self._where = where
-        self._spec = spec
-        self.matched_objects: Dict[str, Any] = {}
-
-    def apply_to_one(self, db: Any, obj: Any) -> bool:
-        # `obj is None` means this handle was excluded by whatever proxy
-        # `db` is (or genuinely doesn't resolve) -- never a match,
-        # regardless of `where` (an empty/`None` where means "match
-        # everything", which must still exclude a row that isn't there).
-        # Relying on every proxy's handle enumeration to have already
-        # filtered this out before `Filter.apply()` ever calls this would be
-        # exactly the kind of unverified cross-proxy assumption this
-        # redesign exists to avoid -- see `evaluator.py`'s module docstring.
-        if obj is None:
-            return False
-        matched = evaluate_where(db, obj, self._where, self._spec)
-        if matched:
-            self.matched_objects[obj.handle] = obj
-        return matched
-
 
 _ASCII_NOCASE_TABLE = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
 
@@ -200,16 +138,16 @@ def _null_safe_cmp(a: Any, b: Any, direction: str) -> int:
 
 
 def _sort_key_row(
-    db: Any, obj: Any, ordering: Sequence[OrderBy], spec: ObjectTypeSpec
+    reader: RecordReader, data: Any, ordering: Sequence[OrderBy], spec: ObjectTypeSpec
 ) -> Tuple[Any, ...]:
-    return tuple(resolve_column_ref(db, obj, ob.column, spec) for ob in ordering)
+    return tuple(resolve_column_ref(reader, data, ob.column, spec) for ob in ordering)
 
 
 def _sort_matches(
-    db: Any, matches: List[Any], ordering: Sequence[OrderBy], spec: ObjectTypeSpec
+    reader: RecordReader, matches: List[Any], ordering: Sequence[OrderBy], spec: ObjectTypeSpec
 ) -> List[Tuple[Tuple[Any, ...], Any]]:
     """`matches` paired with its resolved sort-key row, sorted per `ordering`."""
-    keyed = [(_sort_key_row(db, obj, ordering, spec), obj) for obj in matches]
+    keyed = [(_sort_key_row(reader, data, ordering, spec), data) for data in matches]
 
     def compare(row_a: Tuple[Any, ...], row_b: Tuple[Any, ...]) -> int:
         key_a, _ = row_a
@@ -253,12 +191,17 @@ def run_query(
     limit: Optional[int] = None,
     after: Optional[Sequence[Any]] = None,
     select: Optional[Sequence[ColumnRef]] = None,
+    reader: Optional[RecordReader] = None,
 ) -> List[Any]:
-    """Every real object of `spec`'s type matching `where`, fetched through `db`.
+    """Every real object of `spec`'s type matching `where`, read through `db`.
 
-    `db` may be a proxy or a plain database -- either way, the returned
-    objects (and match decisions) reflect whatever `db` itself would return
-    for each handle, never an unproxied lookup.
+    `db` may be a proxy, a restricted database or a plain database --
+    either way, the returned objects (and match decisions) reflect whatever
+    `db` itself would return for each handle, never an unproxied lookup.
+
+    `reader`, when given, is a `RecordReader` for `db` to read it with
+    instead of the default `ObjectReader` -- e.g. `RawDataReader(db)` for a
+    database that hands out raw data cheaply. It must read `db` itself.
 
     `order_by`/`limit`/`after` mean exactly what they mean on `Query`/
     `compile_query` -- see this module's own docstring for the scope cap
@@ -274,26 +217,47 @@ def run_query(
     the SQL path's `SELECT` list. Omitting `select` (the default) keeps
     returning full objects, unchanged from before this parameter existed.
     """
-    getter = getattr(db, GETTER_BY_TABLE[spec.table])
-    namespace = _FILTER_NAMESPACE_BY_TABLE.get(spec.table)
-    if namespace is None:
-        handles = getattr(db, f"get_{spec.table}_handles")()
-        matches = [
-            obj
-            for handle in handles
-            if (obj := getter(handle)) is not None and evaluate_where(db, obj, where, spec)
-        ]
-    else:
-        filter_class = GenericFilterFactory(namespace)
-        gfilter = filter_class()
-        rule = _PredicateRule(where, spec)
-        gfilter.add_rule(rule)
-        matched_handles = gfilter.apply(db)
-        matches = [
-            rule.matched_objects[handle]
-            for handle in matched_handles
-            if handle in rule.matched_objects
-        ]
+    rows, _total = run_query_with_total(
+        db,
+        spec,
+        where,
+        order_by=order_by,
+        limit=limit,
+        after=after,
+        select=select,
+        reader=reader,
+    )
+    return rows
+
+
+def run_query_with_total(
+    db: Any,
+    spec: ObjectTypeSpec,
+    where: Any,
+    *,
+    order_by: Sequence[OrderBy] = (),
+    limit: Optional[int] = None,
+    after: Optional[Sequence[Any]] = None,
+    select: Optional[Sequence[ColumnRef]] = None,
+    reader: Optional[RecordReader] = None,
+) -> Tuple[List[Any], int]:
+    """`run_query`'s rows, and how many records match `where` in all.
+
+    The total ignores `after` and `limit`, like the SQL path's
+    `compile_count_query`. Every record is read and tested anyway to sort
+    the matches, so the total costs nothing extra -- unlike a second
+    `run_query` without `limit`, which reads and tests every record again.
+    """
+    if reader is None:
+        reader = ObjectReader(db)
+    elif reader.db is not db:
+        raise ValueError("reader must read the db the query runs against")
+    matches = [
+        data
+        for data in reader.iter_records(spec.table)
+        if evaluate_where(reader, data, where, spec)
+    ]
+    total = len(matches)
 
     # Resolved, not whitelist-checked: `order_by` takes the same
     # `ColumnRef`s `select` does, and `_sort_key_row` already resolves
@@ -301,7 +265,7 @@ def run_query(
     # no CAST hint the way the SQL path does -- `<`/`>` on the extracted
     # values already compare by their own types.
     ordering = effective_order_by(resolve_order_by(spec, order_by))
-    keyed = _sort_matches(db, matches, ordering, spec)
+    keyed = _sort_matches(reader, matches, ordering, spec)
 
     if after is not None:
         if len(after) != len(ordering):
@@ -310,9 +274,9 @@ def run_query(
                 f"{len(ordering)} "
                 f"({', '.join(order_by_key(ob.column) for ob in ordering)})"
             )
-        keyed = [(key, obj) for key, obj in keyed if _matches_keyset(key, after, ordering)]
+        keyed = [(key, data) for key, data in keyed if _matches_keyset(key, after, ordering)]
 
-    matches = [obj for _, obj in keyed]
+    matches = [data for _, data in keyed]
     if limit is not None:
         matches = matches[:limit]
 
@@ -327,8 +291,10 @@ def run_query(
             resolve_ref_string(spec, column) if isinstance(column, str) else column
             for column in select
         ]
-        return [
-            tuple(resolve_column_ref(db, obj, column, spec) for column in columns)
-            for obj in matches
+        rows = [
+            tuple(resolve_column_ref(reader, data, column, spec) for column in columns)
+            for data in matches
         ]
-    return matches
+    else:
+        rows = [data_to_object(data) if isinstance(data, dict) else data for data in matches]
+    return rows, total

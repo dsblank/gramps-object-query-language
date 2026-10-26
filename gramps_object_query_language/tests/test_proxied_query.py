@@ -20,9 +20,10 @@
 """Tests for `proxied_query.py`'s `run_query`, end to end.
 
 Same real-temporary-SQLite-db pattern as `test_evaluator.py` and
-`tests/test_private_proxy.py` -- `run_query` drives Gramps' own
-`Filter.apply()`, so a mock database would only prove the mock's behavior,
-not that this composes correctly with core.
+`tests/test_private_proxy.py` -- `run_query` reads through a real
+database's (or Gramps proxy's) own cursor and getters, so a mock database
+would only prove the mock's behavior, not that this composes correctly with
+core.
 """
 
 import pytest
@@ -30,10 +31,22 @@ from gramps.cli.clidbman import CLIDbManager
 from gramps.gen.db import DbTxn
 from gramps.gen.db.utils import make_database
 from gramps.gen.dbstate import DbState
-from gramps.gen.lib import Family, Name, Person, Surname, Tag
+from gramps.gen.lib import (
+    ChildRef,
+    Date,
+    Event,
+    EventRef,
+    EventType,
+    Family,
+    Name,
+    Person,
+    Surname,
+    Tag,
+)
 from gramps.gen.proxy import PrivateProxyDb
 
-from gramps_object_query_language.proxied_query import run_query
+from gramps_object_query_language.proxied_query import run_query, run_query_with_total
+from gramps_object_query_language.evaluator import RawDataReader, RecordReader, evaluate_where
 from gramps_object_query_language.query import (
     FAMILY,
     PERSON,
@@ -47,6 +60,7 @@ from gramps_object_query_language.query import (
     compile_query,
     resolve_column_path,
 )
+from gramps_object_query_language.query_lang import compile_expr_for_spec
 
 
 def _name(given: str, surname: str) -> Name:
@@ -142,9 +156,35 @@ def test_run_query_excludes_private_person_via_proxy(db_handles, proxy):
     assert matched_handles == {handles["father"], handles["mother"]}
 
 
+def test_run_query_raw_data_reader_matches_default_reader(db_handles, proxy):
+    """Reading raw data instead of objects changes only speed: same results,
+    privacy included, as the default reader -- on the proxy and the plain
+    database alike."""
+    _db, handles = db_handles
+    father_surname = resolve_column_path(FAMILY, ["father", "surname"])
+    for spec, where in [
+        (PERSON, None),
+        (PERSON, Eq("gender", Person.MALE)),
+        (FAMILY, Eq(father_surname, "Anderson")),
+        (TAG, None),
+    ]:
+        for db in (proxy, db_handles[0]):
+            default = run_query(db, spec, where, select=["handle"])
+            raw = run_query(db, spec, where, select=["handle"], reader=RawDataReader(db))
+            assert raw == default
+    people = run_query(proxy, PERSON, None, reader=RawDataReader(proxy))
+    assert handles["private_person"] not in {p.handle for p in people}
+
+
+def test_run_query_rejects_reader_for_another_db(db_handles, proxy):
+    db, _handles = db_handles
+    with pytest.raises(ValueError):
+        run_query(proxy, PERSON, None, reader=RawDataReader(db))
+
+
 def test_run_query_tag_fallback_no_filter_class(db_handles):
-    """Tag has no core Filter class (`GenericFilterFactory("Tag")` is
-    `None`) -- confirms `run_query` still works via its direct-loop path.
+    """Tags are read one handle at a time rather than through a cursor
+    (not every database offers a tag cursor) -- confirms that path works.
     """
     db, handles = db_handles
     matches = run_query(db, TAG, Eq("name", "Genealogy"))
@@ -664,3 +704,174 @@ def test_sql_and_evaluator_agree_page_by_page(paging_handles, label, spec, selec
 
         assert walked == whole, f"{runner} paging diverged for {label!r}"
         assert len(walked) == len(set(walked)), f"{runner} repeated a row for {label!r}"
+
+
+def test_run_query_with_total_ignores_limit_and_after(db_handles):
+    """The total counts every match, like `compile_count_query`, whatever
+    page `limit` and `after` select."""
+    db, _handles = db_handles
+    everyone = run_query(db, PERSON, None, select=["handle"])
+    rows, total = run_query_with_total(db, PERSON, None, select=["handle"], limit=1)
+    assert rows == everyone[:1]
+    assert total == len(everyone) == 3
+    rows, total = run_query_with_total(
+        db, PERSON, None, select=["handle"], limit=1, after=everyone[0]
+    )
+    assert rows == everyone[1:2]
+    assert total == 3
+
+
+@pytest.fixture(scope="module")
+def privacy_handles():
+    """Public records with private parts, and a broken child reference."""
+    dbman = CLIDbManager(DbState())
+    dirpath, db_name = dbman.create_new_db_cli("_test_proxied_query_privacy", dbid="sqlite")
+    db = make_database("sqlite")
+    db.load(dirpath)
+    handles = {}
+    with DbTxn("setup", db) as trans:
+        for key, surname in (("adams", "Adams"), ("miller", "Miller")):
+            person = Person()
+            person.set_primary_name(_name("Ann", surname))
+            handles[key] = db.add_person(person, trans)
+
+        # a public person whose name is private: reads back as "Private"
+        secret = Person()
+        name = _name("Bea", "Baker")
+        name.set_privacy(True)
+        secret.set_primary_name(name)
+        handles["secret_name"] = db.add_person(secret, trans)
+
+        # a public person whose birth event is private
+        birth = Event()
+        birth.set_type(EventType.BIRTH)
+        date = Date()
+        date.set_yr_mon_day(1900, 1, 1)
+        birth.set_date_object(date)
+        birth.set_privacy(True)
+        db.add_event(birth, trans)
+        ref = EventRef()
+        ref.set_reference_handle(birth.handle)
+        born = db.get_person_from_handle(handles["adams"])
+        born.add_event_ref(ref)
+        born.set_birth_ref(ref)
+        db.commit_person(born, trans)
+
+        # one real child and one reference to a person that doesn't exist
+        family = Family()
+        for child_handle in (handles["miller"], "no_such_person"):
+            child_ref = ChildRef()
+            child_ref.set_reference_handle(child_handle)
+            family.add_child_ref(child_ref)
+        handles["family"] = db.add_family(family, trans)
+        # a family whose only child doesn't exist
+        orphaned = Family()
+        child_ref = ChildRef()
+        child_ref.set_reference_handle("no_such_person")
+        orphaned.add_child_ref(child_ref)
+        handles["broken_family"] = db.add_family(orphaned, trans)
+    yield db, handles
+    db.close()
+    dbman.remove_database(db_name)
+
+
+def _readers(db):
+    """Run `run_query` with each reader: the default and `RawDataReader`."""
+    return [{}, {"reader": RawDataReader(db)}]
+
+
+def _matches(db, spec, expr, **kwargs):
+    where = compile_expr_for_spec(spec, expr)
+    return [
+        {row[0] for row in run_query(db, spec, where, select=["handle"], **reader, **kwargs)}
+        for reader in _readers(db)
+    ]
+
+
+def test_run_query_sees_private_parts_as_cleaned(privacy_handles):
+    """Under a proxy, a private part of a visible record is matched as the
+    proxy cleaned it -- the stored value can't be matched -- with either
+    reader, and negating a condition doesn't bring it back."""
+    db, handles = privacy_handles
+    proxy = PrivateProxyDb(db)
+    secret, adams = handles["secret_name"], handles["adams"]
+    for result in _matches(db, PERSON, "surname == 'Baker'"):
+        assert result == {secret}
+    for result in _matches(proxy, PERSON, "surname == 'Baker'"):
+        assert result == set()
+    for result in _matches(proxy, PERSON, "surname == 'Private'"):
+        assert result == {secret}
+    for result in _matches(proxy, PERSON, "not (surname == 'Baker')"):
+        assert secret in result
+    for result in _matches(db, PERSON, "birth.date.sortval > 0"):
+        assert result == {adams}
+    for result in _matches(proxy, PERSON, "birth.date.sortval > 0"):
+        assert result == set()
+
+
+def test_run_query_sorts_by_cleaned_values(privacy_handles):
+    """Sorting uses the cleaned value: a private name sorts as "Private",
+    not where the stored surname would put it."""
+    db, handles = privacy_handles
+    proxy = PrivateProxyDb(db)
+    order_by = [OrderBy("surname")]
+    stored = [handles["adams"], handles["secret_name"], handles["miller"]]
+    cleaned = [handles["adams"], handles["miller"], handles["secret_name"]]
+    for database, expected in ((db, stored), (proxy, cleaned)):
+        for reader in _readers(database):
+            rows = run_query(database, PERSON, None, order_by=order_by, select=["handle"], **reader)
+            assert [row[0] for row in rows] == expected
+
+
+def test_run_query_skips_related_records_that_dont_read_back(privacy_handles):
+    """A reference to a record that doesn't exist counts for nothing in
+    `len(...)` and `any(...)`, as in the SQL join, with either reader."""
+    db, handles = privacy_handles
+    for expr, expected in (
+        ("len(children) == 1", {handles["family"]}),
+        ("len(children) == 2", set()),
+        ("any(children)", {handles["family"]}),
+    ):
+        sql = {row[0] for row in _sql_rows(
+            db, FAMILY, Query(select=["handle"], where=compile_expr_for_spec(FAMILY, expr))
+        )}
+        assert sql == expected, expr
+        for result in _matches(db, FAMILY, expr):
+            assert result == expected, expr
+
+
+def test_evaluate_where_on_raw_data_matches_objects(privacy_handles):
+    """`evaluate_where` gives the same answer for a record's raw data as
+    for its object, related records included."""
+    db, handles = privacy_handles
+    proxy = PrivateProxyDb(db)
+    for database in (db, proxy):
+        for expr in ("surname == 'Baker'", "birth.date.sortval > 0", "gender == Person.UNKNOWN"):
+            where = compile_expr_for_spec(PERSON, expr)
+            for handle in database.get_person_handles():
+                obj = database.get_person_from_handle(handle)
+                data = database.get_raw_person_data(handle)
+                assert isinstance(data, dict)
+                assert evaluate_where(database, data, where, PERSON) == evaluate_where(
+                    database, obj, where, PERSON
+                ), (expr, handle)
+
+
+def test_reader_cache_drops_least_recently_used():
+    """A full cache drops the record read longest ago, keeping one that
+    was just read again."""
+
+    class CountingReader(RecordReader):
+        def __init__(self):
+            super().__init__(db=None, cache_size=2)
+            self.reads = []
+
+        def read(self, table, handle):
+            self.reads.append(handle)
+            return handle
+
+    reader = CountingReader()
+    for handle in ("a", "b", "a", "c", "a", "b"):
+        assert reader.get("place", handle) == handle
+    # "a" stays cached (used again before "c" arrived); "b" is read twice
+    assert reader.reads == ["a", "b", "c", "b"]

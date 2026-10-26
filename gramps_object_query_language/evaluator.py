@@ -17,24 +17,41 @@
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 #
 
-"""Evaluate `query.py`'s AST directly against real Gramps objects.
+"""Evaluate `query.py`'s AST directly against Gramps records.
 
 `query.py` compiles a `Query`/`where` expression to SQL, which is only safe
 to run against an *unproxied* database -- it has no notion of privacy or any
 other proxy-applied rule, and reimplementing one in SQL is exactly the
 mistake this module exists to avoid (see `query.py`'s module docstring).
 This module instead walks the same AST and evaluates it directly against a
-real object, fetched through whatever `db` the caller passes in. When `db`
-is a proxy, every object this module ever sees -- the row object itself and
-anything reached via a `RelatedObject` hop, at any depth -- has already been
-through that proxy's own `include_*`/`sanitize_*` rules. Correctness follows
+record's raw data (the JSON-shaped dict Gramps stores, the same shape
+`object_to_dict()` produces), read through whatever `db` the caller passes
+in. When `db` is a proxy or another restricted database, every record this
+module ever sees -- the row itself and anything reached via a
+`RelatedObject` hop, at any depth -- has already been through that
+database's own rules for what to hide and what to remove: `RecordReader`
+only ever uses `db`'s public `get_raw_<table>_data`, never a lower-level
+method a proxy might pass straight through to the database underneath it.
+Correctness follows
 from that alone: there is no separate privacy guard here the way
 `Comparison.compile()` needs a `CASE WHEN` guard for NULL-safe `Eq`/`Ne` --
 a masked field already reads back as whatever the proxy's `sanitize_*` left
 it as (typically `None`), and plain Python `==`/`!=`/`is None` against that
 already-correct value is automatically the right, non-leaking answer.
 
-Not fast: no SQL push-down, no keyset narrowing before objects are fetched.
+A record is evaluated in whichever form it arrives in, never converted
+wholesale: a Gramps object (what a Gramps filter rule's `apply_to_one` is
+handed), or its raw data (the JSON-shaped dict Gramps stores). Related
+records are read in the same form, through a `RecordReader`: by default
+`ObjectReader` for an object row, which goes through `db`'s object getters
+and so through any cache in front of them (`CacheProxyDb`), and
+`RawDataReader` for a raw-data row. Reading a whole table as raw data
+(`run_query(..., reader=RawDataReader(db))`) avoids building an object per
+record, which is most of the cost of this path on a database that can hand
+out raw data cheaply; a Gramps proxy can't (it builds the object anyway),
+so objects stay the default.
+
+Not fast: no SQL push-down, no keyset narrowing before records are read.
 Intended for the proxied path, where the query's result set is expected to
 be small relative to the table, or where correctness matters more than
 p99 latency -- see `object_query.py`'s dispatch.
@@ -43,6 +60,7 @@ p99 latency -- see `object_query.py`'s dispatch.
 from __future__ import annotations
 
 import re
+from collections import OrderedDict
 from typing import Any, Iterator, Optional, Tuple
 
 from gramps.gen.errors import HandleError
@@ -71,9 +89,10 @@ from .query import (
     RelatedObject,
 )
 
-# Real getter method name for each `ObjectTypeSpec.table`, used to fetch a
-# `RelatedObject` hop's target through `db` (whatever proxy or plain
-# database that is) -- never a direct/unproxied lookup.
+# Real getter method name for each `ObjectTypeSpec.table`, for callers that
+# need the object itself through `db` (whatever proxy or plain database that
+# is) -- never a direct/unproxied lookup. This module reads raw data instead,
+# see `RecordReader`.
 GETTER_BY_TABLE: dict[str, str] = {
     "person": "get_person_from_handle",
     "family": "get_family_from_handle",
@@ -86,6 +105,139 @@ GETTER_BY_TABLE: dict[str, str] = {
     "note": "get_note_from_handle",
     "tag": "get_tag_from_handle",
 }
+
+
+class RecordReader:
+    """Reads related records through `db`, remembering recent ones.
+
+    Subclasses decide the form records come back in -- `ObjectReader`
+    (Gramps objects) or `RawDataReader` (raw data) -- by implementing
+    `read` and `iter_records`, only ever through `db`'s public methods,
+    which a proxy or a restricted database answers with records as the
+    user may see them (`None` for a hidden one), never the stored records.
+    A missing handle reads as `None` too, whichever way `db` reports it
+    (plain databases return `None`, Gramps proxies raise `HandleError`).
+
+    One reader serves one query: many rows often reach the same related
+    record (events sharing a place, children sharing a family), and reading
+    it through a proxy or restricted database means cleaning it again each
+    time. When the cache is full, the least recently used record is
+    dropped, so memory stays bounded on large trees while the records many
+    rows share stay cached.
+    """
+
+    def __init__(self, db: Any, cache_size: int = 10000) -> None:
+        self.db = db
+        self._cache: OrderedDict[Tuple[str, str], Any] = OrderedDict()
+        self._cache_size = cache_size
+
+    def get(self, table: str, handle: str) -> Any:
+        """`table`'s record `handle`, or `None`, cached."""
+        key = (table, handle)
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            return self._cache[key]
+        record = self.read(table, handle)
+        if len(self._cache) >= self._cache_size:
+            self._cache.popitem(last=False)
+        self._cache[key] = record
+        return record
+
+    def read(self, table: str, handle: str) -> Any:
+        """`table`'s record `handle`, or `None`, uncached: for reading
+        through a whole table, which would only evict the related records
+        worth keeping."""
+        raise NotImplementedError
+
+    def iter_records(self, table: str) -> Iterator[Any]:
+        """Every record of `table` that `db` returns."""
+        raise NotImplementedError
+
+
+class ObjectReader(RecordReader):
+    """Reads Gramps objects through `db`'s `get_<table>_from_handle`.
+
+    The default: every database offers these getters, a Gramps proxy
+    decides visibility and cleans records in them, and a `CacheProxyDb` in
+    front caches what they return across a whole filter run.
+    """
+
+    def read(self, table: str, handle: str) -> Any:
+        try:
+            return getattr(self.db, GETTER_BY_TABLE[table])(handle)
+        except HandleError:
+            return None
+
+    def iter_records(self, table: str) -> Iterator[Any]:
+        for handle in getattr(self.db, f"iter_{table}_handles")():
+            obj = self.read(table, handle)
+            if obj is not None:
+                yield obj
+
+
+class RawDataReader(RecordReader):
+    """Reads raw data through `db`'s `get_raw_<table>_data` and cursor.
+
+    Opt-in: much faster than `ObjectReader` on a database that hands out
+    raw data without building an object first -- a plain database, or a
+    restricted database that cleans raw data directly -- but slower on a
+    Gramps proxy, whose raw getters build the object anyway and then wrap
+    its data.
+    """
+
+    def read(self, table: str, handle: str) -> Optional[dict]:
+        try:
+            return getattr(self.db, f"get_raw_{table}_data")(handle)
+        except HandleError:
+            return None
+
+    def iter_records(self, table: str) -> Iterator[dict]:
+        """Through the public cursor, so a database can read the whole
+        table at once -- except for tags, which are few and not every
+        database offers a cursor for."""
+        if table == "tag":
+            for handle in self.db.iter_tag_handles():
+                data = self.read(table, handle)
+                if data is not None:
+                    yield data
+            return
+        with getattr(self.db, f"get_{table}_cursor")() as cursor:
+            for _, data in cursor:
+                if data is not None:
+                    yield data
+
+
+def _reader(db: Any, row: Any) -> RecordReader:
+    """`db` if it's already a reader, else one reading related records in
+    the same form as `row`."""
+    if isinstance(db, RecordReader):
+        return db
+    return RawDataReader(db) if isinstance(row, dict) else ObjectReader(db)
+
+
+def _handle(row: Any) -> Any:
+    return row["handle"] if isinstance(row, dict) else row.handle
+
+
+def _given_name_of_data(data: dict) -> str:
+    primary_name = data.get("primary_name")
+    return primary_name.get("first_name", "") if primary_name else ""
+
+
+def _surname_of_data(data: dict) -> str:
+    primary_name = data.get("primary_name")
+    if not primary_name:
+        return ""
+    surname_list = primary_name.get("surname_list")
+    if not surname_list or not surname_list[0]:
+        return ""
+    return surname_list[0].get("surname", "")
+
+
+def _enclosed_by_of_data(data: dict) -> str:
+    for placeref in data.get("placeref_list") or []:
+        return placeref.get("ref", "")
+    return ""
 
 
 def _given_name(obj: Any) -> str:
@@ -110,33 +262,44 @@ def _enclosed_by(obj: Any) -> str:
 
 
 # `given_name`/`surname`/`enclosed_by` are real SQL columns (populated by the
-# DB layer at write time), but not real attributes on the in-memory object --
-# mirrors gramps core's `gen/db/generic.py` `DbGeneric._get_person_data`/
-# `_get_place_data` exactly, the functions that populate those same columns.
+# DB layer at write time), but neither attributes of the object nor keys of
+# its raw data -- mirrors gramps core's `gen/db/generic.py`
+# `DbGeneric._get_person_data`/`_get_place_data` exactly, the functions that
+# populate those same columns, for each form a record comes in.
 _DERIVED_COLUMNS: dict[str, dict[str, Any]] = {
     "person": {"given_name": _given_name, "surname": _surname},
     "place": {"enclosed_by": _enclosed_by},
 }
+_DERIVED_COLUMNS_OF_DATA: dict[str, dict[str, Any]] = {
+    "person": {"given_name": _given_name_of_data, "surname": _surname_of_data},
+    "place": {"enclosed_by": _enclosed_by_of_data},
+}
 
 
 def get_flat_column(obj: Any, column: str, spec: ObjectTypeSpec) -> Any:
-    """A flat column's value straight off a real object.
+    """A flat column's value straight off a record, a Gramps object or its
+    raw data.
 
-    `getattr` for anything `get_secondary_fields()` already exposes as a
-    real attribute (`gramps_id`, `gender`, `private`, `handle`,
-    `father_handle`, `place`, ...) -- which is everything except the small,
-    fixed set of derived columns above.
+    An attribute (or top-level key) for anything `get_secondary_fields()`
+    names (`gramps_id`, `gender`, `private`, `handle`, `father_handle`,
+    `place`, ...) -- which is everything except the small, fixed set of
+    derived columns above.
     """
+    if isinstance(obj, dict):
+        derived = _DERIVED_COLUMNS_OF_DATA.get(spec.table, {})
+        if column in derived:
+            return derived[column](obj)
+        return obj.get(column)
     derived = _DERIVED_COLUMNS.get(spec.table, {})
     if column in derived:
         return derived[column](obj)
     return getattr(obj, column)
 
 
-def _walk_json_path(data: Any, segments: Any, root_obj: Any) -> Any:
-    """Walk `JsonPath.segments` against `data` (an `object_to_dict()` dict).
+def _walk_json_path(data: Any, segments: Any, root: Any) -> Any:
+    """Walk `JsonPath.segments` against `data` (raw data, or part of it).
 
-    A `ColumnIndex` segment resolves against `root_obj` -- the row the path
+    A `ColumnIndex` segment resolves against `root` -- the row the path
     started from -- not whatever `data` has been narrowed to by that point,
     mirroring `_render_handle_ref`'s "this row's `<column>`" semantics
     exactly (only ever appears as a `RelatedObject.handle_ref` segment, so
@@ -147,7 +310,7 @@ def _walk_json_path(data: Any, segments: Any, root_obj: Any) -> Any:
         if current is None:
             return None
         if isinstance(segment, ColumnIndex):
-            index = getattr(root_obj, segment.column)
+            index = root.get(segment.column) if isinstance(root, dict) else getattr(root, segment.column)
             if index is None or index < 0:
                 return None
             segment = index
@@ -163,95 +326,93 @@ def _walk_json_path(data: Any, segments: Any, root_obj: Any) -> Any:
 
 
 def get_json_path(obj: Any, path: JsonPath) -> Any:
-    """`JsonPath.segments` extracted from `obj`'s real, in-memory data.
+    """`JsonPath.segments` extracted from a record's raw data (a Gramps
+    object is converted with `object_to_dict()` first).
 
-    `object_to_dict()` is the same JSON-shaped structure the compiled SQL
-    path navigates via `json_extract`/`->` against the stored `json_data`
-    column -- using it here keeps the two paths interpreting a `JsonPath`
-    identically without hand-duplicating that shape.
+    The raw data is the same JSON-shaped structure the compiled SQL path
+    navigates via `json_extract`/`->` against the stored `json_data`
+    column, so the two paths interpret a `JsonPath` identically without
+    hand-duplicating that shape.
 
-    Any `base_column` other than `"json_data"` (`"je.value"`, `"link.value"`,
-    ...) marks a field inside an `any(...)`/`len(..., condition)` condition,
-    or a self-linked `Collection`'s own condition (see
-    `ObjectTypeSpec.element_base_column`/`resolve_any_path`/
-    `resolve_column_path` in query.py) -- there, `obj` *is* already one
-    array element's raw dict (no real Gramps object exists per element, see
-    `_json_array_items`/`_self_linked_entry`), so it's walked directly,
-    skipping `object_to_dict()` (which expects a real Gramps object, not a
-    plain dict already in the JSON shape it would otherwise produce). Which
-    exact marker string it is doesn't matter here -- unlike SQL, where each
-    one has to name a distinct alias so multiple unnests in the same query
-    don't collide, the evaluator only ever has one `obj` in scope at a time,
-    so any non-`"json_data"` value means the same thing: "this is already a
-    dict."
+    `obj` is either a whole record or, for a field inside an
+    `any(...)`/`len(..., condition)` condition or a self-linked
+    `Collection`'s own condition (any `base_column` other than
+    `"json_data"` -- see `ObjectTypeSpec.element_base_column`), one array
+    element's dict. Both are walked the same way: unlike SQL, where each
+    unnest needs its own alias, the evaluator only ever has one dict in
+    scope at a time.
     """
-    if path.base_column != "json_data":
-        return _walk_json_path(obj, path.segments, obj)
-    data = json_utils.object_to_dict(obj)
+    if obj is None:
+        return None
+    data = obj if isinstance(obj, dict) else json_utils.object_to_dict(obj)
     return _walk_json_path(data, path.segments, obj)
 
 
 def _resolve_related_object(
-    db: Any, obj: Any, ref: RelatedObject, spec: ObjectTypeSpec
+    reader: RecordReader, data: Any, ref: RelatedObject, spec: ObjectTypeSpec
 ) -> Any:
     if isinstance(ref.handle_ref, JsonPath):
-        handle = get_json_path(obj, ref.handle_ref)
+        handle = get_json_path(data, ref.handle_ref)
     else:
-        handle = get_flat_column(obj, ref.handle_ref, spec)
+        handle = get_flat_column(data, ref.handle_ref, spec)
     if not handle:
         return None
-    getter = getattr(db, GETTER_BY_TABLE[ref.target.table])
-    try:
-        return getter(handle)
-    except HandleError:
-        return None
+    return reader.get(ref.target.table, handle)
 
 
 def resolve_column_ref(db: Any, obj: Any, ref: ColumnRef, spec: ObjectTypeSpec) -> Any:
-    """`query.py`'s `_render_column`, evaluated in Python against a real
-    object instead of rendered as SQL.
+    """`query.py`'s `_render_column`, evaluated in Python against a record
+    instead of rendered as SQL.
 
-    `db` is whatever the caller is running under (proxy or plain) --
-    every `RelatedObject` hop is fetched through it (`_resolve_related_object`),
-    so the same rules that applied to `obj` itself apply to everything
-    reached from it, at any depth, with no separate handling needed here.
+    `obj` is a Gramps object or a record's raw data. `db` is whatever the
+    caller is running under (proxy or plain), or a `RecordReader` wrapping
+    it to share its cache across calls -- every
+    `RelatedObject` hop is read through it (`_resolve_related_object`), so
+    the same rules that applied to `obj` itself apply to everything reached
+    from it, at any depth, with no separate handling needed here.
     """
-    if obj is None:
+    return _resolve(_reader(db, obj), obj, ref, spec)
+
+
+def _resolve(
+    reader: RecordReader, data: Any, ref: ColumnRef, spec: ObjectTypeSpec
+) -> Any:
+    if data is None:
         return None
     if isinstance(ref, RelatedObject):
-        related_obj = _resolve_related_object(db, obj, ref, spec)
-        return resolve_column_ref(db, related_obj, ref.field, ref.target)
+        related = _resolve_related_object(reader, data, ref, spec)
+        return _resolve(reader, related, ref.field, ref.target)
     if isinstance(ref, JsonPath):
-        return get_json_path(obj, ref)
+        return get_json_path(data, ref)
     if isinstance(ref, CollectionCount):
-        return _collection_count(db, obj, ref)
+        return _collection_count(reader, data, ref)
     if isinstance(ref, Length):
-        return _length_of(db, obj, ref, spec)
+        return _length_of(reader, data, ref, spec)
     if isinstance(ref, JsonArrayCount):
-        return _json_array_count(db, obj, ref, spec)
+        return _json_array_count(reader, data, ref, spec)
     if isinstance(ref, FlatColumnRef):
-        return get_flat_column(obj, ref.name, spec)
-    return get_flat_column(obj, ref, spec)
+        return get_flat_column(data, ref.name, spec)
+    return get_flat_column(data, ref, spec)
 
 
-def _collection_handles(obj: Any, collection: Collection) -> list:
-    """The list of related handles for `collection` on `obj` -- a plain
+def _collection_handles(data: Any, collection: Collection) -> list:
+    """The list of related handles for `collection` on `data` -- a plain
     handle string per element (`notes`), or each element's `ref_field`
     pulled out (`children`'s `ChildRef.ref`) -- mirrors `query.py`'s
     `_collection_source_sqlite`/`_collection_source_postgresql` exactly, just
     walking the real in-memory list instead of rendering SQL to iterate it.
     """
-    items = get_json_path(obj, collection.list_path) or []
+    items = get_json_path(data, collection.list_path) or []
     if collection.ref_field:
         return [item.get(collection.ref_field) for item in items if item]
     return [item for item in items if item]
 
 
-def _self_linked_entry(related: Any, obj: Any, collection: Collection) -> Optional[dict]:
+def _self_linked_entry(related: Any, data: Any, collection: Collection) -> Optional[dict]:
     """The one entry (a dict, matching the SQL side's `link.value` shape --
     see `query.py`'s `_self_link_source_sqlite`) in `related`'s own
     `collection.self_link_field` array whose `collection.self_link_ref_field`
-    equals `obj`'s own handle -- `None` if no such entry exists (a
+    equals `data`'s own handle -- `None` if no such entry exists (a
     data-integrity edge case, e.g. `person.handle` listed in a family's
     `parent_family_list` with no matching `ChildRef` in that family's own
     `child_ref_list` -- treated as "this related row contributes nothing,"
@@ -270,16 +431,16 @@ def _self_linked_entry(related: Any, obj: Any, collection: Collection) -> Option
         (
             e
             for e in entries
-            if isinstance(e, dict) and e.get(collection.self_link_ref_field) == obj.handle
+            if isinstance(e, dict) and e.get(collection.self_link_ref_field) == _handle(data)
         ),
         None,
     )
 
 
 def _backlink_handles(
-    db: Any, obj: Any, condition: Optional[BacklinkClassFilter]
+    reader: RecordReader, data: Any, condition: Optional[BacklinkClassFilter]
 ) -> Iterator[Tuple[str, str]]:
-    """`(class_name, handle)` pairs for every object referencing `obj`,
+    """`(class_name, handle)` pairs for every object referencing `data`,
     matching `condition` (a `BacklinkClassFilter`, `Backlinks`' only
     supported condition shape -- see query.py) if given -- the evaluator
     counterpart to `query.py`'s `_backlinks_subquery_body`, walking
@@ -293,52 +454,61 @@ def _backlink_handles(
     unrestricted result and filters in Python instead.
 
     Privacy comes from `db` itself, same as every other relationship this
-    module evaluates (see the module docstring): when `db` is a
-    `PrivateProxyDb`, its own `find_backlink_handles` override already
-    excludes a referrer that is itself private (`gramps/gen/proxy/
-    private.py`) before this function ever sees it -- no separate privacy
-    handling needed here.
+    module evaluates (see the module docstring): a proxy or restricted
+    database's own `find_backlink_handles` already leaves out referrers the
+    user may not see before this function ever sees them -- no separate
+    privacy handling needed here.
     """
+    db = reader.db
+    handle = _handle(data)
     if condition is None:
-        yield from db.find_backlink_handles(obj.handle)
+        yield from db.find_backlink_handles(handle)
     elif condition.op in ("eq", "in"):
         include_classes = [condition.value] if condition.op == "eq" else list(condition.value)
-        yield from db.find_backlink_handles(obj.handle, include_classes)
+        yield from db.find_backlink_handles(handle, include_classes)
     else:
-        for class_name, handle in db.find_backlink_handles(obj.handle):
+        for class_name, ref_handle in db.find_backlink_handles(handle):
             if class_name != condition.value:
-                yield class_name, handle
+                yield class_name, ref_handle
 
 
-def _collection_count(db: Any, obj: Any, count: CollectionCount) -> int:
+def _collection_count(reader: RecordReader, data: Any, count: CollectionCount) -> int:
     """How many related rows in `count.collection` match `count.condition`
     (every related row at all, if `condition` is `None`) -- the evaluator
     counterpart to `query.py`'s `CollectionCount` SQL rendering. Unlike
     `Exists`'s short-circuit on the first match, this has to walk every
-    related row, matching `COUNT(*)`'s own semantics.
+    related row, matching `COUNT(*)`'s own semantics. A related record that
+    doesn't read back (hidden, or missing) isn't counted, like the SQL
+    join that finds no row for it.
     """
     if isinstance(count.collection, Backlinks):
-        return sum(1 for _ in _backlink_handles(db, obj, count.condition))
-    collection = count.collection
-    getter = getattr(db, GETTER_BY_TABLE[collection.target.table])
-    matched = 0
-    for handle in _collection_handles(obj, collection):
-        try:
-            related = getter(handle)
-        except HandleError:
+        return sum(1 for _ in _backlink_handles(reader, data, count.condition))
+    return sum(
+        1
+        for row, row_spec in _collection_rows(reader, data, count.collection)
+        if count.condition is None or _matches(reader, row, count.condition, row_spec)
+    )
+
+
+def _collection_rows(
+    reader: RecordReader, data: Any, collection: Collection
+) -> Iterator[Tuple[Any, ObjectTypeSpec]]:
+    """What `collection`'s condition is tested against, for each related
+    record that reads back: the record itself, or for a self-linked
+    collection its entry pointing back at `data` (`_self_linked_entry`)."""
+    for handle in _collection_handles(data, collection):
+        related = reader.get(collection.target.table, handle)
+        if related is None:
             continue
         if collection.self_link_field:
-            entry = _self_linked_entry(related, obj, collection)
-            if entry is None:
-                continue
-            if count.condition is None or evaluate_where(db, entry, count.condition, collection.target):
-                matched += 1
-        elif count.condition is None or evaluate_where(db, related, count.condition, collection.target):
-            matched += 1
-    return matched
+            entry = _self_linked_entry(related, data, collection)
+            if entry is not None:
+                yield entry, collection.target
+        else:
+            yield related, collection.target
 
 
-def _length_of(db: Any, obj: Any, length: Length, spec: ObjectTypeSpec) -> int:
+def _length_of(reader: RecordReader, data: Any, length: Length, spec: ObjectTypeSpec) -> int:
     """`len(x)`, evaluated against a real object -- the evaluator counterpart
     to `query.py`'s `Length` SQL rendering. Resolves `length.inner`
     (a `JsonPath`, or a `RelatedObject` chain whose own innermost `field` is
@@ -352,14 +522,14 @@ def _length_of(db: Any, obj: Any, length: Length, spec: ObjectTypeSpec) -> int:
     why), rather than diverging on the one input SQL's `COALESCE`/`CASE`
     guards were built specifically to handle.
     """
-    value = resolve_column_ref(db, obj, length.inner, spec)
+    value = _resolve(reader, data, length.inner, spec)
     return len(value) if isinstance(value, list) else 0
 
 
-def _json_array_items(db: Any, obj: Any, array: ColumnRef, spec: ObjectTypeSpec) -> list:
+def _json_array_items(reader: RecordReader, data: Any, array: ColumnRef, spec: ObjectTypeSpec) -> list:
     """The raw list of dicts `array` (a `JsonPath`, or a `RelatedObject`
     chain ending in one -- see query.py's `resolve_any_path`) resolves to
-    on `obj` -- shared by `JsonArrayExists`/`JsonArrayCount`'s own evaluator
+    on `data` -- shared by `JsonArrayExists`/`JsonArrayCount`'s own evaluator
     counterparts. Reuses `resolve_column_ref` verbatim, so a relationship-
     crossing array (`father.attribute_list`) gets the same privacy-
     respecting hop (`_resolve_related_object`) any other `RelatedObject`
@@ -368,21 +538,21 @@ def _json_array_items(db: Any, obj: Any, array: ColumnRef, spec: ObjectTypeSpec)
     own "missing/non-array is 0" reasoning one level up (`any`/`len` over
     nothing to iterate is simply nothing to match).
     """
-    items = resolve_column_ref(db, obj, array, spec)
+    items = _resolve(reader, data, array, spec)
     return items if isinstance(items, list) else []
 
 
-def _json_array_count(db: Any, obj: Any, count: "JsonArrayCount", spec: ObjectTypeSpec) -> int:
+def _json_array_count(reader: RecordReader, data: Any, count: "JsonArrayCount", spec: ObjectTypeSpec) -> int:
     """How many elements of `count.array` match `count.condition` -- the
     evaluator counterpart to `query.py`'s `JsonArrayCount` SQL rendering.
     Each element is a plain dict (no real Gramps object exists per array
     element), evaluated against `count.element_spec` the same way
     `_collection_count` evaluates a related row against `collection.target`.
     """
-    items = _json_array_items(db, obj, count.array, spec)
+    items = _json_array_items(reader, data, count.array, spec)
     if count.condition is None:
         return len(items)
-    return sum(1 for item in items if evaluate_where(db, item, count.condition, count.element_spec))
+    return sum(1 for item in items if _matches(reader, item, count.condition, count.element_spec))
 
 
 def _like_to_regex(pattern: str) -> re.Pattern:
@@ -458,7 +628,7 @@ def _compare(op: str, left: Any, right: Any) -> Optional[bool]:
     raise ValueError(f"unsupported operator: {op!r}")
 
 
-def _evaluate_tri(db: Any, obj: Any, expr: Any, spec: ObjectTypeSpec) -> Optional[bool]:
+def _evaluate_tri(reader: RecordReader, data: Any, expr: Any, spec: ObjectTypeSpec) -> Optional[bool]:
     """`evaluate_where`'s actual recursion, in SQL's three-valued logic
     (`True`/`False`/`None` for `UNKNOWN`) rather than a plain `bool`.
 
@@ -482,21 +652,21 @@ def _evaluate_tri(db: Any, obj: Any, expr: Any, spec: ObjectTypeSpec) -> Optiona
     if expr is None:
         return True
     if isinstance(expr, And):
-        results = [_evaluate_tri(db, obj, e, spec) for e in expr.exprs]
+        results = [_evaluate_tri(reader, data, e, spec) for e in expr.exprs]
         if any(r is False for r in results):
             return False
         if any(r is None for r in results):
             return None
         return True
     if isinstance(expr, Or):
-        results = [_evaluate_tri(db, obj, e, spec) for e in expr.exprs]
+        results = [_evaluate_tri(reader, data, e, spec) for e in expr.exprs]
         if any(r is True for r in results):
             return True
         if any(r is None for r in results):
             return None
         return False
     if isinstance(expr, Not):
-        result = _evaluate_tri(db, obj, expr.expr, spec)
+        result = _evaluate_tri(reader, data, expr.expr, spec)
         return None if result is None else not result
     if isinstance(expr, Exists):
         # Always a definite True/False, never UNKNOWN -- matching SQL's own
@@ -506,32 +676,21 @@ def _evaluate_tri(db: Any, obj: Any, expr: Any, spec: ObjectTypeSpec) -> Optiona
         # None for.
         collection = expr.collection
         if isinstance(collection, Backlinks):
-            return any(True for _ in _backlink_handles(db, obj, expr.condition))
-        getter = getattr(db, GETTER_BY_TABLE[collection.target.table])
-        for handle in _collection_handles(obj, collection):
-            try:
-                related = getter(handle)
-            except HandleError:
-                continue
-            if collection.self_link_field:
-                entry = _self_linked_entry(related, obj, collection)
-                if entry is None:
-                    continue
-                if expr.condition is None or evaluate_where(db, entry, expr.condition, collection.target):
-                    return True
-            elif expr.condition is None or evaluate_where(db, related, expr.condition, collection.target):
-                return True
-        return False
+            return any(True for _ in _backlink_handles(reader, data, expr.condition))
+        return any(
+            expr.condition is None or _matches(reader, row, expr.condition, row_spec)
+            for row, row_spec in _collection_rows(reader, data, collection)
+        )
     if isinstance(expr, JsonArrayExists):
         # Same "always a definite True/False" reasoning as Exists just
         # above -- an intra-record array with nothing matching (or nothing
         # in it at all) is simply False, not UNKNOWN.
-        items = _json_array_items(db, obj, expr.array, spec)
+        items = _json_array_items(reader, data, expr.array, spec)
         if expr.condition is None:
             return len(items) > 0
-        return any(evaluate_where(db, item, expr.condition, expr.element_spec) for item in items)
+        return any(_matches(reader, item, expr.condition, expr.element_spec) for item in items)
     if isinstance(expr, In):
-        value = resolve_column_ref(db, obj, expr.column, spec)
+        value = _resolve(reader, data, expr.column, spec)
         if value is None:
             return None
         return value in expr.values
@@ -546,20 +705,20 @@ def _evaluate_tri(db: Any, obj: Any, expr: Any, spec: ObjectTypeSpec) -> Optiona
         # is; a missing needle (as opposed to a missing haystack) is just as
         # much "unknown" as a missing haystack, so it collapses to the same
         # `None` (SQL's `LIKE` against a NULL pattern is `UNKNOWN` too).
-        value = resolve_column_ref(db, obj, expr.column, spec)
+        value = _resolve(reader, data, expr.column, spec)
         if value is None:
             return None
         if isinstance(expr.value, (JsonPath, RelatedObject, FlatColumnRef)):
-            substring = resolve_column_ref(db, obj, expr.value, spec)
+            substring = _resolve(reader, data, expr.value, spec)
             if substring is None:
                 return None
         else:
             substring = expr.value
         return str(substring).lower() in str(value).lower()
     if isinstance(expr, Comparison):
-        left = resolve_column_ref(db, obj, expr.column, spec)
+        left = _resolve(reader, data, expr.column, spec)
         if isinstance(expr.value, (JsonPath, RelatedObject, FlatColumnRef)):
-            right = resolve_column_ref(db, obj, expr.value, spec)
+            right = _resolve(reader, data, expr.value, spec)
         else:
             right = expr.value
         return _compare(expr.op, left, right)
@@ -567,9 +726,11 @@ def _evaluate_tri(db: Any, obj: Any, expr: Any, spec: ObjectTypeSpec) -> Optiona
 
 
 def evaluate_where(db: Any, obj: Any, expr: Any, spec: ObjectTypeSpec) -> bool:
-    """`query.py`'s `.compile()` tree, evaluated in Python against a real
-    object instead of rendered as SQL. See module docstring for why no
-    privacy guard is needed here the way `Comparison.compile()` needs one.
+    """`query.py`'s `.compile()` tree, evaluated in Python against a record
+    instead of rendered as SQL. See module docstring for why no privacy
+    guard is needed here the way `Comparison.compile()` needs one.
+
+    `obj` and `db` are as for `resolve_column_ref`.
 
     Delegates the actual recursion to `_evaluate_tri`, which tracks SQL's
     three-valued logic (`True`/`False`/`UNKNOWN`) rather than a plain
@@ -577,4 +738,8 @@ def evaluate_where(db: Any, obj: Any, expr: Any, spec: ObjectTypeSpec) -> bool:
     a SQL `WHERE` clause only keeps rows that are definitely `True`,
     treating `UNKNOWN` the same as `False`.
     """
-    return _evaluate_tri(db, obj, expr, spec) is True
+    return _matches(_reader(db, obj), obj, expr, spec)
+
+
+def _matches(reader: RecordReader, data: Any, expr: Any, spec: ObjectTypeSpec) -> bool:
+    return data is not None and _evaluate_tri(reader, data, expr, spec) is True
