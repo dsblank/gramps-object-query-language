@@ -62,6 +62,7 @@ from gramps_object_query_language.evaluator import (
 )
 from gramps_object_query_language.query import (
     CITATION,
+    EVENT,
     FAMILY,
     NOTE,
     PERSON,
@@ -1748,3 +1749,221 @@ def _assert_sql_and_evaluator_agree(db, handles, spec, keys, where_expr, expecte
     for key in keys:
         actual = evaluate_where(db, get_object(handles[key]), where, spec)
         assert actual == (key in expected), f"{where_expr!r} on {key!r}: eval={actual}"
+
+
+# --- several main-row fields: PostgreSQL parses the row's JSON once ----------
+
+
+@pytest.fixture(scope="module")
+def parse_once_db():
+    """Events and people for queries that read several fields of the main
+    row, which PostgreSQL answers through one parsed copy of the row
+    (`goql_row`) instead of a `json_data::jsonb` cast per field. Mixes in
+    flat columns, relationship hops, lists and missing values, the pieces
+    that sit next to the parsed copy in the same query."""
+    dbman = CLIDbManager(DbState())
+    dirpath, db_name = dbman.create_new_db_cli("_test_evaluator_parse_once", dbid="sqlite")
+    db = make_database("sqlite")
+    db.load(dirpath)
+    handles = {}
+    with DbTxn("setup", db) as trans:
+        place = Place()
+        place.set_title("Chicago")
+        place_handle = db.add_place(place, trans)
+
+        def add_event(key, event_type, date, description, **extra):
+            event = Event()
+            event.set_type(event_type)
+            if date is not None:
+                event.set_date_object(date)
+            event.set_description(description)
+            event.set_gramps_id(key)
+            if extra.get("place"):
+                event.set_place_handle(place_handle)
+            if extra.get("attribute"):
+                attribute = Attribute()
+                attribute.set_value(extra["attribute"])
+                event.add_attribute(attribute)
+            handles[key] = db.add_event(event, trans)
+
+        about = Date(1950, 11, 2)
+        about.set_modifier(Date.MOD_ABOUT)
+        julian = Date()
+        julian.set(Date.QUAL_NONE, Date.MOD_NONE, Date.CAL_JULIAN, (1, 1, 1700, False))
+        yearless = Date()
+        yearless.set_yr_mon_day(0, 11, 5)
+        add_event("e_nov2", EventType.BIRTH, Date(1950, 11, 2), "Birth of Ann", place=True)
+        add_event("e_nov2_about", EventType.BIRTH, about, "Birth of Bob")
+        add_event("e_dec25", EventType.MARRIAGE, Date(1975, 12, 25), "Wedding", attribute="x")
+        add_event("e_julian", EventType.DEATH, julian, "Old death")
+        add_event("e_yearless", EventType.BIRTH, yearless, "Birth, year unknown")
+        add_event("e_nodate", EventType.BIRTH, None, "Undated birth")
+
+        for key, given, surname, gender, birth, other, alternate in (
+            ("p_ann", "Ann", "Smith", Person.FEMALE, "e_nov2", None, False),
+            ("p_bob", "Bob", "Smith", Person.MALE, "e_nov2_about", None, True),
+            ("p_cat", "Cat", "Jones", Person.FEMALE, None, "e_dec25", False),
+            ("p_dan", "Dan", "Brown", Person.UNKNOWN, None, None, False),
+        ):
+            person = Person()
+            person.set_primary_name(_name(given, surname))
+            person.set_gender(gender)
+            if alternate:
+                person.add_alternate_name(_name(given, "Alt"))
+            if birth:
+                ref = _event_ref(handles[birth])
+                person.add_event_ref(ref)
+                person.set_birth_ref(ref)
+            if other:
+                person.add_event_ref(_event_ref(handles[other]))
+            handles[key] = db.add_person(person, trans)
+    yield db, handles
+    db.close()
+    dbman.remove_database(db_name)
+
+
+_PARSE_ONCE_EVENTS = ("e_nov2", "e_nov2_about", "e_dec25", "e_julian", "e_yearless", "e_nodate")
+_PARSE_ONCE_PEOPLE = ("p_ann", "p_bob", "p_cat", "p_dan")
+_EXACT_DAY_AND_MONTH = (
+    "type.value in [EventType.BIRTH, EventType.DEATH, EventType.MARRIAGE]"
+    " and date.modifier == Date.MOD_NONE and date.quality == Date.QUAL_NONE"
+    " and date.calendar == Date.CAL_GREGORIAN"
+    " and date.dateval[0] > 0 and date.dateval[1] > 0"
+)
+
+
+def _assert_parses_main_row_once(spec, where_expr):
+    """Guards the tests below: each where_expr must actually compile to the
+    parsed-once form on PostgreSQL, or it isn't testing it."""
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+    from gramps_object_query_language.query_lang import parse_expr_for_spec, where_list_to_ast
+
+    where = where_list_to_ast(parse_expr_for_spec(spec, where_expr), spec)
+    sql, _ = compile_query(spec, Query(select=["handle"], where=where), dialect=Dialect.POSTGRESQL)
+    assert "goql_row" in sql, where_expr
+
+
+@pytest.mark.parametrize(
+    "where_expr, expected",
+    [
+        (
+            "type.value == EventType.BIRTH and date.modifier == Date.MOD_NONE"
+            " and date.dateval[1] == 11",
+            {"e_nov2", "e_yearless"},
+        ),
+        (_EXACT_DAY_AND_MONTH, {"e_nov2", "e_dec25", "e_yearless"}),
+        (
+            "(date.dateval[1] == 12 or date.dateval[0] == 2)"
+            " and not (date.modifier == Date.MOD_ABOUT)",
+            {"e_nov2", "e_dec25"},
+        ),
+        (
+            "date.calendar != Date.CAL_GREGORIAN or date.dateval[2] == 0",
+            {"e_julian", "e_yearless", "e_nodate"},
+        ),
+        (
+            "date.calendar == Date.CAL_JULIAN and date.dateval[1] == 1 and date.dateval[0] == 1",
+            {"e_julian"},
+        ),
+        # beside a relationship hop, whose own json_data is its own row's
+        (
+            "place.title == 'Chicago' and date.dateval[1] == 11"
+            " and type.value == EventType.BIRTH",
+            {"e_nov2"},
+        ),
+        # beside a flat column (not `description`: SharedPostgreSQL's real
+        # column is desc_ription, which _rows_on_postgresql's copies lack)
+        (
+            "like(gramps_id, 'e_nov2%') and date.dateval[1] == 11"
+            " and date.modifier == Date.MOD_ABOUT",
+            {"e_nov2_about"},
+        ),
+        # beside len() and any() of the row's own lists
+        (
+            "len(citation_list) == 0 and date.dateval[2] > 1900 and date.dateval[1] > 0",
+            {"e_nov2", "e_nov2_about", "e_dec25"},
+        ),
+        (
+            "any(attribute_list, value == 'x')"
+            " or (date.calendar == Date.CAL_JULIAN and date.dateval[2] == 1700)",
+            {"e_dec25", "e_julian"},
+        ),
+    ],
+)
+def test_sql_and_evaluator_agree_parsing_events_once(parse_once_db, pg_conn, where_expr, expected):
+    db, handles = parse_once_db
+    _assert_parses_main_row_once(EVENT, where_expr)
+    _assert_sql_and_evaluator_agree(
+        db, handles, EVENT, _PARSE_ONCE_EVENTS, where_expr, expected, pg_conn
+    )
+
+
+@pytest.mark.parametrize(
+    "where_expr, expected",
+    [
+        ("primary_name.first_name == 'Ann' and len(alternate_names) == 0", {"p_ann"}),
+        (
+            "primary_name.surname_list[0].surname == 'Smith' and len(alternate_names) > 0",
+            {"p_bob"},
+        ),
+        (
+            "gender == Person.FEMALE and primary_name.surname_list[0].surname == 'Jones'"
+            " and primary_name.first_name != ''",
+            {"p_cat"},
+        ),
+        # beside a hop through birth_ref_index into the event table
+        (
+            "birth.date.dateval[1] == 11 and primary_name.first_name in ['Ann', 'Bob']"
+            " and primary_name.surname_list[0].surname == 'Smith'",
+            {"p_ann", "p_bob"},
+        ),
+        (
+            "any(event_ref_list, role.value == 1) and primary_name.first_name != 'Ann'"
+            " and len(alternate_names) == 0",
+            {"p_cat"},
+        ),
+        # a missing birth (the hop finds no row) next to main-row fields
+        (
+            "(birth.date.dateval[1] == 0 or primary_name.first_name == 'Dan')"
+            " and len(alternate_names) == 0",
+            {"p_dan"},
+        ),
+    ],
+)
+def test_sql_and_evaluator_agree_parsing_people_once(parse_once_db, pg_conn, where_expr, expected):
+    db, handles = parse_once_db
+    _assert_parses_main_row_once(PERSON, where_expr)
+    _assert_sql_and_evaluator_agree(
+        db, handles, PERSON, _PARSE_ONCE_PEOPLE, where_expr, expected, pg_conn
+    )
+
+
+@pytest.mark.parametrize("limit", [None, 2])
+def test_order_by_and_count_agree_parsing_once(parse_once_db, pg_conn, limit):
+    """ORDER BY and LIMIT over the parsed copy, and a count query (which uses
+    it only from four field references up), give the same answer on SQLite
+    and PostgreSQL as the expected order."""
+    from gramps_object_query_language.query import (
+        Dialect, OrderBy, Query, compile_count_query, compile_query,
+    )
+    from gramps_object_query_language.query_lang import parse_expr_for_spec, where_list_to_ast
+
+    db, handles = parse_once_db
+    where = where_list_to_ast(parse_expr_for_spec(EVENT, _EXACT_DAY_AND_MONTH), EVENT)
+    order_by = [OrderBy("date.dateval[1]"), OrderBy("date.dateval[0]"), OrderBy("date.dateval[2]", "desc")]
+    query = Query(select=["handle"], where=where, order_by=order_by, limit=limit)
+    expected = [handles[key] for key in ("e_nov2", "e_yearless", "e_dec25")][:limit]
+
+    sql, params = compile_query(EVENT, query, dialect=Dialect.SQLITE)
+    db.dbapi.execute(sql, params)
+    assert [row[0] for row in db.dbapi.fetchall()] == expected, "SQLite"
+    count_sql, count_params = compile_count_query(EVENT, Query(where=where), dialect=Dialect.SQLITE)
+    db.dbapi.execute(count_sql, count_params)
+    assert db.dbapi.fetchall()[0][0] == 3, "SQLite count"
+
+    sql, params = compile_query(EVENT, query, dialect=Dialect.POSTGRESQL)
+    count_sql, count_params = compile_count_query(EVENT, Query(where=where), dialect=Dialect.POSTGRESQL)
+    assert "goql_row" in sql and "goql_row" in count_sql
+    if pg_conn is not None:
+        assert [row[0] for row in _rows_on_postgresql(pg_conn, db, sql, params)] == expected, "PostgreSQL"
+        assert _rows_on_postgresql(pg_conn, db, count_sql, count_params)[0][0] == 3, "PostgreSQL count"
