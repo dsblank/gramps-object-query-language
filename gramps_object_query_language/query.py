@@ -119,6 +119,70 @@ def _sql_table(spec: ObjectTypeSpec) -> str:
     return spec.sql_alias or spec.table
 
 
+#: PostgreSQL only: the main row's `json_data`, parsed to `jsonb` once per
+#: row by a `LATERAL` join (see `_from_clause`). `json_data` is stored as
+#: `TEXT`, and PostgreSQL does not share one `json_data::jsonb` cast between
+#: expressions: every field reference re-parsed the row's JSON, about 0.6 s
+#: per reference over 330k events, so a ten-field query took 5 s.
+_PG_ROW_ALIAS = "goql_row"
+_PG_ROW_JSONB = f"{_PG_ROW_ALIAS}.json_data_jsonb"
+
+#: One reference is one parse either way, so the join saves nothing there,
+#: and PostgreSQL can plan it worse (`date.sortval == X ORDER BY handle`
+#: over 330k events went serial: 1.9 s vs 0.65 s). From two up it wins.
+_PG_QUERY_LATERAL_MIN_REFS = 2
+
+#: A count query has no `ORDER BY ... LIMIT`, and without one PostgreSQL
+#: plans the `LATERAL` form serially, so it only pays off once enough
+#: per-reference parses are saved to beat the lost parallel workers
+#: (measured on 330k events: 4 references, 2.25 s vs 2.45 s).
+_PG_COUNT_LATERAL_MIN_REFS = 4
+
+
+def _pg_jsonb(base_column: str) -> str:
+    """`base_column` as `jsonb` on PostgreSQL. A bare `json_data` is always
+    the main row's own (a relationship hop's or a collection target's is
+    qualified with its alias, see `_render_related_object`/
+    `_qualify_json_path`), so it reads the once-per-row parsed copy;
+    anything else (`je.value`, `person__hop0.json_data`) is cast in place.
+    `_from_clause` turns the parsed copy back into a plain cast when it
+    decides against the `LATERAL` join."""
+    if base_column == "json_data":
+        return _PG_ROW_JSONB
+    return f"{base_column}::jsonb"
+
+
+def _from_clause(
+    spec: ObjectTypeSpec, dialect: Optional[Dialect], body_sql: str, min_refs: int
+) -> Tuple[str, bool]:
+    """The main query's `FROM`, and whether it carries the `LATERAL` join.
+
+    On PostgreSQL, when `body_sql` (the rest of the statement) reads the
+    main row's JSON at least `min_refs` times, it joins
+    `jsonb_extract_path(json_data::jsonb, VARIADIC '{}')` -- the row's whole
+    document, parsed once. A function in `FROM` is evaluated once per row
+    and never inlined back into each expression, and unlike a
+    `(SELECT ... OFFSET 0)` fence it doesn't stop parallel workers. A query
+    on flat columns only gets no join, since it would parse every row's JSON
+    for nothing; the caller then rewrites `_PG_ROW_JSONB` back to a plain
+    cast (see `_finish_pg_row_json`)."""
+    refs = body_sql.count(_PG_ROW_JSONB)
+    if dialect == Dialect.POSTGRESQL and refs and refs >= min_refs:
+        return (
+            f"{spec.table} CROSS JOIN LATERAL "
+            f"jsonb_extract_path({spec.table}.json_data::jsonb, VARIADIC '{{}}'::text[]) "
+            f"AS {_PG_ROW_ALIAS}(json_data_jsonb)",
+            True,
+        )
+    return spec.table, False
+
+
+def _finish_pg_row_json(sql: str, lateral: bool) -> str:
+    """Without the `LATERAL` join, main-row references go back to the
+    plain per-expression cast they always were."""
+    return sql if lateral else sql.replace(_PG_ROW_JSONB, "json_data::jsonb")
+
+
 def _spec_for(
     cls: type[TableObject], extra_columns: frozenset[str] = frozenset()
 ) -> ObjectTypeSpec:
@@ -1280,13 +1344,13 @@ def _render_json_path(
         placeholders = ", ".join(["?"] * len(path.segments))
         params = [str(segment) for segment in path.segments]
         if isinstance(value, bool):
-            extract = f"jsonb_extract_path({path.base_column}::jsonb, {placeholders})"
+            extract = f"jsonb_extract_path({_pg_jsonb(path.base_column)}, {placeholders})"
             return f"CAST({extract} AS BOOLEAN)", params
         if isinstance(value, (int, float)):
-            extract = f"jsonb_extract_path({path.base_column}::jsonb, {placeholders})"
+            extract = f"jsonb_extract_path({_pg_jsonb(path.base_column)}, {placeholders})"
             return f"CAST({extract} AS NUMERIC)", params
         return (
-            f"jsonb_extract_path_text({path.base_column}::jsonb, {placeholders})",
+            f"jsonb_extract_path_text({_pg_jsonb(path.base_column)}, {placeholders})",
             params,
         )
     raise QueryError(f"unsupported dialect: {dialect!r}")
@@ -1317,7 +1381,7 @@ def _render_length_of_json_path(path: JsonPath, dialect: Dialect) -> Tuple[str, 
     if dialect == Dialect.POSTGRESQL:
         placeholders = ", ".join(["?"] * len(path.segments))
         params = [str(segment) for segment in path.segments]
-        extract = f"jsonb_extract_path({path.base_column}::jsonb, {placeholders})"
+        extract = f"jsonb_extract_path({_pg_jsonb(path.base_column)}, {placeholders})"
         return (
             f"CASE WHEN jsonb_typeof({extract}) = 'array' "
             f"THEN jsonb_array_length({extract}) ELSE 0 END",
@@ -1516,9 +1580,20 @@ def _render_related_object(
             related.field, target_alias, dialect, treeid, value, _depth=_depth + 1
         )
     elif isinstance(related.field, JsonPath):
-        field_sql, field_params = _render_json_path(related.field, dialect, value)
+        field = related.field
+        if dialect == Dialect.POSTGRESQL and field.base_column == "json_data":
+            # The hop's own row, not the main row (see `_pg_jsonb`).
+            field = replace(field, base_column=f"{target_alias}.json_data")
+        field_sql, field_params = _render_json_path(field, dialect, value)
     elif isinstance(related.field, Length):
-        field_sql, field_params = _render_length(related.field, dialect)
+        field = related.field
+        if (
+            dialect == Dialect.POSTGRESQL
+            and isinstance(field.inner, JsonPath)
+            and field.inner.base_column == "json_data"
+        ):
+            field = replace(field, inner=replace(field.inner, base_column=f"{target_alias}.json_data"))
+        field_sql, field_params = _render_length(field, dialect)
     else:
         _check_column(related.field, related.target.columns)
         field_sql, field_params = _quote_column(related.field, dialect), []
@@ -3104,7 +3179,9 @@ def compile_query(
         order_parts.append(f"{order_sql} {_order_direction_sql(ob, dialect)}")
         order_params.extend(p)
 
-    sql = f"SELECT {', '.join(select_parts)} FROM {spec.table}"
+    body_sql = ", ".join(select_parts) + " ".join(where_clauses) + ", ".join(order_parts)
+    from_sql, lateral = _from_clause(spec, dialect, body_sql, min_refs=_PG_QUERY_LATERAL_MIN_REFS)
+    sql = f"SELECT {', '.join(select_parts)} FROM {from_sql}"
     if where_clauses:
         sql += " WHERE " + " AND ".join(where_clauses)
     sql += " ORDER BY " + ", ".join(order_parts)
@@ -3112,6 +3189,7 @@ def compile_query(
     if query.limit is not None:
         sql += " LIMIT ?"
         params.append(query.limit)
+    sql = _finish_pg_row_json(sql, lateral)
 
     _check_bindings(sql, params, "compiled query")
     return sql, params
@@ -3141,9 +3219,13 @@ def compile_count_query(
     would.
     """
     where_clauses, params = _where_clauses(spec, query.where, dialect, treeid, collation)
-    sql = f"SELECT COUNT(*) FROM {spec.table}"
+    from_sql, lateral = _from_clause(
+        spec, dialect, " ".join(where_clauses), min_refs=_PG_COUNT_LATERAL_MIN_REFS
+    )
+    sql = f"SELECT COUNT(*) FROM {from_sql}"
     if where_clauses:
         sql += " WHERE " + " AND ".join(where_clauses)
+    sql = _finish_pg_row_json(sql, lateral)
     _check_bindings(sql, params, "compiled count query")
     return sql, params
 

@@ -558,7 +558,7 @@ def test_related_object_postgresql_shape():
     sql, params = compile_query(
         PERSON, Query(select=["handle", BIRTH_DATE], limit=10), dialect=Dialect.POSTGRESQL
     )
-    assert "jsonb_extract_path_text(json_data::jsonb, ?)" in sql
+    assert "jsonb_extract_path_text(event__hop0.json_data::jsonb, ?)" in sql
     assert (
         "person.json_data::jsonb -> 'event_ref_list' -> person.birth_ref_index ->> 'ref'"
         in sql
@@ -719,7 +719,7 @@ def test_related_object_sortval_where_postgresql_numeric_cast():
         Query(select=["handle"], where=Gte(BIRTH_DATE_SORTVAL, 2439857)),
         dialect=Dialect.POSTGRESQL,
     )
-    assert "CAST(jsonb_extract_path(json_data::jsonb, ?, ?) AS NUMERIC)" in sql
+    assert "CAST(jsonb_extract_path(event__hop0.json_data::jsonb, ?, ?) AS NUMERIC)" in sql
     assert "jsonb_extract_path_text" not in sql
     assert params[:2] == ["date", "sortval"]
 
@@ -730,7 +730,7 @@ def test_related_object_sortval_select_unaffected_by_where_addition():
     sql, params = compile_query(
         PERSON, Query(select=["handle", BIRTH_DATE]), dialect=Dialect.POSTGRESQL
     )
-    assert "jsonb_extract_path_text(json_data::jsonb, ?)" in sql
+    assert "jsonb_extract_path_text(event__hop0.json_data::jsonb, ?)" in sql
     assert "CAST" not in sql
 
 
@@ -821,7 +821,9 @@ def test_field_vs_field_postgresql_numeric_cast_both_sides():
     # cast (via a dummy int hint, since there's no literal runtime value
     # to infer it from) -- not the default TEXT extraction, which would
     # compare lexicographically.
-    assert sql.count("CAST(jsonb_extract_path(json_data::jsonb, ?, ?) AS NUMERIC)") == 2
+    assert sql.count("CAST(jsonb_extract_path(event__hop1.json_data::jsonb, ?, ?) AS NUMERIC)") == 2
+    # Nothing reads the family's own JSON, so no LATERAL parse of it.
+    assert "LATERAL" not in sql
     assert "jsonb_extract_path_text" not in sql
 
 
@@ -834,7 +836,7 @@ def test_field_vs_field_equality_stays_text_both_sides():
         Query(select=["handle"], where=Eq(MOTHER_DEATH_SORTVAL, FATHER_DEATH_SORTVAL)),
         dialect=Dialect.POSTGRESQL,
     )
-    assert sql.count("jsonb_extract_path_text(json_data::jsonb, ?, ?)") == 2
+    assert sql.count("jsonb_extract_path_text(event__hop1.json_data::jsonb, ?, ?)") == 2
     assert "CAST" not in sql
 
 
@@ -2332,8 +2334,8 @@ def test_length_postgresql_shape():
         PERSON, Query(select=["handle"], where=Gt(ref, 0)), dialect=Dialect.POSTGRESQL
     )
     assert (
-        "CASE WHEN jsonb_typeof(jsonb_extract_path(json_data::jsonb, ?)) = 'array' "
-        "THEN jsonb_array_length(jsonb_extract_path(json_data::jsonb, ?)) ELSE 0 END > ?" in sql
+        "CASE WHEN jsonb_typeof(jsonb_extract_path(goql_row.json_data_jsonb, ?)) = 'array' "
+        "THEN jsonb_array_length(jsonb_extract_path(goql_row.json_data_jsonb, ?)) ELSE 0 END > ?" in sql
     )
     assert params == ["attribute_list", "attribute_list", 0, 50]
 
@@ -3642,3 +3644,53 @@ def test_sort_cost_benchmark_still_runs():
         assert elapsed_ms >= 0
         assert plan, f"no query plan for {column}"
         assert module.walk_pages(conn, column, pages=2, size=5) >= 0
+
+
+def test_postgresql_parses_main_row_json_once():
+    """Every main-row path reads one LATERAL-parsed jsonb copy instead of
+    casting json_data again per expression (PostgreSQL re-parses the TEXT
+    for each cast), while a relationship hop reads its own aliased row."""
+    spec, where = compile_expr(
+        "event",
+        "date.dateval[1] == 11 and date.dateval[0] >= 1 and type.value == EventType.BIRTH",
+    )
+    sql, params = compile_query(
+        spec,
+        Query(select=["handle", "place.name.value"], where=where, order_by=[OrderBy("date.dateval[2]")]),
+        dialect=Dialect.POSTGRESQL,
+    )
+    assert (
+        "FROM event CROSS JOIN LATERAL "
+        "jsonb_extract_path(event.json_data::jsonb, VARIADIC '{}'::text[]) AS goql_row(json_data_jsonb)"
+        in sql
+    )
+    assert sql.count("event.json_data::jsonb") == 1
+    assert sql.count("goql_row.json_data_jsonb") == 4
+    assert "place__hop0.json_data::jsonb" in sql
+    assert " json_data::jsonb" not in sql and "(json_data::jsonb" not in sql
+
+    # A count reading the main row's JSON only three times keeps the plain
+    # casts (see _PG_COUNT_LATERAL_MIN_REFS); four or more gets the join.
+    count_sql, _ = compile_count_query(spec, Query(where=where), dialect=Dialect.POSTGRESQL)
+    assert "LATERAL" not in count_sql and "goql_row" not in count_sql
+    assert count_sql.count("(json_data::jsonb") == 3
+    spec4, where4 = compile_expr(
+        "event",
+        "date.dateval[1] == 11 and date.dateval[0] >= 1 and type.value == EventType.BIRTH"
+        " and date.modifier == Date.MOD_NONE",
+    )
+    count4_sql, _ = compile_count_query(spec4, Query(where=where4), dialect=Dialect.POSTGRESQL)
+    assert "CROSS JOIN LATERAL" in count4_sql and count4_sql.count("goql_row.json_data_jsonb") == 4
+
+    sqlite_sql, _ = compile_query(spec, Query(select=["handle"], where=where), dialect=Dialect.SQLITE)
+    assert "LATERAL" not in sqlite_sql
+
+    # One main-row reference is one parse either way: plain cast, no join.
+    one_spec, one_where = compile_expr("event", "date.sortval == 2459034")
+    one_sql, _ = compile_query(one_spec, Query(select=["handle"], where=one_where), dialect=Dialect.POSTGRESQL)
+    assert "LATERAL" not in one_sql and one_sql.count("(json_data::jsonb") == 1
+
+    # Flat columns only: no LATERAL, so no per-row JSON parse at all.
+    flat_spec, flat_where = compile_expr("event", "private == False and gramps_id == 'E1'")
+    flat_sql, _ = compile_query(flat_spec, Query(select=["handle"], where=flat_where), dialect=Dialect.POSTGRESQL)
+    assert "LATERAL" not in flat_sql and "jsonb" not in flat_sql
