@@ -845,6 +845,100 @@ tree's own custom type values (e.g. a `PlaceType` of "Ranch" someone typed
 in), which have no fixed constant to name; only `.CUSTOM` identifies "this
 is a custom one," not which.
 
+## Values passed in: `Env`
+
+`Env.NAME` is a value supplied by whoever runs the expression, rather than
+written into it -- the person a user calls "home", the records they've
+bookmarked, a cutoff date. Pass them as `env` to `parse_expr`,
+`parse_expr_for_spec`, `compile_expr` or `compile_expr_for_spec`:
+
+```python
+compile_expr("Person", "handle == Env.HOME_PERSON", env={"HOME_PERSON": "GNUJQCL9MD64AM56OH"})
+compile_expr("Family", "father.handle == Env.HOME or mother.handle == Env.HOME", env={"HOME": "GNUJQCL9MD64AM56OH"})
+compile_expr("Event", "handle in Env.BOOKMARKS", env={"BOOKMARKS": ["a1b2...", "c3d4..."]})
+compile_expr("Note", "Env.WORD in text.string", env={"WORD": "census"})
+```
+
+```python
+Person "handle == Env.HOME_PERSON"
+Person "handle in Env.BOOKMARKS"
+Person "handle not in Env.BOOKMARKS"
+Family "father.handle == Env.HOME or mother.handle == Env.HOME"
+```
+
+An `Env` value can go anywhere a literal can: either side of a comparison,
+in a substring test, as a `like`/`regex` pattern, inside `any(...)`. A
+value is a string, number, boolean or `None`; a list (or tuple) of those
+is for `in`. It's a value, never parsed as part of the expression, so a
+string holding quotes or GOQL needs no escaping, and on the SQL side it's
+a bound parameter like any other literal.
+
+An empty list is allowed, unlike a literal `[]`: `handle in Env.BOOKMARKS`
+with no bookmarks matches nothing, and `handle not in Env.BOOKMARKS`
+matches everything (even a record whose field is missing -- an empty list
+is plain false, not unknown).
+
+`Env` is capitalized like the constant classes above, so it can't be
+mistaken for a field: no Gramps field starts with a capital letter. A
+name that isn't in `env` is an error naming the ones that are; names are
+case-sensitive. Using a list where a single value belongs
+(`handle == Env.BOOKMARKS`), or a single value with `in`
+(`handle in Env.HOME`), is an error that says which one it is.
+
+### What to pass in
+
+GOQL defines no `Env` names of its own: each app chooses which ones it
+supplies, and an expression only has to use names the `env` passed with it
+has. Some that make a saved expression more useful, because they're true
+when it runs rather than when it was written:
+
+- **The user's own reference points** -- a home person, the database's
+  default person, a home place, a tag the team uses for "to do":
+
+  ```python
+  Family "father.handle == Env.HOME_PERSON or mother.handle == Env.HOME_PERSON"
+  Event "place.handle == Env.HOME_PLACE"
+  Person "any(t.name == Env.TODO_TAG for t in tags)"
+  ```
+
+- **What the user is looking at** -- the active record, the current
+  selection, bookmarks, recently visited records. The same saved expression
+  then works on whatever is selected:
+
+  ```python
+  Family "any(c.handle == Env.ACTIVE for c in children)"
+  Person "handle in Env.SELECTION and len(citations) == 0"
+  Note "handle not in Env.VISITED"
+  ```
+
+- **Points in time GOQL can't compute** -- there's no date arithmetic, so a
+  relative cutoff is passed in ready-made: when the user last looked (in
+  seconds, the same scale as `change`), or a date sort value such as
+  "110 years ago" for a rough "possibly living" check:
+
+  ```python
+  Person "change >= Env.LAST_VISIT"
+  Person "birth.date.sortval > Env.LIVING_CUTOFF and death.date.sortval == 0"
+  ```
+
+  For today itself, `Date('today')` already works -- see [Dates](#dates).
+
+- **Sets GOQL can't work out** -- there's no recursion, so ancestors,
+  descendants or relatives within a few steps can be computed by the
+  caller and passed as a handle list:
+
+  ```python
+  Person "handle in Env.ANCESTORS and len(citations) == 0"
+  ```
+
+  A large tree can make that list long; computing it next to the database
+  is cheaper than in a client.
+
+Values like a home person, the selection or the last visit differ per
+user, so one saved expression can find different records for different
+people. Apps that want to share saved expressions should agree on names
+for the values they have in common.
+
 ## Dates
 
 `Date('...')` parses a human-readable date string with Gramps' own date
@@ -853,6 +947,16 @@ day number) -- so it can be compared with the ordinary numeric operators:
 
 ```python
 Person "birth.date.sortval >= Date('Jan 1, 1968')"
+```
+
+`Date('today')` is today's date, worked out each time the expression is
+compiled, so a saved expression that uses it stays relative to the day it
+runs. The parser only knows today itself: offsets such as "1 year ago"
+don't parse, and neither does a time ("now") -- pass a ready-made value in
+[`Env`](#values-passed-in-env) for those.
+
+```python
+Person "birth.date.sortval > Date('today')"
 ```
 
 `sortval` is a bare point on the calendar; it drops the date's modifier
@@ -1057,7 +1161,7 @@ sql, params = compile_query(spec, Query(select=["handle"], where=where), dialect
 rows = connection.execute(sql, params).fetchall()
 ```
 
-`compile_expr(namespace, expr)` parses and translates a `where_expr` string
+`compile_expr(namespace, expr, env=None)` parses and translates a `where_expr` string
 in one step, returning the matching `ObjectTypeSpec` alongside a `where` AST
 ready for `compile_query`/`compile_count_query`. If you only need the
 intermediate JSON shape (e.g. to send over an HTTP API as a `where_expr`

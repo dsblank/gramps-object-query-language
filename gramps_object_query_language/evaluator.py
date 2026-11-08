@@ -690,6 +690,8 @@ def _evaluate_tri(reader: RecordReader, data: Any, expr: Any, spec: ObjectTypeSp
             return len(items) > 0
         return any(_matches(reader, item, expr.condition, expr.element_spec) for item in items)
     if isinstance(expr, In):
+        if not expr.values:
+            return False  # matches nothing, even a missing value -- see In
         value = _resolve(reader, data, expr.column, spec)
         if value is None:
             return None
