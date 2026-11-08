@@ -1030,15 +1030,15 @@ compile_query(PERSON, Query(select=["handle", "birth.place.title"]), dialect=Dia
 
 ## Sorting: the same paths in `order_by`
 
-An `order_by` entry is a column reference written the same way, followed by
-`asc` or `desc` (either case; `asc` if left off). `parse_order_by` turns a
-list of them, most significant first, into `OrderBy`s for `Query`:
+An `order_by` entry is a column reference written the same way, sorted
+ascending, or descending with a leading `-`. `parse_order_by` turns a list of
+them, most significant first, into `OrderBy`s for `Query`:
 
 ```python
 from gramps_object_query_language.query_lang import parse_order_by
 
-parse_order_by(PERSON, ["surname", "given_name", "birth.date.sortval desc"])
-parse_order_by(FAMILY, ["len(child_ref_list) desc"])
+parse_order_by(PERSON, ["surname", "given_name", "-birth.date.sortval"])
+parse_order_by(FAMILY, ["-len(child_ref_list)"])
 ```
 
 Anything a `select` entry can name works here: a flat column, a path, a

@@ -1693,23 +1693,22 @@ def parse_order_by_entry(spec: ObjectTypeSpec, entry: str) -> OrderBy:
 
     The entry is a column reference written as it would be in `select` --
     a flat column (`surname`), a path (`birth.date.sortval`), or a
-    `count(...)`/`len(...)` -- optionally followed by `asc` or `desc`
-    (either case; `asc` if omitted):
+    `count(...)`/`len(...)` -- sorted ascending, or descending with a
+    leading `-`:
 
     >>> from gramps_object_query_language.query import PERSON
-    >>> parse_order_by_entry(PERSON, "birth.date.sortval desc")
+    >>> parse_order_by_entry(PERSON, "-birth.date.sortval")
     OrderBy(column=RelatedObject(...), direction='desc')
 
     An `as` alias means nothing for a sort, so it's rejected rather than
     ignored.
     """
     text = entry.strip()
-    if not text:
-        raise QueryLangError("empty order_by entry")
     direction = "asc"
-    head, _, last = text.rpartition(" ")
-    if head and last.lower() in ("asc", "desc"):
-        text, direction = head.strip(), last.lower()
+    if text.startswith("-"):
+        text, direction = text[1:].strip(), "desc"
+    if not text:
+        raise QueryLangError(f"empty order_by entry {entry!r}")
     if _SELECT_ALIAS_SEPARATOR in f" {text} ":
         raise QueryLangError(f"invalid order_by entry {entry!r}: 'as' has no meaning in order_by")
     try:
@@ -1728,7 +1727,7 @@ def parse_order_by(spec: ObjectTypeSpec, entries: Sequence[str]) -> List[OrderBy
     most significant first, ready for `Query(order_by=...)`.
 
     >>> from gramps_object_query_language.query import PERSON
-    >>> parse_order_by(PERSON, ["surname", "given_name", "birth.date.sortval desc"])
+    >>> parse_order_by(PERSON, ["surname", "given_name", "-birth.date.sortval"])
     """
     return [parse_order_by_entry(spec, entry) for entry in entries]
 
