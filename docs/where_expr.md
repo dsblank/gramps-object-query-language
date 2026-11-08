@@ -1028,11 +1028,30 @@ Three details are specific to `select`:
 compile_query(PERSON, Query(select=["handle", "birth.place.title"]), dialect=Dialect.SQLITE)
 ```
 
-Paths work in `order_by` too:
+## Sorting: the same paths in `order_by`
+
+An `order_by` entry is a column reference written the same way, sorted
+ascending, or descending with a leading `-`. `parse_order_by` turns a list of
+them, most significant first, into `OrderBy`s for `Query`:
+
+```python
+from gramps_object_query_language.query_lang import parse_order_by
+
+parse_order_by(PERSON, ["surname", "given_name", "-birth.date.sortval"])
+parse_order_by(FAMILY, ["-len(child_ref_list)"])
+```
+
+Anything a `select` entry can name works here: a flat column, a path, a
+relationship path, `count(...)` or `len(...)`. `as` has no meaning in a sort,
+so it's an error, as is a comparison (`birth.date.sortval > 0`). Sorting by a
+path costs what selecting it does; see [What sorting costs](#what-sorting-costs)
+below.
+
+Built by hand, the same sort is:
 
 ```python
 Query(select=["handle", "birth.date.sortval"],
-      order_by=[OrderBy("birth.date.sortval", "asc")])
+      order_by=[OrderBy("birth.date.sortval", "desc")])
 ```
 
 Keyset pagination (`after`) works with it, but the cursor row's values can't

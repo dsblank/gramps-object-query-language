@@ -168,6 +168,7 @@ from .query import (
     Lte,
     Ne,
     Not,
+    OrderBy,
     ObjectTypeSpec,
     Or,
     QueryError,
@@ -1685,6 +1686,50 @@ def parse_select_entry(spec: ObjectTypeSpec, entry: str) -> Tuple[SelectRef, str
         # derived name like `events_count` would not). An explicit
         # `as <key>` is still the way to get a tidy name.
         return ref, " ".join(text.split())
+
+
+def parse_order_by_entry(spec: ObjectTypeSpec, entry: str) -> OrderBy:
+    """Parse one `order_by` entry string into an `OrderBy`.
+
+    The entry is a column reference written as it would be in `select` --
+    a flat column (`surname`), a path (`birth.date.sortval`), or a
+    `count(...)`/`len(...)` -- sorted ascending, or descending with a
+    leading `-`:
+
+    >>> from gramps_object_query_language.query import PERSON
+    >>> parse_order_by_entry(PERSON, "-birth.date.sortval")
+    OrderBy(column=RelatedObject(...), direction='desc')
+
+    An `as` alias means nothing for a sort, so it's rejected rather than
+    ignored.
+    """
+    text = entry.strip()
+    direction = "asc"
+    if text.startswith("-"):
+        text, direction = text[1:].strip(), "desc"
+    if not text:
+        raise QueryLangError(f"empty order_by entry {entry!r}")
+    if _SELECT_ALIAS_SEPARATOR in f" {text} ":
+        raise QueryLangError(f"invalid order_by entry {entry!r}: 'as' has no meaning in order_by")
+    try:
+        node = ast.parse(text, mode="eval").body
+    except SyntaxError as error:
+        raise QueryLangError(f"could not parse order_by entry {entry!r}: {error}") from error
+    try:
+        ref = json_column_to_ref(_translate_column_or_computed(node, spec), spec)
+    except (QueryLangError, QueryError) as error:
+        raise QueryLangError(f"invalid order_by entry {entry!r}: {error}") from error
+    return OrderBy(ref, direction)
+
+
+def parse_order_by(spec: ObjectTypeSpec, entries: Sequence[str]) -> List[OrderBy]:
+    """Parse an `order_by` list of entry strings (see `parse_order_by_entry`),
+    most significant first, ready for `Query(order_by=...)`.
+
+    >>> from gramps_object_query_language.query import PERSON
+    >>> parse_order_by(PERSON, ["surname", "given_name", "-birth.date.sortval"])
+    """
+    return [parse_order_by_entry(spec, entry) for entry in entries]
 
 
 def parse_select(

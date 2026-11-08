@@ -27,6 +27,8 @@ from gramps_object_query_language.query_lang import (
     compile_expr,
     compile_expr_for_spec,
     parse_expr,
+    parse_order_by,
+    parse_order_by_entry,
     parse_select,
     parse_select_entry,
     resolve_namespace,
@@ -48,6 +50,7 @@ from gramps_object_query_language.query import (
     Lt,
     Not,
     Or,
+    OrderBy,
     RelatedObject,
     Regex,
     QueryError,
@@ -2391,6 +2394,68 @@ def test_parse_select_output_feeds_compile_query():
     )
     assert [key for _, key in parsed] == ["handle", "birthplace"]
     assert sql.startswith("SELECT handle, (SELECT (SELECT title FROM place")
+
+
+# --- parse_order_by -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "entry,direction",
+    [("surname", "asc"), ("-surname", "desc"), ("  - surname ", "desc")],
+)
+def test_parse_order_by_direction(entry, direction):
+    assert parse_order_by_entry(PERSON, entry) == OrderBy("surname", direction)
+
+
+def test_parse_order_by_resolves_same_ref_as_select():
+    """A sort column means what the same text means in `select`."""
+    for text in ["birth.date.sortval", "primary_name.surname_list[0].surname", "count(events)", "len(event_ref_list)"]:
+        ref, _ = parse_select_entry(PERSON, f"{text} as k")
+        assert parse_order_by_entry(PERSON, f"-{text}") == OrderBy(ref, "desc")
+    assert isinstance(parse_order_by_entry(FAMILY, "father.surname").column, RelatedObject)
+
+
+def test_parse_order_by_column_named_desc():
+    """Media has a real `desc` column; a sort keyword would have made it
+    ambiguous, `-` doesn't."""
+    from gramps_object_query_language.query import MEDIA
+
+    assert parse_order_by(MEDIA, ["desc", "-desc"]) == [OrderBy("desc", "asc"), OrderBy("desc", "desc")]
+
+
+def test_parse_order_by_keeps_list_order():
+    assert parse_order_by(PERSON, ["surname", "-given_name"]) == [
+        OrderBy("surname", "asc"), OrderBy("given_name", "desc"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    ["", "   ", "-", "--surname", "nope", "-nope", "surname as s", "surname desc", "+surname",
+     "birth.date.sortval > 0"],
+)
+def test_parse_order_by_rejects_malformed_entry(entry):
+    with pytest.raises(QueryLangError):
+        parse_order_by(PERSON, [entry])
+
+
+def test_parse_order_by_end_to_end_sqlite_execution():
+    import json
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE family (handle TEXT, json_data TEXT)")
+    for handle, kids in [("two", 2), ("none", 0), ("three", 3)]:
+        conn.execute(
+            "INSERT INTO family VALUES (?, ?)",
+            (handle, json.dumps({"child_ref_list": [{"ref": f"c{i}"} for i in range(kids)]})),
+        )
+    order_by = parse_order_by(FAMILY, ["-len(child_ref_list)"])
+    sql, params = compile_query(FAMILY, Query(select=["handle"], order_by=order_by), dialect=Dialect.SQLITE)
+    assert [row[0] for row in conn.execute(sql, params)] == ["three", "two", "none"]
+    order_by = parse_order_by(FAMILY, ["len(child_ref_list)"])
+    sql, params = compile_query(FAMILY, Query(select=["handle"], order_by=order_by), dialect=Dialect.SQLITE)
+    assert [row[0] for row in conn.execute(sql, params)] == ["none", "two", "three"]
 
 
 # --- dotted strings in a `where` leaf's column --------------------------------
