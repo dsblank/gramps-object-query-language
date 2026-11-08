@@ -2519,3 +2519,18 @@ def test_env_single_value_used_with_in_says_so():
         parse_expr("person", "handle in Env.HOME", env={"HOME": "H1"})
     with pytest.raises(QueryLangError, match="single value"):
         parse_expr("person", "handle not in Env.HOME", env={"HOME": "H1"})
+
+
+def test_date_today_is_todays_sortval():
+    """Gramps' date parser knows "today", so a saved expression using
+    Date('today') stays relative to the day it's compiled (docs: Dates)."""
+    import datetime
+
+    from gramps.gen.datehandler import parser
+
+    expected = parser.parse(datetime.date.today().isoformat()).sortval
+    assert parse_expr("person", "birth.date.sortval > Date('today')") == [
+        {"column": {"json_path": ["birth", "date", "sortval"]}, "op": "gt", "value": expected}
+    ]
+    with pytest.raises(QueryLangError, match="could not parse 'now'"):
+        parse_expr("person", "change > Date('now')")
