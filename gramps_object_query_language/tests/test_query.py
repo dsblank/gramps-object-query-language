@@ -1730,9 +1730,16 @@ def test_and_or_not_compile_and_combine_params():
     assert "" in params
 
 
-def test_in_requires_at_least_one_value():
-    with pytest.raises(QueryError):
-        In("gender", [])
+def test_empty_in_compiles_to_false_on_both_dialects():
+    """query_lang.py only builds an empty In from an empty `Env` list; it
+    matches nothing (SQL has no valid `IN ()`)."""
+    for dialect in (Dialect.SQLITE, Dialect.POSTGRESQL):
+        sql, params = compile_query(PERSON, Query(select=["handle"], where=In("gender", [])), dialect=dialect)
+        assert "1 = 0" in sql and "IN (" not in sql
+        sql, params = compile_query(
+            PERSON, Query(select=["handle"], where=Not(In("gender", []))), dialect=dialect
+        )
+        assert "NOT (1 = 0)" in sql or "NOT 1 = 0" in sql
 
 
 def test_in_compiles_placeholders():

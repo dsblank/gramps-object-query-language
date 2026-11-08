@@ -113,7 +113,7 @@ supports today:
 from __future__ import annotations
 
 import ast
-from typing import Any, List, Optional, Sequence, Tuple, Union
+from typing import Any, List, Mapping, Optional, Sequence, Tuple, Union
 
 from gramps.gen.datehandler import parser as _date_parser
 from gramps.gen.lib import (
@@ -699,7 +699,9 @@ def _translate_compare(node: ast.Compare, spec: ObjectTypeSpec) -> dict:
             # "field in [v1, v2, ...]" -- list membership.
             column = _translate_column_or_computed(node.left, spec)
             value = _translate_list(rhs)
-            if not value:
+            if not value and not isinstance(rhs, _EnvList):
+                # A literal `[]` is almost certainly a mistake; an empty
+                # `Env` list (no bookmarks yet, ...) just matches nothing.
                 raise QueryLangError("'in' requires a non-empty list")
             leaf = {"column": column, "op": "in", "value": value}
         elif _is_path_node(rhs):
@@ -1233,13 +1235,78 @@ class _ComprehensionDesugarer(ast.NodeTransformer):
         return node
 
 
+#: The name an expression uses for caller-supplied values: `Env.NAME`, read
+#: from the `env` mapping passed to `parse_expr`/`compile_expr` (and their
+#: `_for_spec` variants). Capitalized like `Person.MALE` -- no Gramps field
+#: starts with a capital letter, so `Env.NAME` can never be a path.
+ENV_NAME = "Env"
+
+EnvValue = Union[str, int, float, bool, None, Sequence[Union[str, int, float, bool, None]]]
+
+
+class _EnvList(ast.List):
+    """A list substituted from `Env` -- unlike a literal `[]`, an empty one
+    is legal (`handle in Env.BOOKMARKS` with no bookmarks matches nothing),
+    see `_translate_compare`."""
+
+
+def _env_scalar_node(name: str, value: Any) -> ast.Constant:
+    if value is not None and not isinstance(value, (str, int, float, bool)):
+        raise QueryLangError(
+            f"{ENV_NAME}.{name} must be a string, number, boolean, None or a list of those, "
+            f"got {type(value).__name__}"
+        )
+    return ast.Constant(value=value)
+
+
+class _EnvSubstituter(ast.NodeTransformer):
+    """Replaces every `Env.NAME` with its value from `env`, as the literal
+    it would have been written as (`ast.Constant`, or `_EnvList` for a
+    list), before any other translation -- so an `Env` value works
+    everywhere a literal does (comparisons either way round, `in [...]`,
+    substring tests, `like`/`regex` patterns, inside `any(...)`), and is
+    bound as a SQL parameter like any other literal, never spliced into
+    SQL text."""
+
+    def __init__(self, env: Optional[Mapping[str, EnvValue]]):
+        self.env = env
+
+    def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
+        if not (isinstance(node.value, ast.Name) and node.value.id == ENV_NAME):
+            return self.generic_visit(node)
+        name = node.attr
+        if self.env is None or name not in self.env:
+            known = ", ".join(f"{ENV_NAME}.{n}" for n in sorted(self.env or {})) or "none"
+            raise QueryLangError(f"unknown {ENV_NAME} value: {ENV_NAME}.{name} (known: {known})")
+        value = self.env[name]
+        if isinstance(value, (list, tuple)):
+            return ast.copy_location(
+                _EnvList(elts=[_env_scalar_node(name, v) for v in value], ctx=ast.Load()), node
+            )
+        return ast.copy_location(_env_scalar_node(name, value), node)
+
+    def visit_Name(self, node: ast.Name) -> ast.AST:
+        if node.id == ENV_NAME:
+            raise QueryLangError(f"{ENV_NAME} needs a name after it, e.g. {ENV_NAME}.HOME_PERSON")
+        return node
+
+
+def _substitute_env(node: ast.AST, env: Optional[Mapping[str, EnvValue]]) -> ast.AST:
+    return ast.fix_missing_locations(_EnvSubstituter(env).visit(node))
+
+
 def _desugar_comprehensions(node: ast.AST) -> ast.AST:
     rewritten = _ComprehensionDesugarer().visit(node)
     return ast.fix_missing_locations(rewritten)
 
 
-def parse_expr_for_spec(spec: ObjectTypeSpec, expr: str) -> List[dict]:
+def parse_expr_for_spec(
+    spec: ObjectTypeSpec, expr: str, env: Optional[Mapping[str, EnvValue]] = None
+) -> List[dict]:
     """Parse an "almost Python" expression against an already-known `ObjectTypeSpec`.
+
+    `env` supplies the values `Env.NAME` refers to (see `_EnvSubstituter`):
+    a string, number, boolean or None, or a list of those for `in`.
 
     For callers that already know their target type and don't need (or
     want) a namespace string -- e.g. `resources/object_query.py`'s
@@ -1252,11 +1319,11 @@ def parse_expr_for_spec(spec: ObjectTypeSpec, expr: str) -> List[dict]:
         tree = ast.parse(expr, mode="eval")
     except SyntaxError as error:
         raise QueryLangError(f"invalid syntax: {error}") from error
-    body = _desugar_comprehensions(tree.body)
+    body = _desugar_comprehensions(_substitute_env(tree.body, env))
     return _translate_top_level(body, spec)
 
 
-def parse_expr(namespace: str, expr: str) -> List[dict]:
+def parse_expr(namespace: str, expr: str, env: Optional[Mapping[str, EnvValue]] = None) -> List[dict]:
     """Parse an "almost Python" expression into a `where` condition list.
 
     >>> parse_expr("person", "gender == 1")
@@ -1271,7 +1338,7 @@ def parse_expr(namespace: str, expr: str) -> List[dict]:
     `eval`/`compile`/`exec`).
     """
     spec = resolve_namespace(namespace)
-    return parse_expr_for_spec(spec, expr)
+    return parse_expr_for_spec(spec, expr, env)
 
 
 # --- expr -> query.py AST ----------------------------------------------------
@@ -1497,17 +1564,19 @@ def _node_from_json(node: dict, spec: ObjectTypeSpec) -> Any:
     return _condition_from_json(node, spec)
 
 
-def compile_expr_for_spec(spec: ObjectTypeSpec, expr: str) -> Any:
+def compile_expr_for_spec(spec: ObjectTypeSpec, expr: str, env: Optional[Mapping[str, EnvValue]] = None) -> Any:
     """Parse and translate a where-expression string into a `query.py` `where`
     AST (a single comparison, or an `And`/`Or` tree of them), ready for
     `compile_query`/`compile_count_query`. For callers that already have
     `spec` -- see `parse_expr_for_spec`.
     """
-    conditions = parse_expr_for_spec(spec, expr)
+    conditions = parse_expr_for_spec(spec, expr, env)
     return where_list_to_ast(conditions, spec)
 
 
-def compile_expr(namespace: str, expr: str) -> Tuple[ObjectTypeSpec, Any]:
+def compile_expr(
+    namespace: str, expr: str, env: Optional[Mapping[str, EnvValue]] = None
+) -> Tuple[ObjectTypeSpec, Any]:
     """Parse and translate a where-expression string into `(spec, where)`,
     ready to pass straight to `compile_query(spec, Query(where=where), ...)`.
 
@@ -1520,7 +1589,7 @@ def compile_expr(namespace: str, expr: str) -> Tuple[ObjectTypeSpec, Any]:
     father.death.date.sortval"` becomes `Lt(RelatedObject(...), RelatedObject(...))`.
     """
     spec = resolve_namespace(namespace)
-    return spec, compile_expr_for_spec(spec, expr)
+    return spec, compile_expr_for_spec(spec, expr, env)
 
 
 # --- select entries ----------------------------------------------------------

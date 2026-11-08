@@ -329,6 +329,16 @@ def test_evaluate_where_in(db_handles):
     assert evaluate_where(db, father, In("surname", ["Baker"]), PERSON) is False
 
 
+def test_evaluate_where_empty_in_matches_nothing(db_handles):
+    """Even a missing value: an empty list is plain FALSE, like the SQL's
+    `1 = 0`, so NOT of it is TRUE."""
+    db, handles = db_handles
+    father = db.get_person_from_handle(handles["father"])
+    assert evaluate_where(db, father, In("surname", []), PERSON) is False
+    assert evaluate_where(db, father, In(JsonPath(("nope",)), []), PERSON) is False
+    assert evaluate_where(db, father, Not(In("surname", [])), PERSON) is True
+
+
 def test_evaluate_where_and_or_not(db_handles):
     db, handles = db_handles
     father = db.get_person_from_handle(handles["father"])

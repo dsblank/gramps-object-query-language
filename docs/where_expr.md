@@ -845,6 +845,44 @@ tree's own custom type values (e.g. a `PlaceType` of "Ranch" someone typed
 in), which have no fixed constant to name; only `.CUSTOM` identifies "this
 is a custom one," not which.
 
+## Values passed in: `Env`
+
+`Env.NAME` is a value supplied by whoever runs the expression, rather than
+written into it -- the person a user calls "home", the records they've
+bookmarked, a cutoff date. Pass them as `env` to `parse_expr`,
+`parse_expr_for_spec`, `compile_expr` or `compile_expr_for_spec`:
+
+```python
+compile_expr("Person", "handle == Env.HOME_PERSON", env={"HOME_PERSON": "GNUJQCL9MD64AM56OH"})
+compile_expr("Family", "father.handle == Env.HOME or mother.handle == Env.HOME", env={"HOME": "GNUJQCL9MD64AM56OH"})
+compile_expr("Event", "handle in Env.BOOKMARKS", env={"BOOKMARKS": ["a1b2...", "c3d4..."]})
+compile_expr("Note", "Env.WORD in text.string", env={"WORD": "census"})
+```
+
+```python
+Person "handle == Env.HOME_PERSON"
+Person "handle in Env.BOOKMARKS"
+Person "handle not in Env.BOOKMARKS"
+Family "father.handle == Env.HOME or mother.handle == Env.HOME"
+```
+
+An `Env` value can go anywhere a literal can: either side of a comparison,
+in a substring test, as a `like`/`regex` pattern, inside `any(...)`. A
+value is a string, number, boolean or `None`; a list (or tuple) of those
+is for `in`. It's a value, never parsed as part of the expression, so a
+string holding quotes or GOQL needs no escaping, and on the SQL side it's
+a bound parameter like any other literal.
+
+An empty list is allowed, unlike a literal `[]`: `handle in Env.BOOKMARKS`
+with no bookmarks matches nothing, and `handle not in Env.BOOKMARKS`
+matches everything (even a record whose field is missing -- an empty list
+is plain false, not unknown).
+
+`Env` is capitalized like the constant classes above, so it can't be
+mistaken for a field: no Gramps field starts with a capital letter. A
+name that isn't in `env` is an error naming the ones that are; names are
+case-sensitive.
+
 ## Dates
 
 `Date('...')` parses a human-readable date string with Gramps' own date
@@ -1057,7 +1095,7 @@ sql, params = compile_query(spec, Query(select=["handle"], where=where), dialect
 rows = connection.execute(sql, params).fetchall()
 ```
 
-`compile_expr(namespace, expr)` parses and translates a `where_expr` string
+`compile_expr(namespace, expr, env=None)` parses and translates a `where_expr` string
 in one step, returning the matching `ObjectTypeSpec` alongside a `where` AST
 ready for `compile_query`/`compile_count_query`. If you only need the
 intermediate JSON shape (e.g. to send over an HTTP API as a `where_expr`

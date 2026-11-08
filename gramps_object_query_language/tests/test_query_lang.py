@@ -2411,3 +2411,91 @@ def test_where_leaf_column_still_rejects_unknown_flat_column():
         where_list_to_ast(
             [{"column": "gendr", "op": "eq", "value": 1}], PERSON
         )
+
+
+# --- Env: caller-supplied values --------------------------------------------
+
+
+def test_env_scalar_becomes_a_literal():
+    assert parse_expr("person", "handle == Env.HOME_PERSON", env={"HOME_PERSON": "H1"}) == [
+        {"column": "handle", "op": "eq", "value": "H1"}
+    ]
+
+
+def test_env_on_the_left_flips_like_a_literal():
+    assert parse_expr("person", "Env.ID < gramps_id", env={"ID": "I1"}) == [
+        {"column": "gramps_id", "op": "gt", "value": "I1"}
+    ]
+
+
+def test_env_list_in():
+    assert parse_expr("event", "handle in Env.BOOKMARKS", env={"BOOKMARKS": ["a", "b"]}) == [
+        {"column": "handle", "op": "in", "value": ["a", "b"]}
+    ]
+
+
+def test_env_tuple_is_a_list_too():
+    assert parse_expr("event", "handle in Env.B", env={"B": ("a",)})[0]["value"] == ["a"]
+
+
+def test_empty_env_list_is_allowed_but_literal_empty_list_is_not():
+    assert parse_expr("event", "handle in Env.BOOKMARKS", env={"BOOKMARKS": []}) == [
+        {"column": "handle", "op": "in", "value": []}
+    ]
+    with pytest.raises(QueryLangError, match="non-empty"):
+        parse_expr("event", "handle in []")
+
+
+def test_env_substring_and_regex():
+    assert parse_expr("note", "Env.T in text.string", env={"T": "war"}) == [
+        {"column": {"json_path": ["text", "string"]}, "op": "contains", "value": "war"}
+    ]
+    assert parse_expr("person", "regex(gramps_id, Env.P)", env={"P": "^I0"})[0]["value"] == "^I0"
+
+
+def test_env_through_a_relationship_and_inside_any():
+    env = {"HOME": "H1"}
+    assert parse_expr("family", "father.handle == Env.HOME or mother.handle == Env.HOME", env=env)
+    result = parse_expr("person", "any(c.handle == Env.HOME for c in associations)", env=env)
+    assert "H1" in repr(result)
+
+
+def test_env_name_is_case_sensitive_and_must_be_known():
+    with pytest.raises(QueryLangError, match=r"unknown Env value: Env.home \(known: Env.HOME\)"):
+        parse_expr("person", "handle == Env.home", env={"HOME": "H1"})
+    with pytest.raises(QueryLangError, match=r"known: none"):
+        parse_expr("person", "handle == Env.HOME")
+
+
+def test_bare_env_is_rejected():
+    with pytest.raises(QueryLangError, match="needs a name"):
+        parse_expr("person", "handle == Env", env={"HOME": "H1"})
+
+
+def test_env_rejects_values_that_are_not_literals():
+    with pytest.raises(QueryLangError, match="must be a string"):
+        parse_expr("person", "handle == Env.X", env={"X": {"a": 1}})
+    with pytest.raises(QueryLangError, match="must be a string"):
+        parse_expr("person", "handle in Env.X", env={"X": [["nested"]]})
+
+
+def test_env_value_is_never_parsed_as_an_expression():
+    """An Env string is a value, so quotes or GOQL syntax inside it are
+    just characters -- nothing to escape."""
+    nasty = "x' or handle != '"
+    assert parse_expr("person", "handle == Env.X", env={"X": nasty}) == [
+        {"column": "handle", "op": "eq", "value": nasty}
+    ]
+
+
+def test_lowercase_env_is_still_an_ordinary_path():
+    """Only the capitalized `Env` is special; `env.x` stays a field path,
+    rejected downstream like any unknown field."""
+    result = parse_expr("person", "handle == env.x", env={"x": "H1"})
+    assert result == [{"column": "handle", "op": "eq", "value_column": {"json_path": ["env", "x"]}}]
+
+
+def test_compile_expr_passes_env_through():
+    spec, where = compile_expr("person", "handle == Env.H", env={"H": "H1"})
+    assert "H1" in repr(where)
+    assert "H1" in repr(compile_expr_for_spec(spec, "handle == Env.H", env={"H": "H1"}))

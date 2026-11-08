@@ -2069,8 +2069,9 @@ class In:
     """WHERE column IN (values...)."""
 
     def __init__(self, column: ColumnRef, values: Sequence[Any]):
-        if not values:
-            raise QueryError("In() requires at least one value")
+        # An empty list is allowed (query_lang.py only produces one from an
+        # empty `Env` list): it matches nothing, as SQL's own `x IN ()`
+        # would if that were valid syntax -- compiled as a plain FALSE.
         self.column = column
         self.values = list(values)
 
@@ -2084,6 +2085,8 @@ class In:
         # `collation` is accepted, not used -- `IN` is exact-match
         # membership, not an ordering comparison; see Regex.compile's own
         # note on why every leaf still has to accept it.
+        if not self.values:
+            return "1 = 0", []
         column_sql, column_params = _render_column(
             self.column, spec, dialect, value=self.values[0], treeid=treeid
         )

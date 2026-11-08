@@ -168,8 +168,8 @@ def db():
     return conn
 
 
-def run(db, namespace, expr, select=("handle",)):
-    spec, where = compile_expr(namespace, expr)
+def run(db, namespace, expr, select=("handle",), env=None):
+    spec, where = compile_expr(namespace, expr, env=env)
     sql, params = compile_query(
         spec, Query(select=list(select), where=where), dialect=Dialect.SQLITE
     )
@@ -1276,3 +1276,35 @@ def test_backlinks_comprehension_sugar_matches_direct_call():
     conn = _backlinks_conn()
     result = run(conn, "Note", "any(bl for bl in backlinks if bl._class == 'Person')")
     assert result == [("note-on-person",)]
+
+
+# --- Env: caller-supplied values --------------------------------------------
+
+
+def test_env_value(db):
+    assert run(db, "Person", "handle == Env.HOME_PERSON", env={"HOME_PERSON": "kid1"}) == [("kid1",)]
+
+
+def test_env_list(db):
+    assert run(db, "Person", "handle in Env.BOOKMARKS", env={"BOOKMARKS": ["mom1", "dad1"]}) == [
+        ("dad1",),
+        ("mom1",),
+    ]
+
+
+def test_env_empty_list_matches_nothing_and_not_matches_everything(db):
+    env = {"BOOKMARKS": []}
+    assert run(db, "Person", "handle in Env.BOOKMARKS", env=env) == []
+    assert run(db, "Person", "not (handle in Env.BOOKMARKS)", env=env) == run(db, "Person", "handle != ''")
+    assert run(db, "Person", "handle not in Env.BOOKMARKS", env=env) == run(db, "Person", "handle != ''")
+
+
+def test_env_through_a_relationship(db):
+    # The family whose father is dad1.
+    assert run(db, "Family", "father.handle == Env.HOME or mother.handle == Env.HOME", env={"HOME": "dad1"}) == [
+        ("fam1",),
+    ]
+
+
+def test_env_quotes_are_just_characters(db):
+    assert run(db, "Person", "handle == Env.X", env={"X": "x' or handle != '"}) == []
