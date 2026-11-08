@@ -45,8 +45,9 @@ pip install gramps-object-query-language
   parser (`parse_expr`) that translates into the same `where` shape, plus
   `compile_expr`, which translates it the rest of the way into `query.py`'s
   executable AST for callers that want to run it directly, and
-  `parse_select`, which parses `select` entries (`"birth.place.title as
-  birthplace"`, `"count(events) as n_events"`) written in that same path
+  `parse_select` and `parse_order_by`, which parse `select` entries
+  (`"birth.place.title as birthplace"`, `"count(events) as n_events"`) and
+  `order_by` entries (`"birth.date.sortval desc"`) written in that same path
   grammar. See [`docs/where_expr.md`](docs/where_expr.md).
 - `gramps_object_query_language.evaluator` -- evaluates the AST directly
   against real Gramps objects (no SQL), for use with a proxied database.
