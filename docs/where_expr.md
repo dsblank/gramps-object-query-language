@@ -881,7 +881,9 @@ is plain false, not unknown).
 `Env` is capitalized like the constant classes above, so it can't be
 mistaken for a field: no Gramps field starts with a capital letter. A
 name that isn't in `env` is an error naming the ones that are; names are
-case-sensitive.
+case-sensitive. Using a list where a single value belongs
+(`handle == Env.BOOKMARKS`), or a single value with `in`
+(`handle in Env.HOME`), is an error that says which one it is.
 
 ## Dates
 

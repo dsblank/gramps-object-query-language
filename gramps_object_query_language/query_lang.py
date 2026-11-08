@@ -615,6 +615,8 @@ def _translate_value(node: ast.AST) -> Any:
     a `ClassName.CONST` value constant (e.g. `Person.MALE`, see `_CONSTANTS`),
     or `Date('...')` (see `_translate_date_call`).
     """
+    if isinstance(node, _EnvList):
+        raise _env_list_misused(node)
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
         inner = _translate_value(node.operand)
         if not isinstance(inner, (int, float)) or isinstance(inner, bool):
@@ -695,6 +697,9 @@ def _translate_compare(node: ast.Compare, spec: ObjectTypeSpec) -> dict:
     op = _COMPARE_OPS[lookup_type]
     rhs = node.comparators[0]
     if op == "in":
+        if isinstance(rhs, _EnvConstant):
+            name = f"{ENV_NAME}.{rhs.env_name}"
+            raise QueryLangError(f"{name} is a single value; 'in' needs a list, e.g. handle == {name}")
         if isinstance(rhs, ast.List):
             # "field in [v1, v2, ...]" -- list membership.
             column = _translate_column_or_computed(node.left, spec)
@@ -1247,7 +1252,21 @@ EnvValue = Union[str, int, float, bool, None, Sequence[Union[str, int, float, bo
 class _EnvList(ast.List):
     """A list substituted from `Env` -- unlike a literal `[]`, an empty one
     is legal (`handle in Env.BOOKMARKS` with no bookmarks matches nothing),
-    see `_translate_compare`."""
+    see `_translate_compare`. `env_name` names it in error messages."""
+
+    env_name: str = ""
+
+
+class _EnvConstant(ast.Constant):
+    """A single value substituted from `Env`; `env_name` names it in error
+    messages."""
+
+    env_name: str = ""
+
+
+def _env_list_misused(node: ast.AST) -> QueryLangError:
+    name = f"{ENV_NAME}.{node.env_name}"  # type: ignore[attr-defined]
+    return QueryLangError(f"{name} is a list; use it with 'in', e.g. handle in {name}")
 
 
 def _env_scalar_node(name: str, value: Any) -> ast.Constant:
@@ -1256,7 +1275,9 @@ def _env_scalar_node(name: str, value: Any) -> ast.Constant:
             f"{ENV_NAME}.{name} must be a string, number, boolean, None or a list of those, "
             f"got {type(value).__name__}"
         )
-    return ast.Constant(value=value)
+    node = _EnvConstant(value=value)
+    node.env_name = name
+    return node
 
 
 class _EnvSubstituter(ast.NodeTransformer):
@@ -1280,9 +1301,9 @@ class _EnvSubstituter(ast.NodeTransformer):
             raise QueryLangError(f"unknown {ENV_NAME} value: {ENV_NAME}.{name} (known: {known})")
         value = self.env[name]
         if isinstance(value, (list, tuple)):
-            return ast.copy_location(
-                _EnvList(elts=[_env_scalar_node(name, v) for v in value], ctx=ast.Load()), node
-            )
+            env_list = _EnvList(elts=[_env_scalar_node(name, v) for v in value], ctx=ast.Load())
+            env_list.env_name = name
+            return ast.copy_location(env_list, node)
         return ast.copy_location(_env_scalar_node(name, value), node)
 
     def visit_Name(self, node: ast.Name) -> ast.AST:

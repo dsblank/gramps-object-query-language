@@ -2499,3 +2499,23 @@ def test_compile_expr_passes_env_through():
     spec, where = compile_expr("person", "handle == Env.H", env={"H": "H1"})
     assert "H1" in repr(where)
     assert "H1" in repr(compile_expr_for_spec(spec, "handle == Env.H", env={"H": "H1"}))
+
+
+@pytest.mark.parametrize("expr", [
+    "handle == Env.BOOKMARKS",
+    "Env.BOOKMARKS == handle",
+    "Env.BOOKMARKS in gramps_id",
+    "like(gramps_id, Env.BOOKMARKS)",
+    "regex(gramps_id, Env.BOOKMARKS)",
+    "any(n.handle == Env.BOOKMARKS for n in notes)",
+])
+def test_env_list_used_as_a_single_value_says_so(expr):
+    with pytest.raises(QueryLangError, match=r"^Env.BOOKMARKS is a list; use it with 'in', e.g. handle in Env.BOOKMARKS$"):
+        parse_expr("person", expr, env={"BOOKMARKS": ["a", "b"]})
+
+
+def test_env_single_value_used_with_in_says_so():
+    with pytest.raises(QueryLangError, match=r"^Env.HOME is a single value; 'in' needs a list, e.g. handle == Env.HOME$"):
+        parse_expr("person", "handle in Env.HOME", env={"HOME": "H1"})
+    with pytest.raises(QueryLangError, match="single value"):
+        parse_expr("person", "handle not in Env.HOME", env={"HOME": "H1"})
