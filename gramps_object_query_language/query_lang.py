@@ -172,9 +172,13 @@ from .query import (
     ObjectTypeSpec,
     Or,
     QueryError,
+    JsonPath,
+    Length,
+    RelatedObject,
     Regex,
     SelectRef,
     default_ref_key,
+    ref_value_type,
     relationship_target,
     resolve_any_path,
     resolve_collection,
@@ -1456,12 +1460,72 @@ def json_column_to_ref(column: Union[str, dict], spec: ObjectTypeSpec) -> Column
     return resolve_column_path(spec, column["json_path"], base_column)
 
 
+def _value_kind(column: ColumnRef, spec: ObjectTypeSpec) -> Optional[str]:
+    """`"number"`, `"string"` or `"boolean"` when the schema pins down the
+    scalar kind `column` holds (nullable or not); `None` for anything else
+    (an object, an array, a mixed type, or a type the schema doesn't give).
+    """
+    if isinstance(column, (CollectionCount, JsonArrayCount, Length)):
+        return "number"
+    while isinstance(column, RelatedObject):
+        spec = column.target
+        column = column.field
+    if isinstance(column, FlatColumnRef):
+        column = column.name
+    if isinstance(column, str):
+        if column in spec.text_columns:
+            return "string"
+        if column in spec.bool_columns:
+            return "boolean"
+        column = JsonPath((column,))
+    try:
+        value_type = ref_value_type(spec, column)
+    except QueryError:
+        return None
+    types = set(value_type) if isinstance(value_type, list) else {value_type}
+    types.discard("null")
+    if types and types <= {"integer", "number"}:
+        return "number"
+    if types == {"string"}:
+        return "string"
+    if types == {"boolean"}:
+        return "boolean"
+    return None
+
+
+_KIND_ACCEPTS = {
+    "number": (int, float),  # bool is an int, as in Python
+    "string": (str,),
+    "boolean": (bool, int),
+}
+
+
+def _check_literal_kind(column: ColumnRef, value: Any, spec: ObjectTypeSpec) -> None:
+    """Reject a literal (or `Env` value) whose type can't be compared with
+    `column`'s -- `len(event_ref_list) > 'a'`, `gramps_id == 3` -- here,
+    rather than letting it fail at run time: PostgreSQL raises (a 500 for a
+    web caller), the evaluator raises `TypeError` for an ordering operator,
+    and SQLite quietly matches nothing. `None` is always allowed: it is how
+    `is None` is written.
+    """
+    kind = _value_kind(column, spec)
+    if kind is None or value is None or isinstance(value, _KIND_ACCEPTS[kind]):
+        return
+    raise QueryError(
+        f"cannot compare a {kind} field with {value!r} ({type(value).__name__})"
+    )
+
+
 def _condition_from_json(condition: dict, spec: ObjectTypeSpec) -> Any:
     """One `parse_expr`-shaped condition dict, translated to a `query.py`
     comparison object (`Eq`, `Lt`, `In`, `Like`, `Regex`, `Contains`, ...)."""
     column = json_column_to_ref(condition["column"], spec)
     op = condition["op"]
+    if op in _OP_CLASSES and "value_column" not in condition:
+        _check_literal_kind(column, condition["value"], spec)
     if op == "in":
+        for item in condition["value"]:
+            _check_literal_kind(column, item, spec)
         return In(column, condition["value"])
     if op == "like":
         return Like(column, condition["value"])
@@ -1624,7 +1688,9 @@ def compile_expr(
 _SELECT_ALIAS_SEPARATOR = " as "
 
 
-def parse_select_entry(spec: ObjectTypeSpec, entry: str) -> Tuple[SelectRef, str]:
+def parse_select_entry(
+    spec: ObjectTypeSpec, entry: str, env: Optional[Mapping[str, EnvValue]] = None
+) -> Tuple[SelectRef, str]:
     """Parse one `select` entry string into `(column_ref, response_key)`.
 
     The entry is a column expression in the same "almost Python" grammar
@@ -1644,6 +1710,9 @@ def parse_select_entry(spec: ObjectTypeSpec, entry: str) -> Tuple[SelectRef, str
     references, not arithmetic or comparisons, matching what `SelectRef`
     can actually represent. Anything else fails here rather than compiling
     into something surprising.
+
+    `env` supplies `Env.NAME` values, as for `parse_expr_for_spec` -- e.g.
+    in a `count(...)` condition: `count(events, description == Env.D)`.
     """
     text = entry.strip()
     if not text:
@@ -1669,7 +1738,9 @@ def parse_select_entry(spec: ObjectTypeSpec, entry: str) -> Tuple[SelectRef, str
         raise QueryLangError(f"could not parse select entry {entry!r}: {error}") from error
 
     try:
-        ref = json_column_to_ref(_translate_column_or_computed(node, spec), spec)
+        ref = json_column_to_ref(
+            _translate_column_or_computed(_substitute_env(node, env), spec), spec
+        )
     except (QueryLangError, QueryError) as error:
         raise QueryLangError(f"invalid select entry {entry!r}: {error}") from error
 
@@ -1688,7 +1759,9 @@ def parse_select_entry(spec: ObjectTypeSpec, entry: str) -> Tuple[SelectRef, str
         return ref, " ".join(text.split())
 
 
-def parse_order_by_entry(spec: ObjectTypeSpec, entry: str) -> OrderBy:
+def parse_order_by_entry(
+    spec: ObjectTypeSpec, entry: str, env: Optional[Mapping[str, EnvValue]] = None
+) -> OrderBy:
     """Parse one `order_by` entry string into an `OrderBy`.
 
     The entry is a column reference written as it would be in `select` --
@@ -1701,7 +1774,7 @@ def parse_order_by_entry(spec: ObjectTypeSpec, entry: str) -> OrderBy:
     OrderBy(column=RelatedObject(...), direction='desc')
 
     An `as` alias means nothing for a sort, so it's rejected rather than
-    ignored.
+    ignored. `env` supplies `Env.NAME` values, as in `parse_select_entry`.
     """
     text = entry.strip()
     direction = "asc"
@@ -1716,24 +1789,28 @@ def parse_order_by_entry(spec: ObjectTypeSpec, entry: str) -> OrderBy:
     except SyntaxError as error:
         raise QueryLangError(f"could not parse order_by entry {entry!r}: {error}") from error
     try:
-        ref = json_column_to_ref(_translate_column_or_computed(node, spec), spec)
+        ref = json_column_to_ref(
+            _translate_column_or_computed(_substitute_env(node, env), spec), spec
+        )
     except (QueryLangError, QueryError) as error:
         raise QueryLangError(f"invalid order_by entry {entry!r}: {error}") from error
     return OrderBy(ref, direction)
 
 
-def parse_order_by(spec: ObjectTypeSpec, entries: Sequence[str]) -> List[OrderBy]:
+def parse_order_by(
+    spec: ObjectTypeSpec, entries: Sequence[str], env: Optional[Mapping[str, EnvValue]] = None
+) -> List[OrderBy]:
     """Parse an `order_by` list of entry strings (see `parse_order_by_entry`),
     most significant first, ready for `Query(order_by=...)`.
 
     >>> from gramps_object_query_language.query import PERSON
     >>> parse_order_by(PERSON, ["surname", "given_name", "-birth.date.sortval"])
     """
-    return [parse_order_by_entry(spec, entry) for entry in entries]
+    return [parse_order_by_entry(spec, entry, env) for entry in entries]
 
 
 def parse_select(
-    spec: ObjectTypeSpec, entries: Sequence[str]
+    spec: ObjectTypeSpec, entries: Sequence[str], env: Optional[Mapping[str, EnvValue]] = None
 ) -> List[Tuple[SelectRef, str]]:
     """Parse a `select` list of entry strings into `(column_ref, key)` pairs,
     ready for `Query(select=[ref, ...])` plus the response keys to zip each
@@ -1747,7 +1824,7 @@ def parse_select(
     key would silently drop one of them from every result row, and which
     one won would depend on nothing the caller can see.
     """
-    parsed = [parse_select_entry(spec, entry) for entry in entries]
+    parsed = [parse_select_entry(spec, entry, env) for entry in entries]
     seen: set = set()
     for _, key in parsed:
         if key in seen:

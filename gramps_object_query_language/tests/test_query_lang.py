@@ -2586,6 +2586,63 @@ def test_env_single_value_used_with_in_says_so():
         parse_expr("person", "handle not in Env.HOME", env={"HOME": "H1"})
 
 
+def test_env_in_select_and_order_by():
+    env = {"D": "x"}
+    ref, key = parse_select_entry(PERSON, "count(events, description == Env.D) as n", env)
+    assert key == "n" and isinstance(ref, CollectionCount)
+    assert ref.condition == Eq("description", "x")
+    assert parse_select(PERSON, ["count(events, description == Env.D) as n"], env)[0] == (ref, key)
+    order = parse_order_by_entry(PERSON, "-count(events, description == Env.D)", env)
+    assert order == OrderBy(ref, "desc")
+    assert parse_order_by(PERSON, ["-count(events, description == Env.D)"], env) == [order]
+    with pytest.raises(QueryLangError, match=r"unknown Env value: Env.D \(known: none\)"):
+        parse_select_entry(PERSON, "count(events, description == Env.D)")
+
+
+@pytest.mark.parametrize(
+    "expr, env",
+    [
+        ("len(event_ref_list) > Env.N", {"N": "a"}),
+        ("count(events) > '2'", {}),
+        ("birth.date.sortval > 'x'", {}),
+        ("gramps_id == 3", {}),
+        ("surname == Env.S", {"S": 5}),
+        ("gramps_id in ['I1', 3]", {}),
+        ("count(events, description == 5) > 0", {}),
+        ("private == 'yes'", {}),
+    ],
+)
+def test_literal_of_the_wrong_type_is_rejected(expr, env):
+    with pytest.raises(QueryError, match="^cannot compare a (number|string|boolean) field with "):
+        compile_expr_for_spec(PERSON, expr, env=env)
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        "len(event_ref_list) > 2",
+        "gender == Person.MALE",
+        "private == True",
+        "private == 1",
+        "birth.date.sortval > Date('1900')",
+        "gramps_id == None",
+        "surname is not None",
+        "gramps_id in ['I1', 'I2']",
+        "mother.death.date.sortval < father.death.date.sortval",
+    ],
+)
+def test_literal_of_a_matching_type_is_accepted(expr):
+    namespace = "family" if "father" in expr else "person"
+    compile_expr(namespace, expr)
+
+
+def test_invalid_regex_pattern_is_rejected_up_front():
+    with pytest.raises(QueryError, match=r"^invalid regex pattern '\(': "):
+        compile_expr_for_spec(PERSON, "regex(gramps_id, Env.P)", env={"P": "("})
+    with pytest.raises(QueryError, match="invalid regex pattern"):
+        Regex("gramps_id", "[")
+
+
 def test_date_today_is_todays_sortval():
     """Gramps' date parser knows "today", so a saved expression using
     Date('today') stays relative to the day it's compiled (docs: Dates)."""

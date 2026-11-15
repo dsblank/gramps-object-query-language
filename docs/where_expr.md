@@ -878,6 +878,16 @@ with no bookmarks matches nothing, and `handle not in Env.BOOKMARKS`
 matches everything (even a record whose field is missing -- an empty list
 is plain false, not unknown).
 
+`parse_select`/`parse_order_by` (and their `_entry` forms) take the same
+`env`, for an `Env` inside a `count(...)`/`len(...)` condition, e.g. a
+select entry `"count(events, description == Env.D) as n"`.
+
+A value of the wrong type for the field it's compared with
+(`len(event_ref_list) > Env.N` with `N` = `"a"`, `gramps_id == 3`) is
+rejected when the expression is compiled, as is a `regex(...)` pattern
+Python's `re` can't compile -- not left to fail, or quietly match nothing,
+when the query runs. The same goes for literals written in the expression.
+
 `Env` is capitalized like the constant classes above, so it can't be
 mistaken for a field: no Gramps field starts with a capital letter. A
 name that isn't in `env` is an error naming the ones that are; names are
