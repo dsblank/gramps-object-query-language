@@ -1752,6 +1752,21 @@ def _validate_like_pattern(pattern: str) -> None:
         )
 
 
+def _validate_regex_pattern(pattern: str) -> None:
+    """Reject a `regex(...)` pattern Python's `re` can't compile, before it
+    reaches a backend that would raise mid-query (SQLite's `regexp` UDF and
+    `evaluator.py` both use `re`; PostgreSQL raises its own error).
+
+    Called from `Regex.__init__`, the counterpart to `_validate_like_pattern`.
+    PostgreSQL's POSIX regex dialect still rejects some patterns `re`
+    accepts (lookbehind, named groups) -- see `Regex`'s docstring.
+    """
+    try:
+        re.compile(pattern)
+    except re.error as error:
+        raise QueryError(f"invalid regex pattern {pattern!r}: {error}") from error
+
+
 def _coerce_bool_literal(column: ColumnRef, value: Any, spec: ObjectTypeSpec) -> Any:
     """`value`, with a Python `bool` converted to `int` if `column` is a flat
     (non-JSON) secondary column of `boolean` schema type -- e.g. `private`.
@@ -1959,6 +1974,11 @@ class Regex(Comparison):
     """
 
     op = "REGEXP"
+
+    def __init__(self, column: ColumnRef, value: Any):
+        if isinstance(value, str):
+            _validate_regex_pattern(value)
+        super().__init__(column, value)
 
     def compile(
         self,
