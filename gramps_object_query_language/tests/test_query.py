@@ -3310,6 +3310,27 @@ def test_walk_schema_rejects_unknown_field_and_says_what_exists():
         walk_schema(PERSON, ["gendr"])
 
 
+def test_walk_schema_unknown_top_level_field_lists_relationships_and_collections():
+    # Issue #14: `mother.gramps_id` on Person -- the error must point at the
+    # relationships (`birth`) and collections (`parent_families`) too, not
+    # only the raw JSON fields (`parent_family_list`).
+    with pytest.raises(QueryError) as excinfo:
+        walk_schema(PERSON, ["mother", "gramps_id"])
+    message = str(excinfo.value)
+    assert "known fields: " in message and "parent_family_list" in message
+    assert "relationships (use as <name>.<field>): birth, death" in message
+    assert "collections (use in any/exists/count/len): " in message
+    assert "parent_families" in message and "events" in message
+
+
+def test_walk_schema_unknown_nested_field_does_not_list_relationships():
+    # Relationships only apply at the start of a path, not inside one.
+    with pytest.raises(QueryError) as excinfo:
+        walk_schema(PERSON, ["primary_name", "birth"])
+    assert "relationships" not in str(excinfo.value)
+    assert "collections" not in str(excinfo.value)
+
+
 def test_walk_schema_rejects_index_into_non_array():
     with pytest.raises(QueryError, match="not a list"):
         walk_schema(PERSON, ["primary_name", 0])
