@@ -2656,3 +2656,74 @@ def test_date_today_is_todays_sortval():
     ]
     with pytest.raises(QueryLangError, match="could not parse 'now'"):
         parse_expr("person", "change > Date('now')")
+
+
+# Issue #14: a path used on its own in and/or/not gets a message saying
+# what to write instead, not a Python AST dump.
+@pytest.mark.parametrize(
+    "namespace, expr",
+    [
+        ("family", "mother"),
+        ("family", "mother and mother.gender == Person.FEMALE"),
+        ("family", "mother.gender == Person.FEMALE or mother"),
+        ("family", "not mother"),
+        ("person", "birth"),
+    ],
+)
+def test_bare_relationship_as_condition_explains_itself(namespace, expr):
+    with pytest.raises(QueryLangError) as excinfo:
+        parse_expr(namespace, expr)
+    message = str(excinfo.value)
+    assert "is a relationship on" in message
+    assert ".handle != None" in message
+    assert "Name(" not in message
+
+
+@pytest.mark.parametrize("expr", ["events", "not events", "events and gender == 1"])
+def test_bare_collection_as_condition_explains_itself(expr):
+    with pytest.raises(QueryLangError) as excinfo:
+        parse_expr("person", expr)
+    message = str(excinfo.value)
+    assert "'events' is a collection on 'person'" in message
+    assert "any(events)" in message
+    assert "any(x for x in events if" in message
+
+
+@pytest.mark.parametrize(
+    "expr, text",
+    [
+        ("gramps_id", "gramps_id"),
+        ("primary_name.first_name and gender == 1", "primary_name.first_name"),
+        ("not primary_name.surname_list[0].surname", "primary_name.surname_list[0].surname"),
+        ("birth.date or gender == 1", "birth.date"),
+    ],
+)
+def test_bare_value_path_as_condition_explains_itself(expr, text):
+    with pytest.raises(QueryLangError) as excinfo:
+        parse_expr("person", expr)
+    message = str(excinfo.value)
+    assert f"{text!r} is a value, not a condition" in message
+    assert f"{text} == ..." in message
+
+
+def test_non_path_leaf_error_shows_source_not_ast_dump():
+    with pytest.raises(QueryLangError) as excinfo:
+        parse_expr("person", "1 and gender == 1")
+    message = str(excinfo.value)
+    assert message.endswith("got: 1")
+    assert "Constant(" not in message
+
+
+@pytest.mark.parametrize(
+    "namespace, expr",
+    [
+        ("family", "mother.handle != None and mother.gender == Person.FEMALE"),
+        ("person", "birth.handle != None"),
+        ("person", "any(events)"),
+        ("person", "any(x for x in events if x.gramps_id == 'E0001')"),
+        ("person", "primary_name.first_name != None"),
+    ],
+)
+def test_bare_path_error_suggestions_are_valid(namespace, expr):
+    # Every spelling the messages above suggest must itself compile.
+    compile_expr(namespace, expr)

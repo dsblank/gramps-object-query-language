@@ -265,6 +265,31 @@ def _describe_schema(schema: dict) -> str:
     return schema.get("title") or schema.get("type") or "value"
 
 
+def _relationship_names_hint(spec: ObjectTypeSpec) -> str:
+    """The names that are valid at the *start* of a path on `spec` but
+    aren't JSON Schema fields -- `_RELATIONSHIPS` (`birth.date`,
+    `mother.gramps_id`) and `_COLLECTIONS` (`any(events, ...)`) -- as a
+    suffix for `walk_schema`'s "known fields" error. Without it, a user who
+    guessed a relationship name that doesn't exist on this type is steered
+    toward the raw handle fields (`parent_family_list`) instead of the
+    relationship/collection that actually does what they meant
+    (`parent_families`). Empty for an `any(...)` element spec (table `""`),
+    which has neither.
+    """
+    relationships = sorted(_RELATIONSHIPS.get(spec.table, {}))
+    collections = sorted(_COLLECTIONS.get(spec.table, {}))
+    hint = ""
+    if relationships:
+        hint += (
+            f"; relationships (use as <name>.<field>): {', '.join(relationships)}"
+        )
+    if collections:
+        hint += (
+            f"; collections (use in any/exists/count/len): {', '.join(collections)}"
+        )
+    return hint
+
+
 def walk_schema(spec: ObjectTypeSpec, segments: Sequence[Union[str, int]]) -> dict:
     """Walk `segments` through `spec`'s Gramps JSON Schema, returning the
     schema node for the value the path lands on. Raises `QueryError` -- with
@@ -308,6 +333,7 @@ def walk_schema(spec: ObjectTypeSpec, segments: Sequence[Union[str, int]]) -> di
                 f"unknown field {segment!r} on "
                 f"{_describe_schema(schema)} -- known fields: "
                 f"{', '.join(known)}"
+                f"{'' if walked else _relationship_names_hint(spec)}"
             )
         schema = properties[segment]
         walked.append(segment)

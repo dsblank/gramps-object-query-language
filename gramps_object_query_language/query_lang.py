@@ -953,6 +953,38 @@ def _translate_any_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:
     return {"any": {"path": list(segments), "where": where}}
 
 
+def _bare_path_leaf_message(node: ast.AST, spec: ObjectTypeSpec) -> str:
+    """The error for a path used on its own as a condition (`mother and
+    ...`, `not birth`, `primary_name.first_name or ...`) -- Python
+    truthiness isn't part of the language, so say what to write instead
+    rather than dumping the AST. Three cases, by what the path names:
+
+    - a bare relationship (`mother`, `birth`): point at `<name>.handle !=
+      None`, which is exactly "the link is set" (the related row's handle
+      is NULL when there's no such row);
+    - a bare collection (`events`, `children`): point at `any(...)`;
+    - anything else: it's a value, so it needs a comparison.
+    """
+    text = ast.unparse(node)
+    if isinstance(node, ast.Name):
+        if relationship_target(spec, node.id) is not None:
+            return (
+                f"{text!r} is a relationship on {spec.table!r}, not a condition "
+                f"on its own -- to test that it's set, use {text}.handle != None; "
+                f"to test one of its fields, use e.g. {text}.gramps_id == ..."
+            )
+        if _try_resolve_bare_collection(node, spec) is not None:
+            return (
+                f"{text!r} is a collection on {spec.table!r}, not a condition "
+                f"on its own -- use any({text}) to test that it's non-empty, or "
+                f"any(x for x in {text} if <condition on x>)"
+            )
+    return (
+        f"{text!r} is a value, not a condition -- compare it to something, "
+        f"e.g. {text} == ... or {text} != None"
+    )
+
+
 def _translate_comparison_like_node(node: ast.AST, spec: ObjectTypeSpec) -> dict:
     """A single leaf: a `Compare`, or a whitelisted
     `like(...)`/`regex(...)`/`exists(...)`/`any(...)` call."""
@@ -967,9 +999,11 @@ def _translate_comparison_like_node(node: ast.AST, spec: ObjectTypeSpec) -> dict
             return _translate_exists_call(node, spec)
         if node.func.id == "any":
             return _translate_any_call(node, spec)
+    if _is_path_node(node):
+        raise QueryLangError(_bare_path_leaf_message(node, spec))
     raise QueryLangError(
         f"expected a comparison (a == b, a in [...], like(a, 'pat'), "
-        f"regex(a, 'pat'), exists(rel, cond), any(rel_or_path, cond)), got: {ast.dump(node)}"
+        f"regex(a, 'pat'), exists(rel, cond), any(rel_or_path, cond)), got: {ast.unparse(node)}"
     )
 
 
