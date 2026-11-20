@@ -49,6 +49,16 @@ pip install gramps-object-query-language
   (`"birth.place.title as birthplace"`, `"count(events) as n_events"`) and
   `order_by` entries (`"-birth.date.sortval"`) written in that same path
   grammar. See [`docs/where_expr.md`](docs/where_expr.md).
+- `gramps_object_query_language.vocabulary` -- every name a `where_expr`
+  can use (columns, JSON fields, relationships, collections, keywords,
+  functions, `ClassName.CONST` constants), per namespace, as plain JSON
+  data for editors. `python -m gramps_object_query_language.vocabulary`
+  prints it for clients without Python.
+- `gramps_object_query_language.completion` -- `complete(namespace,
+  source, cursor)`: what could go at the cursor in a half-typed
+  `where_expr` (`birth.date.so` -> `sortval`, `Person.` -> `MALE`, ...),
+  built only on `vocabulary`'s data so other languages can port it;
+  `tests/completion_cases.json` holds cases for those ports to share.
 - `gramps_object_query_language.evaluator` -- evaluates the AST directly
   against real Gramps objects (no SQL), for use with a proxied database.
 - `gramps_object_query_language.proxied_query` -- runs a `where` expression
