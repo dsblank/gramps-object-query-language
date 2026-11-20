@@ -1977,3 +1977,80 @@ def test_order_by_and_count_agree_parsing_once(parse_once_db, pg_conn, limit):
     if pg_conn is not None:
         assert [row[0] for row in _rows_on_postgresql(pg_conn, db, sql, params)] == expected, "PostgreSQL"
         assert _rows_on_postgresql(pg_conn, db, count_sql, count_params)[0][0] == 3, "PostgreSQL count"
+
+
+# --- a selected relationship field named like a sort column -----------------
+#
+# A related field renders as a scalar subquery, `(SELECT gramps_id FROM event
+# ...)`, which PostgreSQL names after its inner column. A bare `ORDER BY
+# gramps_id` looks at output column names first, so it either failed as
+# ambiguous (the record's own column selected too -- and `handle` always is,
+# as the final tiebreak) or silently sorted by the related record's column.
+
+
+def _person_rows(db, pg_conn, query):
+    """`query`'s rows on SQLite and, given `pg_conn`, PostgreSQL."""
+    from gramps_object_query_language.query import Dialect, compile_query
+
+    sql, params = compile_query(PERSON, query, dialect=Dialect.SQLITE)
+    db.dbapi.execute(sql, params)
+    results = {"SQLite": [tuple(row) for row in db.dbapi.fetchall()]}
+    if pg_conn is not None:
+        sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
+        results["PostgreSQL"] = [tuple(row) for row in _rows_on_postgresql(pg_conn, db, sql, params)]
+    return results
+
+
+def test_select_related_handle(parse_once_db, pg_conn):
+    """`birth.handle` (the default order's own `handle` tiebreak shares its
+    name) runs, and returns the birth event's handle."""
+    from gramps_object_query_language.query import Query
+    from gramps_object_query_language.query_lang import parse_select
+
+    db, handles = parse_once_db
+    select = [ref for ref, _ in parse_select(PERSON, ["handle", "birth.handle"])]
+    expected = {
+        (handles["p_ann"], handles["e_nov2"]),
+        (handles["p_bob"], handles["e_nov2_about"]),
+        (handles["p_cat"], None),
+        (handles["p_dan"], None),
+    }
+    for backend, rows in _person_rows(db, pg_conn, Query(select=select)).items():
+        assert set(rows) == expected, backend
+
+
+@pytest.mark.parametrize("own_column_selected", [True, False])
+def test_order_by_column_shared_with_a_related_select(parse_once_db, pg_conn, own_column_selected):
+    """Sorting by `gramps_id` while selecting `birth.gramps_id` sorts by the
+    person's own Gramps ID, whether or not that column is selected too --
+    not by the birth event's (which puts people with no birth first)."""
+    from gramps_object_query_language.query import Query
+    from gramps_object_query_language.query_lang import parse_order_by, parse_select
+
+    db, handles = parse_once_db
+    entries = ["handle", "gramps_id", "birth.gramps_id"] if own_column_selected else ["handle", "birth.gramps_id"]
+    select = [ref for ref, _ in parse_select(PERSON, entries)]
+    order_by = parse_order_by(PERSON, ["gramps_id"])
+    get = db.get_person_from_handle
+    by_own_id = sorted(("p_ann", "p_bob", "p_cat", "p_dan"), key=lambda key: get(handles[key]).gramps_id)
+    expected = [handles[key] for key in by_own_id]
+    for backend, rows in _person_rows(db, pg_conn, Query(select=select, order_by=order_by)).items():
+        assert [row[0] for row in rows] == expected, backend
+
+
+def test_keyset_page_with_a_related_select_named_like_the_sort(parse_once_db, pg_conn):
+    """The next page (`after`) continues the same order: the seek condition
+    and the ORDER BY both use the person's own `change`."""
+    from gramps_object_query_language.query import Query
+    from gramps_object_query_language.query_lang import parse_order_by, parse_select
+
+    db, handles = parse_once_db
+    select = [ref for ref, _ in parse_select(PERSON, ["handle", "birth.change"])]
+    order_by = parse_order_by(PERSON, ["change"])
+    whole = _person_rows(db, pg_conn, Query(select=["handle"], order_by=order_by))["SQLite"]
+    order = [row[0] for row in whole]
+    first = db.get_person_from_handle(order[0])
+    after = (first.change, first.handle)
+    query = Query(select=select, order_by=order_by, after=after)
+    for backend, rows in _person_rows(db, pg_conn, query).items():
+        assert [row[0] for row in rows] == order[1:], backend
