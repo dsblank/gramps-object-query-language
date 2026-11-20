@@ -3205,8 +3205,20 @@ def compile_query(
 
     select_parts = []
     params: list = []
-    for column in columns:
+    for i, column in enumerate(columns):
         sql_frag, p = _render_column(column, spec, dialect, treeid=treeid)
+        # Every computed entry gets an output name no table column has.
+        # PostgreSQL names a scalar subquery after its inner column, so
+        # `birth.gramps_id` would come out named `gramps_id` -- and a bare
+        # `ORDER BY gramps_id` resolves against output names first: it was
+        # ambiguous with the record's own `gramps_id` (and with `handle`,
+        # always the final tiebreak, for `birth.handle`), or silently sorted
+        # by the related record's column when the record's own wasn't
+        # selected. A flat column's output name is that same column, so it
+        # can't mislead a sort and stays as written. Rows are read by
+        # position, so the names themselves never surface.
+        if not isinstance(column, str):
+            sql_frag = f"{sql_frag} AS goql_select_{i}"
         select_parts.append(sql_frag)
         params.extend(p)
 
