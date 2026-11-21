@@ -3204,7 +3204,7 @@ def compile_query(
     ordering = effective_order_by(resolve_order_by(spec, query.order_by))
 
     select_parts = []
-    params: list = []
+    select_params: list = []
     for i, column in enumerate(columns):
         sql_frag, p = _render_column(column, spec, dialect, treeid=treeid)
         # Every computed entry gets an output name no table column has.
@@ -3220,38 +3220,148 @@ def compile_query(
         if not isinstance(column, str):
             sql_frag = f"{sql_frag} AS goql_select_{i}"
         select_parts.append(sql_frag)
-        params.extend(p)
+        select_params.extend(p)
 
     where_clauses, where_params = _where_clauses(spec, query.where, dialect, treeid, collation)
-    params.extend(where_params)
+    where_params = list(where_params)
 
     if query.after is not None:
         sql, p = _compile_keyset(ordering, query.after, spec, collation, dialect, treeid)
         where_clauses.append(f"({sql})")
-        params.extend(p)
+        where_params.extend(p)
 
     # Built before assembly, not inline: a non-flat sort column contributes
     # bound params of its own, and they belong after the WHERE/keyset params
     # and before `LIMIT`'s -- the order the placeholders appear in the SQL.
-    order_parts = []
-    order_params: list = []
-    for ob in ordering:
-        order_sql, p = _column_expr(ob.column, spec, collation, dialect, treeid)
-        order_parts.append(f"{order_sql} {_order_direction_sql(ob, dialect)}")
-        order_params.extend(p)
+    order_exprs: List[Tuple[str, list]] = [
+        _column_expr(ob.column, spec, collation, dialect, treeid) for ob in ordering
+    ]
 
+    if _defers_select(columns, query, dialect):
+        return _compile_deferred_select(
+            spec,
+            ordering,
+            order_exprs,
+            select_parts,
+            select_params,
+            where_clauses,
+            where_params,
+            query.limit,
+            dialect,
+            treeid,
+        )
+
+    order_parts = [
+        f"{order_sql} {_order_direction_sql(ob, dialect)}"
+        for ob, (order_sql, _) in zip(ordering, order_exprs)
+    ]
+    params = select_params + where_params
     body_sql = ", ".join(select_parts) + " ".join(where_clauses) + ", ".join(order_parts)
     from_sql, lateral = _from_clause(spec, dialect, body_sql, min_refs=_PG_QUERY_LATERAL_MIN_REFS)
     sql = f"SELECT {', '.join(select_parts)} FROM {from_sql}"
     if where_clauses:
         sql += " WHERE " + " AND ".join(where_clauses)
     sql += " ORDER BY " + ", ".join(order_parts)
-    params.extend(order_params)
+    for _, p in order_exprs:
+        params.extend(p)
     if query.limit is not None:
         sql += " LIMIT ?"
         params.append(query.limit)
     sql = _finish_pg_row_json(sql, lateral)
 
+    _check_bindings(sql, params, "compiled query")
+    return sql, params
+
+
+def _defers_select(
+    columns: Sequence["ColumnRef"], query: Query, dialect: Optional[Dialect]
+) -> bool:
+    """Whether `compile_query` picks the page first and reads its `select`
+    afterwards (`_compile_deferred_select`): on PostgreSQL, for a page
+    (`limit`) whose `select` reads more than flat columns.
+
+    PostgreSQL computes a plain expression in the `SELECT` list before the
+    `ORDER BY` sort, so when no index gives the order, every matching row's
+    JSON was extracted and all but one page of it thrown away: People in
+    surname order took 0.9 s a page per JSON field over 100k people, against
+    0.1 s in handle order (where the index scan stops at the page). A
+    correlated subquery (`birth.date`) was already left until after the
+    `LIMIT`, which is why it never showed the cost. SQLite measured no gain,
+    so it keeps the single statement."""
+    if dialect != Dialect.POSTGRESQL or query.limit is None:
+        return False
+    return any(not isinstance(column, str) for column in columns)
+
+
+def _compile_deferred_select(
+    spec: ObjectTypeSpec,
+    ordering: Sequence[OrderBy],
+    order_exprs: Sequence[Tuple[str, list]],
+    select_parts: Sequence[str],
+    select_params: Sequence[Any],
+    where_clauses: Sequence[str],
+    where_params: Sequence[Any],
+    limit: int,
+    dialect: Optional[Dialect],
+    treeid: Optional[int],
+) -> Tuple[str, list]:
+    """`compile_query`'s statement as two steps in one: an inner query
+    finds the page -- each row's handle and sort keys, under the same
+    `WHERE`/keyset/`ORDER BY`/`LIMIT` -- and the outer one joins those rows
+    back by primary key and computes `select` for them alone, in the page's
+    order. See `_defers_select` for why.
+
+    The sort keys come out of the inner query as `goql_key_<i>` and both
+    levels sort by those names, so each key (with its `COLLATE`, part of
+    the expression) is computed once per row, and the outer sort reads the
+    same values the inner one chose the page by -- the same rows in the same
+    order as the single statement."""
+    table = spec.table
+    key_parts = [
+        f"{order_sql} AS goql_key_{i}" for i, (order_sql, _) in enumerate(order_exprs)
+    ]
+    inner_body = ", ".join(key_parts) + " ".join(where_clauses)
+    inner_from, inner_lateral = _from_clause(
+        spec, dialect, inner_body, min_refs=_PG_QUERY_LATERAL_MIN_REFS
+    )
+    inner = f"SELECT {table}.handle AS goql_handle, {', '.join(key_parts)} FROM {inner_from}"
+    if where_clauses:
+        inner += " WHERE " + " AND ".join(where_clauses)
+    inner += " ORDER BY " + ", ".join(
+        f"goql_key_{i} {_order_direction_sql(ob, dialect)}" for i, ob in enumerate(ordering)
+    )
+    inner += " LIMIT ?"
+    inner = _finish_pg_row_json(inner, inner_lateral)
+
+    outer_from, outer_lateral = _from_clause(
+        spec, dialect, ", ".join(select_parts), min_refs=_PG_QUERY_LATERAL_MIN_REFS
+    )
+    # `_from_clause` starts with the table itself; the page goes before it,
+    # so the `LATERAL` join (if any) still follows the row it parses.
+    join_on = f"{table}.handle = goql_page.goql_handle"
+    join_params: list = []
+    if treeid is not None:
+        join_on += f" AND {table}.treeid = ?"
+        join_params.append(treeid)
+    # The inner query is finished on its own (its `LATERAL` choice is its
+    # own) and spliced in after the outer one is, so finishing the outer
+    # can't rewrite the inner's parsed-row references.
+    outer_from = outer_from.replace(
+        table, f"(goql_inner_page) AS goql_page JOIN {table} ON {join_on}", 1
+    )
+    sql = f"SELECT {', '.join(select_parts)} FROM {outer_from}"
+    sql += " ORDER BY " + ", ".join(
+        f"goql_page.goql_key_{i} {_order_direction_sql(ob, dialect)}"
+        for i, ob in enumerate(ordering)
+    )
+    sql = _finish_pg_row_json(sql, outer_lateral).replace("goql_inner_page", inner, 1)
+
+    params = list(select_params)
+    for _, p in order_exprs:
+        params.extend(p)
+    params.extend(where_params)
+    params.append(limit)
+    params.extend(join_params)
     _check_bindings(sql, params, "compiled query")
     return sql, params
 
