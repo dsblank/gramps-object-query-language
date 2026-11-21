@@ -59,6 +59,7 @@ p99 latency -- see `object_query.py`'s dispatch.
 
 from __future__ import annotations
 
+import math
 import re
 from collections import OrderedDict
 from typing import Any, Iterator, Optional, Tuple
@@ -71,6 +72,7 @@ from .query import (
     BacklinkClassFilter,
     Backlinks,
     Collection,
+    Arithmetic,
     CollectionCount,
     CollectionPick,
     ColumnIndex,
@@ -396,6 +398,8 @@ def _resolve(
         return _json_array_count(reader, data, ref, spec)
     if isinstance(ref, JsonArrayPick):
         return _json_array_pick(reader, data, ref, spec)
+    if isinstance(ref, Arithmetic):
+        return _arithmetic(reader, data, ref, spec)
     if isinstance(ref, FlatColumnRef):
         return get_flat_column(data, ref.name, spec)
     return get_flat_column(data, ref, spec)
@@ -559,6 +563,37 @@ def _json_array_count(reader: RecordReader, data: Any, count: "JsonArrayCount", 
     if count.condition is None:
         return len(items)
     return sum(1 for item in items if _matches(reader, item, count.condition, count.element_spec))
+
+
+def _arithmetic(reader: RecordReader, data: Any, arithmetic: Arithmetic, spec: ObjectTypeSpec) -> Any:
+    """`Arithmetic`, evaluated -- the counterpart to `query.py`'s
+    `_render_arithmetic`: no value from a side with none, from a non-number
+    (as SQL's cast would fail to give one), or from dividing by zero."""
+
+    def side(operand: Any) -> Any:
+        if isinstance(operand, (int, float)) and not isinstance(operand, bool):
+            return operand
+        value = _resolve(reader, data, operand, spec)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return value
+
+    left, right = side(arithmetic.left), side(arithmetic.right)
+    if left is None or right is None:
+        return None
+    op = arithmetic.op
+    if op == "+":
+        return left + right
+    if op == "-":
+        return left - right
+    if op == "*":
+        return left * right
+    if right == 0:
+        return None
+    if op == "/":
+        return left / right
+    # `//`: the floor of the true quotient, as the SQL computes it.
+    return math.floor(left / right)
 
 
 def _collection_pick(reader: RecordReader, data: Any, pick: CollectionPick) -> Any:
@@ -750,7 +785,7 @@ def _evaluate_tri(reader: RecordReader, data: Any, expr: Any, spec: ObjectTypeSp
         value = _resolve(reader, data, expr.column, spec)
         if value is None:
             return None
-        if isinstance(expr.value, (JsonPath, RelatedObject, FlatColumnRef)):
+        if isinstance(expr.value, (JsonPath, RelatedObject, FlatColumnRef, Arithmetic)):
             substring = _resolve(reader, data, expr.value, spec)
             if substring is None:
                 return None
@@ -759,7 +794,7 @@ def _evaluate_tri(reader: RecordReader, data: Any, expr: Any, spec: ObjectTypeSp
         return str(substring).lower() in str(value).lower()
     if isinstance(expr, Comparison):
         left = _resolve(reader, data, expr.column, spec)
-        if isinstance(expr.value, (JsonPath, RelatedObject, FlatColumnRef)):
+        if isinstance(expr.value, (JsonPath, RelatedObject, FlatColumnRef, Arithmetic)):
             right = _resolve(reader, data, expr.value, spec)
         else:
             right = expr.value

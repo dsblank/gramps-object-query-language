@@ -100,6 +100,8 @@ _TOKEN_RE = re.compile(
 # What the grammar expects at the cursor, from the tokens before the word
 # being typed (see `_expected`):
 # - "operand": the start of a condition -- a name, a function, `not`.
+# - "number": after an arithmetic operator (`+ - * / //`) -- a name or
+#   `len(`, something with a numeric value.
 # - "operator": what follows a complete operand -- a comparison, `in`/
 #   `is`/`not in`, `and`/`or`, and `for`/`if` inside `any(...)`/`[...]`.
 # - "value": the right-hand side of a comparison -- a name, a literal,
@@ -253,6 +255,8 @@ def _expected(text: str) -> Tuple[str, bool]:
         return "in_list", comprehension
     if last[1] in _OPERAND_AFTER and last[0] == "name":
         return "operand", comprehension
+    if last[0] == "other" and last[1] in "+-*/":
+        return "number", comprehension
     if last[0] == "operator":
         return "value", comprehension
     if _ends_operand(last):
@@ -644,6 +648,8 @@ def complete_from_vocabularies(
             candidates = [("[", "punctuation", "list")] + env_names
         elif expected == "path":
             candidates = paths
+        elif expected == "number":
+            candidates = paths + [("len", "function", None)] + env_names
         elif expected == "string":
             candidates = [('"', "punctuation", "text")]
         elif expected == "collection":
@@ -708,7 +714,7 @@ def complete_from_vocabularies(
             role = _expected(before[:chain_start])[0]
             context = _walk(vocabs, namespace, segments, bindings)
             candidates = [] if context is None else _names_at(vocabs, context)
-            if context is not None and role in ("operand", "value", "is_value"):
+            if context is not None and role in ("operand", "value", "is_value", "number"):
                 # `father.families[0]...`: one entry of a collection, across a hop.
                 candidates += _indexable_collections(vocabs, context)
             if role == "iterable":
@@ -717,7 +723,7 @@ def complete_from_vocabularies(
                     for name, kind, detail in candidates
                     if kind == "relationship" or _is_array(detail)
                 ]
-            elif role not in ("operand", "value", "is_value", "path"):
+            elif role not in ("operand", "value", "is_value", "path", "number"):
                 candidates = []
 
     return _results(candidates, prefix, start, bindings, env)

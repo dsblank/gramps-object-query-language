@@ -71,7 +71,9 @@ does today.
 - A list comprehension taken by index picks one matching entry
   (`[a.value for a in attribute_list if a.type.value == AttributeType.OCCUPATION][0]`),
   from a JSON array or a collection (then read on like a relationship).
-  No arithmetic on values (`death.date.dateval[2] - birth.date.dateval[2]`).
+- Arithmetic (`+ - * / //`) on numbers, in where, select and order_by:
+  `(death.date.sortval - birth.date.sortval) // 365`. No `%`, `**`, or
+  functions such as `abs()`/`round()`.
 
 - ~~A `JsonPath` is trusted rather than checked -- an unknown path
   compiles fine and returns NULL for every row~~ -- **Done**: every path is

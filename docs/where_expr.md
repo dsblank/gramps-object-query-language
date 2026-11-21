@@ -1063,6 +1063,40 @@ give you at all:
 Person "birth.date.dateval[6] == 1970"
 ```
 
+## Arithmetic: `+ - * / //`
+
+Numbers can be combined with `+`, `-`, `*`, `/` and `//`, with Python's
+precedence and parentheses, anywhere a value is used -- a comparison (on
+either side), `select` and `order_by`:
+
+```python
+Person "death.date.dateval[2] - birth.date.dateval[2] > 90"
+Person "(death.date.sortval - birth.date.sortval) // 365 > 90"
+Family "mother.birth.date.dateval[2] > father.birth.date.dateval[2] + 10"
+```
+
+The first reads "died more than 90 years after the year they were born";
+the second counts whole years from the exact dates (`sortval` is a day
+count), so someone born in March 1850 who died in February 1930 is 79
+there, 80 by year. The third finds families where the mother is more than
+ten years younger than the father.
+
+- **Numbers only.** Each side is a number, a numeric field, a count
+  (`len(...)`) or a [picked entry](#one-entry-chosen-by-a-condition-0). A
+  date isn't a number: use its `.sortval` (days) or `.dateval[2]` (year).
+  At least one side has to be a field; `2 + 3` is rejected.
+- **`/` and `//`.** `/` divides exactly (`7 / 2` is `3.5`); `//` rounds
+  down, as in Python (`-7 // 2` is `-4`, not SQL's `-3`).
+- **Missing values.** A side with no value (no death event) gives no
+  value, and so does dividing by zero, rather than an error. A comparison
+  against no value is false, as for any missing field.
+- **A date that is there but empty** (an event with no date, or a
+  text-only one) has `sortval` 0 and year 0, which *are* values: a
+  person whose birth event has no date gets a lifespan of nearly 2,000
+  years. Guard with `birth.date.sortval > 0 and death.date.sortval > 0`
+  where it matters.
+- `%` and `**` aren't supported.
+
 ## Selecting values: the same paths in `select`
 
 Everything above describes *which rows* come back. The same path grammar

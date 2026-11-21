@@ -2583,3 +2583,133 @@ def test_picked_entry_sorts(indexed_hop_db):
     )
     db.dbapi.execute(sql, params)
     assert [row[0] for row in db.dbapi.fetchall()][-1] == handles["father"]
+
+
+# --- arithmetic ----------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def lifespan_db():
+    """People with birth and death dates -- a full lifespan, one still
+    living (no death), one with no birth, and a year-only pair -- for
+    `death.date.dateval[2] - birth.date.dateval[2]` and friends."""
+    dbman = CLIDbManager(DbState())
+    dirpath, db_name = dbman.create_new_db_cli("_test_evaluator_lifespan", dbid="sqlite")
+    db = make_database("sqlite")
+    db.load(dirpath)
+    handles = {}
+
+    def event(trans, event_type, year, month=0, day=0):
+        ev = Event()
+        ev.set_type(event_type)
+        date = Date()
+        date.set_yr_mon_day(year, month, day)
+        ev.set_date_object(date)
+        return db.add_event(ev, trans)
+
+    with DbTxn("setup", db) as trans:
+        for key, birth, death in (
+            ("long", (1850, 3, 1), (1930, 2, 1)),  # 80 by year, 79 by days
+            ("short", (1900, 1, 1), (1905, 6, 1)),
+            ("living", (1990, 1, 1), None),
+            ("unborn", None, (1950, 1, 1)),
+            ("years", (1700, 0, 0), (1790, 0, 0)),
+        ):
+            person = Person()
+            person.set_primary_name(_name(key.title(), "Life"))
+            if birth:
+                person.set_birth_ref(_event_ref(event(trans, EventType.BIRTH, *birth)))
+            if death:
+                ref = _event_ref(event(trans, EventType.DEATH, *death))
+                person.add_event_ref(ref)
+                person.set_death_ref(ref)
+            handles[key] = db.add_person(person, trans)
+    yield db, handles
+    db.close()
+    dbman.remove_database(db_name)
+
+
+_LIVES = ("long", "short", "living", "unborn", "years")
+
+
+@pytest.mark.parametrize(
+    "entry, expected",
+    [
+        ("death.date.dateval[2] - birth.date.dateval[2]", {"long": 80, "short": 5, "years": 90}),
+        ("(death.date.sortval - birth.date.sortval) // 365", {"long": 79, "short": 5, "years": 90}),
+        ("birth.date.dateval[2] // 0", {}),
+        ("-birth.date.dateval[2] // 7", {"long": -265, "short": -272, "living": -285, "years": -243}),
+        ("len(event_ref_list) * 10 + 1", {"long": 21, "short": 21, "living": 11, "unborn": 11, "years": 21}),
+    ],
+)
+def test_arithmetic_select(lifespan_db, pg_conn, entry, expected):
+    """Arithmetic gives the same numbers on SQLite, PostgreSQL and the
+    evaluator, whole numbers staying whole, and no value where a side has
+    none or a divisor is zero."""
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+    from gramps_object_query_language.query_lang import parse_select
+
+    db, handles = lifespan_db
+    [(ref, _)] = parse_select(PERSON, [entry + " as v"])
+    want = {handles[key]: expected.get(key) for key in _LIVES}
+    query = Query(select=["handle", ref])
+    sql, params = compile_query(PERSON, query, dialect=Dialect.SQLITE)
+    db.dbapi.execute(sql, params)
+    assert dict(db.dbapi.fetchall()) == want, "SQLite"
+    if pg_conn is not None:
+        sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
+        got = dict(_rows_on_postgresql(pg_conn, db, sql, params))
+        assert got == want, "PostgreSQL"
+        assert all(type(v) is int for v in got.values() if v is not None)
+    for handle, value in want.items():
+        assert resolve_column_ref(db, db.get_person_from_handle(handle), ref, PERSON) == value
+
+
+def test_true_division_is_a_float(lifespan_db, pg_conn):
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+    from gramps_object_query_language.query_lang import parse_select
+
+    db, handles = lifespan_db
+    [(ref, _)] = parse_select(PERSON, ["(death.date.dateval[2] - birth.date.dateval[2]) / 4 as v"])
+    query = Query(select=["handle", ref])
+    sql, params = compile_query(PERSON, query, dialect=Dialect.SQLITE)
+    db.dbapi.execute(sql, params)
+    assert dict(db.dbapi.fetchall())[handles["short"]] == 1.25
+    if pg_conn is not None:
+        sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
+        assert dict(_rows_on_postgresql(pg_conn, db, sql, params))[handles["short"]] == 1.25
+    assert resolve_column_ref(db, db.get_person_from_handle(handles["short"]), ref, PERSON) == 1.25
+
+
+@pytest.mark.parametrize(
+    "where_expr, expected",
+    [
+        ("death.date.dateval[2] - birth.date.dateval[2] > 85", {"years"}),
+        ("death.date.dateval[2] > birth.date.dateval[2] + 85", {"years"}),
+        ("10 > death.date.dateval[2] - birth.date.dateval[2]", {"short"}),
+        ("death.date.dateval[2] == birth.date.dateval[2] + 80", {"long"}),
+        # No value isn't "not more than 50" either (see Not's missing-value rule).
+        ("not (death.date.dateval[2] - birth.date.dateval[2] > 50)", {"short"}),
+    ],
+)
+def test_arithmetic_where(lifespan_db, pg_conn, where_expr, expected):
+    db, handles = lifespan_db
+    _assert_sql_and_evaluator_agree(db, handles, PERSON, _LIVES, where_expr, expected, pg_conn)
+
+
+def test_arithmetic_sort_pages_on_postgresql(lifespan_db, pg_conn):
+    """Sorting by a computed value pages like any other sort key."""
+    from gramps_object_query_language.query_lang import parse_order_by, parse_select
+
+    if pg_conn is None:
+        pytest.skip("needs GOQL_TEST_POSTGRES_DSN")
+    db, _ = lifespan_db
+    select = [ref for ref, _ in parse_select(PERSON, ["handle", "death.date.dateval[2] - birth.date.dateval[2] as age"])]
+    order_by = parse_order_by(PERSON, ["-(death.date.dateval[2] - birth.date.dateval[2])"])
+
+    def run(sql, params):
+        return _rows_on_postgresql(pg_conn, db, sql, params)
+
+    expected = _one_query(run, PERSON, select, order_by)
+    assert len(expected) == 5
+    assert _page_through(run, PERSON, select, order_by) == expected

@@ -2819,3 +2819,35 @@ def test_picked_entry_parses_in_select_where_and_order_by():
 def test_picked_entry_rejects(entry, message):
     with pytest.raises(QueryLangError, match=re.escape(message)):
         parse_select(PERSON, [entry + " as v"], env={"N": 0})
+
+
+# --- arithmetic ------------------------------------------------------------------
+
+
+def test_arithmetic_parses_in_select_where_and_order_by():
+    from gramps_object_query_language.query import Arithmetic
+
+    entry = "(death.date.sortval - birth.date.sortval) // 365"
+    [(ref, key)] = parse_select(PERSON, [entry])
+    assert isinstance(ref, Arithmetic) and ref.op == "//" and ref.integral
+    assert key == entry
+    assert parse_order_by(PERSON, ["-" + entry])[0].column == ref
+    assert compile_expr_for_spec(PERSON, entry + " > 80").column == ref
+    [(ratio, _)] = parse_select(PERSON, ["len(event_ref_list) / 2 as r"])
+    assert not ratio.integral
+
+
+@pytest.mark.parametrize(
+    "entry, message",
+    [
+        ("birth.date - death.date", "for a date, use birth.date.sortval"),
+        ("gramps_id + 1", "gramps_id isn't a number"),
+        ("1 + 2", "at least one field"),
+        ("birth.date.sortval % 7", "supported: + - * / //"),
+        ("birth.date.sortval + 'x'", "needs numbers, not 'x'"),
+        ("birth.date.sortval + True", "needs numbers, not True"),
+    ],
+)
+def test_arithmetic_rejects(entry, message):
+    with pytest.raises(QueryLangError, match=re.escape(message)):
+        parse_select(PERSON, [entry + " as v"])

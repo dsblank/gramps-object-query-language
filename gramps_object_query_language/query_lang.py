@@ -152,6 +152,7 @@ from .query import (
     And,
     BacklinkClassFilter,
     Backlinks,
+    Arithmetic,
     CollectionCount,
     CollectionPick,
     ColumnRef,
@@ -648,6 +649,81 @@ def _translate_pick(call: ast.Call, rest: List[Union[str, int]], spec: ObjectTyp
     return {"pick": payload}
 
 
+_ARITHMETIC_AST_OPS = {
+    ast.Add: "+",
+    ast.Sub: "-",
+    ast.Mult: "*",
+    ast.Div: "/",
+    ast.FloorDiv: "//",
+}
+
+
+def _is_number_literal(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, (int, float))
+        and not isinstance(node.value, bool)
+    )
+
+
+def _translate_arithmetic(node: ast.AST, spec: ObjectTypeSpec) -> dict:
+    """`{"arithmetic": {"op": ..., "left": ..., "right": ...}}` for `a + b`,
+    `(a - b) // 365`, ...: each side `{"number": n}` for a literal, another
+    arithmetic, or a column (`_translate_column_or_computed`). A unary minus
+    on a column is `0 - column`. At least one side somewhere must be a
+    column; `2 + 3` is just a number."""
+
+    def operand(side: ast.AST) -> dict:
+        if _is_number_literal(side):
+            return {"number": side.value}  # type: ignore[attr-defined]
+        if isinstance(side, ast.UnaryOp) and isinstance(side.op, (ast.USub, ast.UAdd)):
+            inner = operand(side.operand)
+            if isinstance(side.op, ast.UAdd):
+                return inner
+            if "number" in inner:
+                return {"number": -inner["number"]}
+            return {"arithmetic": {"op": "-", "left": {"number": 0}, "right": inner}}
+        if isinstance(side, ast.BinOp):
+            return _translate_arithmetic(side, spec)
+        if isinstance(side, ast.Constant):
+            raise QueryLangError(f"arithmetic needs numbers, not {side.value!r}")
+        return {"column": _translate_column_or_computed(side, spec)}
+
+    if not isinstance(node, ast.BinOp) or type(node.op) not in _ARITHMETIC_AST_OPS:
+        raise QueryLangError(
+            f"unsupported arithmetic operator (supported: + - * / //): {ast.dump(node)}"
+        )
+    result = {
+        "arithmetic": {
+            "op": _ARITHMETIC_AST_OPS[type(node.op)],
+            "left": operand(node.left),
+            "right": operand(node.right),
+        }
+    }
+    if not _reads_a_column(result):
+        raise QueryLangError(
+            f"arithmetic needs at least one field, not only numbers: {ast.dump(node)}"
+        )
+    return result
+
+
+def _reads_a_column(operand: dict) -> bool:
+    if "column" in operand:
+        return True
+    if "arithmetic" in operand:
+        payload = operand["arithmetic"]
+        return _reads_a_column(payload["left"]) or _reads_a_column(payload["right"])
+    return False
+
+
+def _is_arithmetic(node: ast.AST) -> bool:
+    return isinstance(node, ast.BinOp) or (
+        isinstance(node, ast.UnaryOp)
+        and isinstance(node.op, ast.USub)
+        and not _is_number_literal(node.operand)
+    )
+
+
 def _translate_column_or_computed(node: ast.AST, spec: ObjectTypeSpec) -> Union[str, dict]:
     """A comparison's column-like side: an ordinary path (`_translate_column`),
     or a `count(...)`/`len(...)` call -- the one place a "column" can be a
@@ -657,6 +733,12 @@ def _translate_column_or_computed(node: ast.AST, spec: ObjectTypeSpec) -> Union[
     scope only ever treats either as *the* column, never as something
     compared against another field (see ROADMAP.md).
     """
+    if isinstance(node, ast.BinOp):
+        return _translate_arithmetic(node, spec)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub) and not _is_number_literal(node.operand):
+        return _translate_arithmetic(
+            ast.BinOp(left=ast.Constant(value=0), op=ast.Sub(), right=node.operand), spec
+        )
     picked = _pick_root(node)
     if picked is not None:
         return _translate_pick(*picked, spec)
@@ -815,13 +897,23 @@ def _translate_compare(node: ast.Compare, spec: ObjectTypeSpec) -> dict:
             or _is_count_call(left)
             or _is_len_call(left)
             or _pick_root(left) is not None
+            or _is_arithmetic(left)
         ):
             # "field OP value" / "field OP field" -- the shape this function
             # always assumed until operand-ordering was generalized. `left`
             # is the column (or `count(...)`/`len(...)`); `rhs` is either
             # another field (`value_column`) or an ordinary value.
             column = _translate_column_or_computed(left, spec)
-            if _is_path_node(rhs):
+            if _is_arithmetic(rhs):
+                # "death.date.dateval[2] > birth.date.dateval[2] + 80":
+                # a computed value on the right, compared field-vs-field.
+                if isinstance(column, dict) and ("count_of" in column or "length_of" in column):
+                    raise QueryLangError(
+                        f"count(...)/len(...) only support comparison against a literal "
+                        f"value, not a field: {ast.dump(node)}"
+                    )
+                leaf = {"column": column, "op": op, "value_column": _translate_column_or_computed(rhs, spec)}
+            elif _is_path_node(rhs):
                 if isinstance(column, dict) and ("count_of" in column or "length_of" in column):
                     # count(...)/len(...) are left-hand-side-only, against a
                     # literal (v1 scope, see ROADMAP.md) -- field-vs-field
@@ -840,7 +932,7 @@ def _translate_compare(node: ast.Compare, spec: ObjectTypeSpec) -> dict:
             else:
                 value = _translate_value(rhs)
                 leaf = {"column": column, "op": op, "value": value}
-        elif _is_path_node(rhs):
+        elif _is_path_node(rhs) or _is_arithmetic(rhs):
             # "value OP field", e.g. "Date('Jan 1, 1968') < mother.birth.sortval"
             # -- the literal happened to be written on the left. Flip the
             # operator so the column still renders on the wire's left, the
@@ -850,7 +942,7 @@ def _translate_compare(node: ast.Compare, spec: ObjectTypeSpec) -> dict:
             # qualifies as "the column" on this side, matching their
             # existing left-hand-side-only v1 scope untouched.
             value = _translate_value(left)
-            column = _translate_column(rhs, spec)
+            column = _translate_column_or_computed(rhs, spec) if _is_arithmetic(rhs) else _translate_column(rhs, spec)
             leaf = {"column": column, "op": _FLIP_OP[op], "value": value}
         else:
             raise QueryLangError(
@@ -1563,6 +1655,81 @@ _OP_CLASSES: dict[str, type] = {
 VALID_LEAF_OPS = frozenset(_OP_CLASSES) | {"in", "like", "regex", "contains"}
 
 
+def _arithmetic_side(operand: dict, spec: ObjectTypeSpec) -> Tuple[Any, bool]:
+    """One side of `{"arithmetic": ...}`: `(value, whole)` -- a literal, a
+    numeric column, or a nested `Arithmetic`, and whether it's a whole
+    number. A column that isn't a number is refused, a date with a hint."""
+    if "number" in operand:
+        number = operand["number"]
+        if isinstance(number, bool) or not isinstance(number, (int, float)):
+            raise QueryError(f"arithmetic needs numbers, not {number!r}")
+        return number, isinstance(number, int)
+    if "arithmetic" in operand:
+        arithmetic = _arithmetic_from_json(operand["arithmetic"], spec)
+        return arithmetic, arithmetic.integral
+    ref = json_column_to_ref(operand["column"], spec)
+    if _value_kind(ref, spec) != "number" and not _holds_numbers(ref, spec):
+        try:
+            name = default_ref_key(ref)
+        except QueryError:
+            name = "this value"
+        hint = ""
+        if name.endswith("date"):
+            hint = f" -- for a date, use {name}.sortval (a day count) or {name}.dateval[2] (its year)"
+        raise QueryError(f"{name} isn't a number, so it can't be used in arithmetic{hint}")
+    return ref, _whole_number(ref, spec)
+
+
+def _schema_types(ref: ColumnRef, spec: ObjectTypeSpec) -> set:
+    """The JSON types the schema gives a column's value (no `null`), or an
+    empty set when it can't say."""
+    while isinstance(ref, RelatedObject):
+        spec, ref = ref.target, ref.field
+    if isinstance(ref, JsonArrayPick):
+        if ref.field is None:
+            return set()
+        spec, ref = ref.element_spec, ref.field
+    if isinstance(ref, FlatColumnRef):
+        ref = ref.name
+    if isinstance(ref, str):
+        ref = JsonPath((ref,))
+    try:
+        value_type = ref_value_type(spec, ref)
+    except QueryError:
+        return set()
+    types = set(value_type) if isinstance(value_type, list) else {value_type}
+    types.discard("null")
+    return types
+
+
+def _holds_numbers(ref: ColumnRef, spec: ObjectTypeSpec) -> bool:
+    """A list item the schema types as a number *or* a flag -- a date's
+    `dateval`, whose `[2]` is its year and `[3]` its BC flag."""
+    types = _schema_types(ref, spec)
+    return bool(types & {"integer", "number"}) and types <= {"integer", "number", "boolean"}
+
+
+def _whole_number(ref: ColumnRef, spec: ObjectTypeSpec) -> bool:
+    """Whether a numeric column holds whole numbers (the schema says
+    `integer`, or it's a count)."""
+    if isinstance(ref, (CollectionCount, JsonArrayCount, Length)):
+        return True
+    return _schema_types(ref, spec) - {"boolean"} == {"integer"}
+
+
+def _arithmetic_from_json(payload: dict, spec: ObjectTypeSpec) -> Arithmetic:
+    op = payload["op"]
+    left, left_whole = _arithmetic_side(payload["left"], spec)
+    right, right_whole = _arithmetic_side(payload["right"], spec)
+    if op == "/":
+        integral = False
+    elif op == "//":
+        integral = True
+    else:
+        integral = left_whole and right_whole
+    return Arithmetic(op, left, right, integral)
+
+
 def _pick_from_json(payload: dict, spec: ObjectTypeSpec) -> ColumnRef:
     """`{"pick": ...}` (see `_translate_pick`) as a `RelatedObject` whose
     handle is a `CollectionPick`, or a `JsonArrayPick`."""
@@ -1653,6 +1820,8 @@ def json_column_to_ref(column: Union[str, dict], spec: ObjectTypeSpec) -> Column
         return resolve_length_path(spec, segments, base_column)
     if "pick" in column:
         return _pick_from_json(column["pick"], spec)
+    if "arithmetic" in column:
+        return _arithmetic_from_json(column["arithmetic"], spec)
     if "length_of_matching" in column:
         payload = column["length_of_matching"]
         array_ref, element_spec = resolve_any_path(spec, payload["path"])
@@ -1666,7 +1835,7 @@ def _value_kind(column: ColumnRef, spec: ObjectTypeSpec) -> Optional[str]:
     scalar kind `column` holds (nullable or not); `None` for anything else
     (an object, an array, a mixed type, or a type the schema doesn't give).
     """
-    if isinstance(column, (CollectionCount, JsonArrayCount, Length)):
+    if isinstance(column, (CollectionCount, JsonArrayCount, Length, Arithmetic)):
         return "number"
     if isinstance(column, JsonArrayPick):
         if column.field is None:

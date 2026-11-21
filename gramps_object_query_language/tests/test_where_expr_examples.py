@@ -385,6 +385,14 @@ def test_picked_entry_by_condition(db):
         )
 
 
+def test_arithmetic(db):
+    # Whole years from the fixture's sortvals: dad1 (1940-1990, 50),
+    # granddad1 (55), grandma1 (52) and other1 (1900-1980, 80) lived more
+    # than 40 years; mom1 (1945-1970) didn't, and kid1 has no death.
+    result = run(db, "Person", "(death.date.sortval - birth.date.sortval) // 365 > 40")
+    assert result == [("dad1",), ("granddad1",), ("grandma1",), ("other1",)]
+
+
 def test_birth_date_sortval(db):
     # 1968 (sortval 2439857) or later.
     result = run(db, "Person", "birth.date.sortval >= 2439857")

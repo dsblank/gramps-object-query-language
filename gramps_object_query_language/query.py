@@ -371,6 +371,8 @@ def ref_value_type(spec: ObjectTypeSpec, ref: "ColumnRef") -> Any:
         if ref.field is None:
             return "object"
         return path_value_type(ref.element_spec, ref.field.segments)
+    if isinstance(ref, Arithmetic):
+        return "integer" if ref.integral else "number"
     return None
 
 
@@ -754,6 +756,43 @@ class JsonArrayCount:
 
     def __repr__(self) -> str:
         return f"JsonArrayCount({self.array!r}, {self.condition!r})"
+
+
+#: The arithmetic operators an expression may use, Python's spelling.
+ARITHMETIC_OPS = ("+", "-", "*", "/", "//")
+
+
+@dataclass(frozen=True)
+class Arithmetic:
+    """`left <op> right` over numbers: `death.date.dateval[2] -
+    birth.date.dateval[2]`, `(death.date.sortval - birth.date.sortval) //
+    365`. Each side is a number literal, a numeric `ColumnRef` (a path, a
+    count, a picked entry) or another `Arithmetic`.
+
+    Means what Python means, with SQL's missing values: a side with no value
+    gives no value, and so does dividing by zero (rather than an error).
+    `/` is true division; `//` rounds down (toward minus infinity, as in
+    Python, not toward zero as SQL's integer division does).
+
+    `integral`: whether the result is a whole number (`+`/`-`/`*` of whole
+    numbers, and every `//`), which PostgreSQL casts it back to so a
+    client gets `80`, not `80.0` or a decimal.
+    """
+
+    op: str
+    left: Any
+    right: Any
+    integral: bool
+
+    def __post_init__(self) -> None:
+        if self.op not in ARITHMETIC_OPS:
+            raise QueryError(f"unsupported arithmetic operator: {self.op!r}")
+        for side in (self.left, self.right):
+            if isinstance(side, bool):
+                raise QueryError("arithmetic needs numbers, not True/False")
+
+    def __repr__(self) -> str:
+        return f"Arithmetic({self.left!r} {self.op} {self.right!r})"
 
 
 @dataclass(frozen=True)
@@ -1420,7 +1459,8 @@ class FlatColumnRef:
 # `field: ColumnRef` on `RelatedObject` makes this recursive, so a chain
 # like `birth.place.title` is itself a valid `ColumnRef`.
 ColumnRef = Union[
-    str, JsonPath, RelatedObject, CollectionCount, FlatColumnRef, Length, JsonArrayCount, JsonArrayPick
+    str, JsonPath, RelatedObject, CollectionCount, FlatColumnRef, Length, JsonArrayCount, JsonArrayPick,
+    Arithmetic,
 ]
 SelectRef = ColumnRef
 
@@ -1828,7 +1868,9 @@ def _render_column(
     elif isinstance(column, JsonArrayCount):
         sql, params = _render_json_array_count(column, spec, dialect, treeid)
     elif isinstance(column, JsonArrayPick):
-        sql, params = _render_json_array_pick(column, spec, dialect, treeid)
+        sql, params = _render_json_array_pick(column, spec, dialect, treeid, value)
+    elif isinstance(column, Arithmetic):
+        sql, params = _render_arithmetic(column, spec, dialect, treeid)
     else:
         if isinstance(column, FlatColumnRef):
             column = column.name
@@ -1973,7 +2015,7 @@ class Comparison:
         treeid: Optional[int] = None,
         collation: Optional[str] = None,
     ) -> Tuple[str, list]:
-        is_field_comparison = isinstance(self.value, (JsonPath, RelatedObject, FlatColumnRef))
+        is_field_comparison = isinstance(self.value, (JsonPath, RelatedObject, FlatColumnRef, Arithmetic))
         # A field-vs-field comparison has no literal runtime value to infer
         # a numeric/boolean cast from (unlike field-vs-value) -- pick it
         # structurally instead: an *ordering* comparison between two paths
@@ -1986,7 +2028,12 @@ class Comparison:
         # `cast_hint` naturally falls back to `self.value` there (a
         # JsonPath/RelatedObject instance, neither bool nor numeric, so it
         # still renders as TEXT on both sides via the existing type checks).
-        cast_hint = 0 if is_field_comparison and self.op in _ORDERING_OPS else self.value
+        # A computed side (`a + b`) is always a number, so the other side
+        # is read as one too, for `==` as much as for `<`.
+        numeric = self.op in _ORDERING_OPS or isinstance(self.value, Arithmetic) or isinstance(
+            self.column, Arithmetic
+        )
+        cast_hint = 0 if is_field_comparison and numeric else self.value
         sql_op = self._sql_op(dialect)
         column_sql, column_params = _render_column(
             self.column, spec, dialect, value=cast_hint, treeid=treeid
@@ -2758,6 +2805,52 @@ def _render_json_array_count(
     return f"(SELECT COUNT(*) FROM {body})", params
 
 
+def _render_arithmetic(
+    arithmetic: Arithmetic,
+    spec: ObjectTypeSpec,
+    dialect: Optional[Dialect],
+    treeid: Optional[int],
+) -> Tuple[str, list]:
+    """`Arithmetic` as SQL. Each side renders as a number (PostgreSQL casts
+    a JSON value to NUMERIC, as for a numeric comparison); a literal side
+    is bound. A zero divisor becomes NULL (`NULLIF`), since PostgreSQL would
+    otherwise fail the whole query. `//` floors the quotient: SQLite has no
+    guaranteed `floor()`, so it truncates and steps down for a negative
+    non-whole quotient, computing that quotient once in a FROM subquery."""
+    if dialect is None:
+        raise QueryError("a dialect is required to compile arithmetic, but none was given")
+
+    def side(operand: Any) -> Tuple[str, list]:
+        if isinstance(operand, (int, float)) and not isinstance(operand, bool):
+            return "?", [operand]
+        return _render_column(operand, spec, dialect, value=0, treeid=treeid)
+
+    left_sql, left_params = side(arithmetic.left)
+    right_sql, right_params = side(arithmetic.right)
+    params = left_params + right_params
+    op = arithmetic.op
+    if dialect == Dialect.SQLITE:
+        if op == "/":
+            return f"({left_sql} * 1.0 / NULLIF({right_sql}, 0))", params
+        if op == "//":
+            return (
+                "(SELECT CAST(goql_div.x AS INTEGER) - (goql_div.x < CAST(goql_div.x AS INTEGER)) "
+                f"FROM (SELECT {left_sql} * 1.0 / NULLIF({right_sql}, 0) AS x) AS goql_div)",
+                params,
+            )
+        return f"({left_sql} {op} {right_sql})", params
+    if dialect == Dialect.POSTGRESQL:
+        if op == "/":
+            sql = f"CAST({left_sql} AS DOUBLE PRECISION) / NULLIF({right_sql}, 0)"
+        elif op == "//":
+            sql = f"FLOOR(CAST({left_sql} AS NUMERIC) / NULLIF({right_sql}, 0))"
+        else:
+            sql = f"{left_sql} {op} {right_sql}"
+        cast = "BIGINT" if arithmetic.integral else "DOUBLE PRECISION"
+        return f"CAST(({sql}) AS {cast})", params
+    raise QueryError(f"unsupported dialect: {dialect!r}")
+
+
 def _entry_order(alias: str, dialect: Dialect) -> str:
     """An unnested array entry's position: SQLite's `json_each` gives it as
     `key`, PostgreSQL's `WITH ORDINALITY` as `ord` (see the `ordered`
@@ -2799,6 +2892,7 @@ def _render_json_array_pick(
     outer_spec: ObjectTypeSpec,
     dialect: Optional[Dialect],
     treeid: Optional[int],
+    value: Any = None,
 ) -> Tuple[str, list]:
     """`(SELECT <field of the entry> FROM <array body> ORDER BY <entry
     position> LIMIT 1 OFFSET <index>)` -- `JsonArrayPick`'s rendering, over
@@ -2816,7 +2910,9 @@ def _render_json_array_pick(
     if pick.field is None:
         field_sql, field_params = f"{alias}.value", []
     else:
-        field_sql, field_params = _render_json_path(pick.field, dialect)
+        # `value` picks PostgreSQL's cast, as for any path (see
+        # `_render_json_path`): numeric against a number.
+        field_sql, field_params = _render_json_path(pick.field, dialect, value)
     order = _entry_order(alias, dialect)
     return (
         f"(SELECT {field_sql} FROM {body} ORDER BY {order} LIMIT 1 OFFSET {pick.index})",
