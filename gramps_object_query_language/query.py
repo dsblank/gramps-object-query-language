@@ -367,6 +367,12 @@ def ref_value_type(spec: ObjectTypeSpec, ref: "ColumnRef") -> Any:
         return path_value_type(spec, ref.segments)
     if isinstance(ref, CollectionCount):
         return "integer"
+    if isinstance(ref, JsonArrayPick):
+        if ref.field is None:
+            return "object"
+        return path_value_type(ref.element_spec, ref.field.segments)
+    if isinstance(ref, Arithmetic):
+        return "integer" if ref.integral else "number"
     return None
 
 
@@ -752,6 +758,88 @@ class JsonArrayCount:
         return f"JsonArrayCount({self.array!r}, {self.condition!r})"
 
 
+#: The arithmetic operators an expression may use, Python's spelling.
+ARITHMETIC_OPS = ("+", "-", "*", "/", "//")
+
+
+@dataclass(frozen=True)
+class Arithmetic:
+    """`left <op> right` over numbers: `death.date.dateval[2] -
+    birth.date.dateval[2]`, `(death.date.sortval - birth.date.sortval) //
+    365`. Each side is a number literal, a numeric `ColumnRef` (a path, a
+    count, a picked entry) or another `Arithmetic`.
+
+    Means what Python means, with SQL's missing values: a side with no value
+    gives no value, and so does dividing by zero (rather than an error).
+    `/` is true division; `//` rounds down (toward minus infinity, as in
+    Python, not toward zero as SQL's integer division does).
+
+    `integral`: whether the result is a whole number (`+`/`-`/`*` of whole
+    numbers, and every `//`), which PostgreSQL casts it back to so a
+    client gets `80`, not `80.0` or a decimal.
+    """
+
+    op: str
+    left: Any
+    right: Any
+    integral: bool
+
+    def __post_init__(self) -> None:
+        if self.op not in ARITHMETIC_OPS:
+            raise QueryError(f"unsupported arithmetic operator: {self.op!r}")
+        for side in (self.left, self.right):
+            if isinstance(side, bool):
+                raise QueryError("arithmetic needs numbers, not True/False")
+
+    def __repr__(self) -> str:
+        return f"Arithmetic({self.left!r} {self.op} {self.right!r})"
+
+
+@dataclass(frozen=True)
+class CollectionPick:
+    """`[f for f in parent_families if <condition>][<index>]` -- the handle
+    of the `index`-th related record (in the order the collection lists
+    them) that matches `condition` (every one, if `None`). Only ever a
+    `RelatedObject.handle_ref`, so the path goes on into that record
+    exactly as it does after `father` or `parent_families[0]`:
+    `[f for f in parent_families if f.father.surname == 'Smith'][0].mother.primary_name`.
+
+    `owner`: the type whose row lists the collection, for the subquery's
+    correlation (see `_render_collection_pick`). Not for `Backlinks` or a
+    self-linked collection -- see `query_lang.py`'s `_translate_pick`.
+    """
+
+    collection: Collection
+    owner: ObjectTypeSpec
+    condition: Optional[Any]
+    index: int
+
+    def __repr__(self) -> str:
+        return f"CollectionPick({self.collection.name!r}, {self.condition!r}, {self.index})"
+
+
+@dataclass(frozen=True)
+class JsonArrayPick:
+    """`[a.value for a in attribute_list if <condition>][<index>]` -- one
+    element of a plain JSON array (see `JsonArrayExists` for `array`/
+    `element_spec`): the `index`-th, in stored order, of those matching
+    `condition` (every one, if `None`), then `field` read from it (a
+    `JsonPath` against the element, `base_column` its unnest alias), or the
+    element itself when `field` is `None`. NULL when fewer match.
+    """
+
+    array: "ColumnRef"
+    element_spec: ObjectTypeSpec
+    condition: Optional[Any]
+    index: int
+    field: Optional[JsonPath] = None
+
+    def __repr__(self) -> str:
+        return (
+            f"JsonArrayPick({self.array!r}, {self.condition!r}, {self.index}, {self.field!r})"
+        )
+
+
 @dataclass(frozen=True)
 class Backlinks:
     """Pseudo-collection: `EXISTS`/`COUNT` against Gramps' own `reference`
@@ -1121,6 +1209,52 @@ def resolve_collection(spec: ObjectTypeSpec, name: str) -> Union[Collection, Bac
     return collections[name]
 
 
+def _resolve_indexed_collection_hop(
+    spec: ObjectTypeSpec, segments: Sequence[Union[str, int]], base_column: str
+) -> Optional[RelatedObject]:
+    """`<collection>[<n>].<field>` -- the record the n-th entry of a
+    collection links to, read like a one-to-one relationship:
+    `parent_families[0].father.primary_name` (a person's main parents'
+    father), `citations[0].source.title`, `children[1].birth.date`.
+
+    Compiles to the same correlated subquery a `RelatedObject` always does,
+    with the handle read from that entry of the collection's own list
+    (`parent_family_list[0]`, `child_ref_list[1].ref`). An entry that isn't
+    there gives NULL, the same as a missing birth event.
+
+    Returns `None` when `segments` isn't this shape, so the caller goes on
+    to its other readings. Only an ordinary collection stored on the row
+    itself qualifies: not `backlinks` (stored on other rows), and not a
+    self-linked one such as `child_refs` (its entries are about this person,
+    not a record to hop to). Never inside an `any()`/`len()` condition
+    (`base_column` other than `json_data`), where a hop's handle would have
+    to come from the array element rather than the row.
+    """
+    if base_column != "json_data" or len(segments) < 2:
+        return None
+    head, index, *rest = segments
+    if not isinstance(head, str) or not isinstance(index, int) or isinstance(index, bool):
+        return None
+    collection = _COLLECTIONS.get(spec.table, {}).get(head)
+    if not isinstance(collection, Collection) or collection.self_link_field is not None:
+        return None
+    if not rest:
+        raise QueryError(
+            f"{head}[{index}] is a {collection.target.table} record, not a value on "
+            f"its own -- use {head}[{index}].<field>, e.g. {head}[{index}].gramps_id"
+        )
+    handle_segments: Tuple[Union[str, int], ...] = (*collection.list_path.segments, index)
+    if collection.ref_field is not None:
+        handle_segments += (collection.ref_field,)
+    field = resolve_column_path(collection.target, rest)
+    return RelatedObject(
+        name=f"{head}[{index}]",
+        target=collection.target,
+        handle_ref=JsonPath(handle_segments),
+        field=field,
+    )
+
+
 def resolve_column_path(
     spec: ObjectTypeSpec, segments: Sequence[Union[str, int]], base_column: str = "json_data"
 ) -> ColumnRef:
@@ -1174,6 +1308,9 @@ def resolve_column_path(
         target_spec, handle_ref = relationships[head]
         field = resolve_column_path(target_spec, rest, base_column)
         return RelatedObject(name=head, target=target_spec, handle_ref=handle_ref, field=field)
+    indexed = _resolve_indexed_collection_hop(spec, segments, base_column)
+    if indexed is not None:
+        return indexed
     # Not a flat column and not a relationship -- so it's a path into
     # `json_data`, checked against the type's own Gramps JSON Schema
     # before it's built (see `walk_schema`). An unknown path is a mistake,
@@ -1272,6 +1409,8 @@ def default_ref_key(ref: "ColumnRef") -> str:
     if isinstance(ref, FlatColumnRef):
         return ref.name
     if isinstance(ref, RelatedObject):
+        if isinstance(ref.handle_ref, CollectionPick):
+            raise QueryError("a picked entry has no path spelling -- supply a key")
         return f"{ref.name}.{default_ref_key(ref.field)}"
     if isinstance(ref, JsonPath):
         parts: List[str] = []
@@ -1319,7 +1458,10 @@ class FlatColumnRef:
 # `FlatColumnRef`) a flat column marked as a field rather than a literal --
 # `field: ColumnRef` on `RelatedObject` makes this recursive, so a chain
 # like `birth.place.title` is itself a valid `ColumnRef`.
-ColumnRef = Union[str, JsonPath, RelatedObject, CollectionCount, FlatColumnRef, Length, JsonArrayCount]
+ColumnRef = Union[
+    str, JsonPath, RelatedObject, CollectionCount, FlatColumnRef, Length, JsonArrayCount, JsonArrayPick,
+    Arithmetic,
+]
 SelectRef = ColumnRef
 
 
@@ -1482,7 +1624,7 @@ def _postgresql_handle_ref_path_sql(
 
 
 def _render_handle_ref(
-    handle_ref: ColumnRef, outer_table: str, dialect: Dialect
+    handle_ref: ColumnRef, outer_table: str, dialect: Dialect, treeid: Optional[int] = None
 ) -> Tuple[str, Optional[str]]:
     """Render the SQL expression that finds a related row's handle from the
     current row, plus the name of the column to guard with `>= 0` if
@@ -1492,6 +1634,8 @@ def _render_handle_ref(
     """
     if isinstance(handle_ref, str):
         return f"{outer_table}.{_quote_column(handle_ref, dialect)}", None
+    if isinstance(handle_ref, CollectionPick):
+        raise QueryError("a picked collection entry renders with its parameters")
     if isinstance(handle_ref, JsonPath):
         index_columns = [
             segment.column
@@ -1520,6 +1664,8 @@ def _guarded_handle_ref_sql(
 ) -> str:
     """`_render_handle_ref`'s SQL expression, with the dynamic-index `>= 0`
     guard already applied when needed -- see `_render_related_object`.
+    (A `CollectionPick` handle carries parameters, so it goes through
+    `_handle_ref_sql_and_params` instead.)
     """
     handle_sql, guard_column = _render_handle_ref(handle_ref, outer_table, dialect)
     if guard_column is not None:
@@ -1527,6 +1673,16 @@ def _guarded_handle_ref_sql(
             f"CASE WHEN {outer_table}.{guard_column} >= 0 THEN {handle_sql} ELSE NULL END"
         )
     return handle_sql
+
+
+def _handle_ref_sql_and_params(
+    handle_ref: ColumnRef, outer_table: str, dialect: Dialect, treeid: Optional[int]
+) -> Tuple[str, list]:
+    """`_guarded_handle_ref_sql`, plus a `CollectionPick`'s subquery, which
+    (unlike every other handle reference) binds parameters."""
+    if isinstance(handle_ref, CollectionPick):
+        return _render_collection_pick(handle_ref, outer_table, dialect, treeid)
+    return _guarded_handle_ref_sql(handle_ref, outer_table, dialect), []
 
 
 def _render_related_object(
@@ -1599,7 +1755,9 @@ def _render_related_object(
     target_table = related.target.table
     target_alias = f"{target_table}__hop{_depth}"
 
-    handle_sql = _guarded_handle_ref_sql(related.handle_ref, outer_table, dialect)
+    handle_sql, handle_params = _handle_ref_sql_and_params(
+        related.handle_ref, outer_table, dialect, treeid
+    )
 
     if isinstance(related.field, RelatedObject):
         field_sql, field_params = _render_related_object(
@@ -1634,7 +1792,9 @@ def _render_related_object(
         f"(SELECT {field_sql} FROM {target_table} AS {target_alias} "
         f"WHERE {' AND '.join(subquery_where)} LIMIT 1)"
     )
-    return subquery, field_params + where_params
+    # Placeholders in text order: the field's (SELECT list), then the
+    # handle's and the tree's (WHERE).
+    return subquery, field_params + handle_params + where_params
 
 
 def _check_bindings(sql: str, params: Sequence[Any], what: str) -> None:
@@ -1707,6 +1867,10 @@ def _render_column(
         sql, params = _render_length(column, dialect)
     elif isinstance(column, JsonArrayCount):
         sql, params = _render_json_array_count(column, spec, dialect, treeid)
+    elif isinstance(column, JsonArrayPick):
+        sql, params = _render_json_array_pick(column, spec, dialect, treeid, value)
+    elif isinstance(column, Arithmetic):
+        sql, params = _render_arithmetic(column, spec, dialect, treeid)
     else:
         if isinstance(column, FlatColumnRef):
             column = column.name
@@ -1851,7 +2015,7 @@ class Comparison:
         treeid: Optional[int] = None,
         collation: Optional[str] = None,
     ) -> Tuple[str, list]:
-        is_field_comparison = isinstance(self.value, (JsonPath, RelatedObject, FlatColumnRef))
+        is_field_comparison = isinstance(self.value, (JsonPath, RelatedObject, FlatColumnRef, Arithmetic))
         # A field-vs-field comparison has no literal runtime value to infer
         # a numeric/boolean cast from (unlike field-vs-value) -- pick it
         # structurally instead: an *ordering* comparison between two paths
@@ -1864,7 +2028,12 @@ class Comparison:
         # `cast_hint` naturally falls back to `self.value` there (a
         # JsonPath/RelatedObject instance, neither bool nor numeric, so it
         # still renders as TEXT on both sides via the existing type checks).
-        cast_hint = 0 if is_field_comparison and self.op in _ORDERING_OPS else self.value
+        # A computed side (`a + b`) is always a number, so the other side
+        # is read as one too, for `==` as much as for `<`.
+        numeric = self.op in _ORDERING_OPS or isinstance(self.value, Arithmetic) or isinstance(
+            self.column, Arithmetic
+        )
+        cast_hint = 0 if is_field_comparison and numeric else self.value
         sql_op = self._sql_op(dialect)
         column_sql, column_params = _render_column(
             self.column, spec, dialect, value=cast_hint, treeid=treeid
@@ -2244,7 +2413,9 @@ def _collection_source_sqlite(collection: Collection, outer_table: str) -> Tuple
     return source, handle_expr, [f"$.{key}"]
 
 
-def _collection_source_postgresql(collection: Collection, outer_table: str) -> Tuple[str, str, list]:
+def _collection_source_postgresql(
+    collection: Collection, outer_table: str, ordered: bool = False
+) -> Tuple[str, str, list]:
     """`(from_fragment, handle_expr, params)` for iterating `collection` on
     PostgreSQL.
 
@@ -2255,11 +2426,20 @@ def _collection_source_postgresql(collection: Collection, outer_table: str) -> T
     plain SQL text directly.
     """
     (key,) = collection.list_path.segments
+    # `ordered`: number the entries (`je.ord`), for picking the n-th.
+    columns = "je(value, ord)" if ordered else "je(value)"
+    ordinality = " WITH ORDINALITY" if ordered else ""
     if collection.ref_field:
-        source = f"jsonb_array_elements({outer_table}.json_data::jsonb -> '{key}') AS je(value)"
+        source = (
+            f"jsonb_array_elements({outer_table}.json_data::jsonb -> '{key}')"
+            f"{ordinality} AS {columns}"
+        )
         handle_expr = f"je.value ->> '{collection.ref_field}'"
     else:
-        source = f"jsonb_array_elements_text({outer_table}.json_data::jsonb -> '{key}') AS je(value)"
+        source = (
+            f"jsonb_array_elements_text({outer_table}.json_data::jsonb -> '{key}')"
+            f"{ordinality} AS {columns}"
+        )
         handle_expr = "je.value"
     return source, handle_expr, []
 
@@ -2296,6 +2476,7 @@ def _collection_subquery_body(
     dialect: Dialect,
     treeid: Optional[int],
     collation: Optional[str] = None,
+    ordered: bool = False,
 ) -> Tuple[str, list]:
     """`<target_table> AS <alias>, <source>[, <self-link source>] WHERE
     <handle correlation>[ AND <self-link correlation>][ AND (<condition>)]
@@ -2344,7 +2525,7 @@ def _collection_subquery_body(
         source, handle_expr, source_params = _collection_source_sqlite(collection, outer_table)
     elif dialect == Dialect.POSTGRESQL:
         source, handle_expr, source_params = _collection_source_postgresql(
-            collection, outer_table
+            collection, outer_table, ordered
         )
     else:
         raise QueryError(f"unsupported dialect: {dialect!r}")
@@ -2485,10 +2666,12 @@ def _resolve_array_location(
     if isinstance(array, RelatedObject):
         target_table = array.target.table
         target_alias = f"{target_table}__any{_depth}"
-        handle_sql = _guarded_handle_ref_sql(array.handle_ref, outer_table, dialect)
+        handle_sql, handle_params = _handle_ref_sql_and_params(
+            array.handle_ref, outer_table, dialect, treeid
+        )
         from_parts = [f"{target_table} AS {target_alias}"]
         where_parts = [f"{target_alias}.handle = ({handle_sql})"]
-        params: list = []
+        params: list = list(handle_params)
         if treeid is not None:
             where_parts.append(f"{target_alias}.treeid = ?")
             params.append(treeid)
@@ -2520,7 +2703,7 @@ def _json_array_source_sqlite(
 
 
 def _json_array_source_postgresql(
-    json_data_ref: str, segments: Tuple[Union[str, int], ...], alias: str
+    json_data_ref: str, segments: Tuple[Union[str, int], ...], alias: str, ordered: bool = False
 ) -> str:
     """The `->` chain for unnesting a JSON array on PostgreSQL --
     `jsonb_array_elements` needs the full chain built out (reusing
@@ -2542,6 +2725,8 @@ def _json_array_source_postgresql(
             expr += f" -> {segment}"
         else:
             expr += f" -> '{segment}'"
+    if ordered:
+        return f"jsonb_array_elements({expr}) WITH ORDINALITY AS {alias}(value, ord)"
     return f"jsonb_array_elements({expr}) AS {alias}(value)"
 
 
@@ -2553,6 +2738,7 @@ def _json_array_subquery_body(
     dialect: Dialect,
     treeid: Optional[int],
     collation: Optional[str] = None,
+    ordered: bool = False,
 ) -> Tuple[str, list]:
     """`<join entries>, <unnest source> [WHERE <join correlation>[ AND
     (<condition>)]]` -- the subquery body shared by `JsonArrayExists`
@@ -2580,10 +2766,15 @@ def _json_array_subquery_body(
     if dialect == Dialect.SQLITE:
         source, source_params = _json_array_source_sqlite(json_data_ref, segments, alias)
     elif dialect == Dialect.POSTGRESQL:
-        source, source_params = _json_array_source_postgresql(json_data_ref, segments, alias), []
+        source, source_params = (
+            _json_array_source_postgresql(json_data_ref, segments, alias, ordered),
+            [],
+        )
     else:
         raise QueryError(f"unsupported dialect: {dialect!r}")
-    params = list(join_params) + list(source_params)
+    # Placeholders in text order: the unnest source sits in FROM, before
+    # the joins' WHERE correlations.
+    params = list(source_params) + list(join_params)
     where_parts = list(where_parts)
     if condition is not None:
         cond_sql, cond_params = condition.compile(element_spec, dialect, treeid, collation)
@@ -2612,6 +2803,121 @@ def _render_json_array_count(
         count.array, count.condition, count.element_spec, outer_spec, dialect, treeid
     )
     return f"(SELECT COUNT(*) FROM {body})", params
+
+
+def _render_arithmetic(
+    arithmetic: Arithmetic,
+    spec: ObjectTypeSpec,
+    dialect: Optional[Dialect],
+    treeid: Optional[int],
+) -> Tuple[str, list]:
+    """`Arithmetic` as SQL. Each side renders as a number (PostgreSQL casts
+    a JSON value to NUMERIC, as for a numeric comparison); a literal side
+    is bound. A zero divisor becomes NULL (`NULLIF`), since PostgreSQL would
+    otherwise fail the whole query. `//` floors the quotient: SQLite has no
+    guaranteed `floor()`, so it truncates and steps down for a negative
+    non-whole quotient, computing that quotient once in a FROM subquery."""
+    if dialect is None:
+        raise QueryError("a dialect is required to compile arithmetic, but none was given")
+
+    def side(operand: Any) -> Tuple[str, list]:
+        if isinstance(operand, (int, float)) and not isinstance(operand, bool):
+            return "?", [operand]
+        return _render_column(operand, spec, dialect, value=0, treeid=treeid)
+
+    left_sql, left_params = side(arithmetic.left)
+    right_sql, right_params = side(arithmetic.right)
+    params = left_params + right_params
+    op = arithmetic.op
+    if dialect == Dialect.SQLITE:
+        if op == "/":
+            return f"({left_sql} * 1.0 / NULLIF({right_sql}, 0))", params
+        if op == "//":
+            return (
+                "(SELECT CAST(goql_div.x AS INTEGER) - (goql_div.x < CAST(goql_div.x AS INTEGER)) "
+                f"FROM (SELECT {left_sql} * 1.0 / NULLIF({right_sql}, 0) AS x) AS goql_div)",
+                params,
+            )
+        return f"({left_sql} {op} {right_sql})", params
+    if dialect == Dialect.POSTGRESQL:
+        if op == "/":
+            sql = f"CAST({left_sql} AS DOUBLE PRECISION) / NULLIF({right_sql}, 0)"
+        elif op == "//":
+            sql = f"FLOOR(CAST({left_sql} AS NUMERIC) / NULLIF({right_sql}, 0))"
+        else:
+            sql = f"{left_sql} {op} {right_sql}"
+        cast = "BIGINT" if arithmetic.integral else "DOUBLE PRECISION"
+        return f"CAST(({sql}) AS {cast})", params
+    raise QueryError(f"unsupported dialect: {dialect!r}")
+
+
+def _entry_order(alias: str, dialect: Dialect) -> str:
+    """An unnested array entry's position: SQLite's `json_each` gives it as
+    `key`, PostgreSQL's `WITH ORDINALITY` as `ord` (see the `ordered`
+    sources)."""
+    return f"{alias}.key" if dialect == Dialect.SQLITE else f"{alias}.ord"
+
+
+def _check_pick_index(index: int) -> None:
+    # Inlined into OFFSET, so it must be a real non-negative int.
+    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+        raise QueryError(f"invalid list index: {index!r}")
+
+
+def _render_collection_pick(
+    pick: CollectionPick, outer_table: str, dialect: Dialect, treeid: Optional[int]
+) -> Tuple[str, list]:
+    """`(SELECT <target>.handle FROM <collection body> ORDER BY <entry
+    position> LIMIT 1 OFFSET <index>)` -- `CollectionPick`'s handle, the
+    same body `CollectionCount` counts over, correlated to `outer_table`
+    (the owner's own name, or a hop's alias when the pick is reached
+    through one)."""
+    _check_pick_index(pick.index)
+    owner = replace(pick.owner, sql_alias=outer_table)
+    body, params = _collection_subquery_body(
+        pick.collection, owner, pick.condition, dialect, treeid, ordered=True
+    )
+    depth = owner.collection_depth
+    target_alias = f"{pick.collection.target.table}__target{depth or ''}"
+    order = _entry_order("je", dialect)
+    return (
+        f"(SELECT {target_alias}.handle FROM {body} "
+        f"ORDER BY {order} LIMIT 1 OFFSET {pick.index})",
+        params,
+    )
+
+
+def _render_json_array_pick(
+    pick: JsonArrayPick,
+    outer_spec: ObjectTypeSpec,
+    dialect: Optional[Dialect],
+    treeid: Optional[int],
+    value: Any = None,
+) -> Tuple[str, list]:
+    """`(SELECT <field of the entry> FROM <array body> ORDER BY <entry
+    position> LIMIT 1 OFFSET <index>)` -- `JsonArrayPick`'s rendering, over
+    the same body `JsonArrayCount` counts."""
+    if dialect is None:
+        raise QueryError(
+            "a dialect is required to compile a list comprehension's entry, "
+            "but none was given"
+        )
+    _check_pick_index(pick.index)
+    body, params = _json_array_subquery_body(
+        pick.array, pick.condition, pick.element_spec, outer_spec, dialect, treeid, ordered=True
+    )
+    alias = _element_alias(pick.element_spec.element_depth)
+    if pick.field is None:
+        field_sql, field_params = f"{alias}.value", []
+    else:
+        # `value` picks PostgreSQL's cast, as for any path (see
+        # `_render_json_path`): numeric against a number.
+        field_sql, field_params = _render_json_path(pick.field, dialect, value)
+    order = _entry_order(alias, dialect)
+    return (
+        f"(SELECT {field_sql} FROM {body} ORDER BY {order} LIMIT 1 OFFSET {pick.index})",
+        field_params + params,
+    )
 
 
 class Exists:

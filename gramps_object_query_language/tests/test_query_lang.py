@@ -19,6 +19,8 @@
 
 """Tests for the "almost Python" expression parser (`gramps_webapi.api.query_lang`)."""
 
+import re
+
 import pytest
 
 from gramps_object_query_language.query_lang import (
@@ -2727,3 +2729,125 @@ def test_non_path_leaf_error_shows_source_not_ast_dump():
 def test_bare_path_error_suggestions_are_valid(namespace, expr):
     # Every spelling the messages above suggest must itself compile.
     compile_expr(namespace, expr)
+
+
+# --- comprehensions in select/order_by ---------------------------------------
+
+
+@pytest.mark.parametrize(
+    "spec, comprehension, kind",
+    [
+        (
+            FAMILY,
+            "len([c for c in child_ref_list if c.frel.value == ChildRefType.BIRTH "
+            "and c.mrel.value == ChildRefType.BIRTH])",
+            JsonArrayCount,
+        ),
+        (
+            PERSON,
+            "len([e for e in events if e.type.value == EventType.CENSUS])",
+            CollectionCount,
+        ),
+    ],
+)
+def test_select_and_order_by_take_the_comprehension_form(spec, comprehension, kind):
+    """A column or sort can be written as a comprehension, as a filter can.
+    (What it counts is checked against a real tree in test_evaluator.py.)"""
+    [(ref, key)] = parse_select(spec, [comprehension + " as n"])
+    assert key == "n" and isinstance(ref, kind)
+    [order] = parse_order_by(spec, ["-" + comprehension])
+    assert isinstance(order.column, kind) and order.direction == "desc"
+
+
+# --- <collection>[n].<field> ---------------------------------------------------
+
+
+def test_indexed_collection_hop_resolves_like_a_relationship():
+    [(ref, key)] = parse_select(PERSON, ["parent_families[0].father.primary_name"])
+    assert key == "parent_families[0].father.primary_name"
+    assert isinstance(ref, RelatedObject)
+    assert ref.handle_ref == JsonPath(("parent_family_list", 0))
+    assert isinstance(ref.field, RelatedObject) and ref.field.name == "father"
+    # A ref-object list reads the entry's `ref`.
+    [(children, _)] = parse_select(FAMILY, ["children[2].gramps_id"])
+    assert children.handle_ref == JsonPath(("child_ref_list", 2, "ref"))
+    # The same text in a filter resolves to the same reference.
+    where = compile_expr_for_spec(PERSON, "parent_families[0].father.primary_name.first_name == 'Ann'")
+    assert where.column.handle_ref == ref.handle_ref
+
+
+@pytest.mark.parametrize(
+    "entry, message",
+    [
+        ("parent_families[0]", "use parent_families[0].<field>"),
+        ("child_refs[0].frel", "unknown field 'child_refs'"),
+        ("backlinks[0].handle", "unknown field 'backlinks'"),
+        ("parent_families.father.surname", "unknown field 'parent_families'"),
+    ],
+)
+def test_indexed_collection_hop_rejects(entry, message):
+    with pytest.raises(QueryLangError, match=message.replace("[", r"\[").replace("]", r"\]").replace(".", r"\.")):
+        parse_select(PERSON, [entry])
+
+
+# --- [x.f for x in rel if cond][n] ---------------------------------------------
+
+
+def test_picked_entry_parses_in_select_where_and_order_by():
+    entry = "[a.value for a in attribute_list if a.type.value == AttributeType.OCCUPATION][0]"
+    [(ref, key)] = parse_select(PERSON, [entry])
+    assert key == entry  # no path spelling: the entry's own text
+    where = compile_expr_for_spec(PERSON, entry + " == 'Farmer'")
+    assert where.column == ref
+    [order] = parse_order_by(PERSON, ["-" + entry])
+    assert order.column == ref and order.direction == "desc"
+    [(hop, _)] = parse_select(PERSON, ["[f for f in parent_families if f.father.surname == 'Smith'][0].mother.primary_name as m"])
+    assert isinstance(hop, RelatedObject) and hop.field.name == "mother"
+
+
+@pytest.mark.parametrize(
+    "entry, message",
+    [
+        ("[f for f in parent_families][0]", "add a field after it"),
+        ("[b for b in backlinks][0].handle", "can't take one entry of 'backlinks'"),
+        ("[a.value for a in attribute_list][-1]", "plain number"),
+        ("[len(a) for a in attribute_list][0]", "collect the loop variable or a field of it"),
+        ("[surname for a in attribute_list][0]", "collect the loop variable or a field of it"),
+        ("[a for a in gramps_id][0]", "requires a JSON array path"),
+    ],
+)
+def test_picked_entry_rejects(entry, message):
+    with pytest.raises(QueryLangError, match=re.escape(message)):
+        parse_select(PERSON, [entry + " as v"], env={"N": 0})
+
+
+# --- arithmetic ------------------------------------------------------------------
+
+
+def test_arithmetic_parses_in_select_where_and_order_by():
+    from gramps_object_query_language.query import Arithmetic
+
+    entry = "(death.date.sortval - birth.date.sortval) // 365"
+    [(ref, key)] = parse_select(PERSON, [entry])
+    assert isinstance(ref, Arithmetic) and ref.op == "//" and ref.integral
+    assert key == entry
+    assert parse_order_by(PERSON, ["-" + entry])[0].column == ref
+    assert compile_expr_for_spec(PERSON, entry + " > 80").column == ref
+    [(ratio, _)] = parse_select(PERSON, ["len(event_ref_list) / 2 as r"])
+    assert not ratio.integral
+
+
+@pytest.mark.parametrize(
+    "entry, message",
+    [
+        ("birth.date - death.date", "for a date, use birth.date.sortval"),
+        ("gramps_id + 1", "gramps_id isn't a number"),
+        ("1 + 2", "at least one field"),
+        ("birth.date.sortval % 7", "supported: + - * / //"),
+        ("birth.date.sortval + 'x'", "needs numbers, not 'x'"),
+        ("birth.date.sortval + True", "needs numbers, not True"),
+    ],
+)
+def test_arithmetic_rejects(entry, message):
+    with pytest.raises(QueryLangError, match=re.escape(message)):
+        parse_select(PERSON, [entry + " as v"])

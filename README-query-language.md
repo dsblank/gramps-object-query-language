@@ -344,17 +344,17 @@ particular position in the list was filled in
 ### Goal: Find people with an alternate name recorded as "Doyle"
 
 ```
-Person "any(alternate_names, first_name == 'Doyle')"
+Person "any(n.first_name == 'Doyle' for n in alternate_names)"
 ```
 
-`alternate_names` -- a person's names beyond the primary one (a maiden
-name, a name used before marriage, an anglicized name, ...) -- isn't a
-collection like `notes`/`citations`: each one only ever exists embedded in
-the person record itself, with no page of its own. `any(path, condition)`
-is for exactly this: a condition on *one element* of a plain list already
-living on the record, not a search across another table. `any(path)` alone
-(no condition) just asks "is there at least one at all," identical to
-`len(path) > 0`.
+`any(... for n in ...)` asks whether *any* entry of a list matches, the way
+it would in Python. `alternate_names` -- a person's names beyond the
+primary one (a maiden name, a name used before marriage, an anglicized
+name, ...) -- isn't a collection like `notes`/`citations`: each one only
+ever exists embedded in the person record itself, with no page of its
+own. The comprehension works the same over either kind of list. Without a
+condition, `any(n for n in alternate_names)` just asks "is there at least
+one at all," identical to `len(alternate_names) > 0`.
 
 ### Goal: Find people who were adopted
 
@@ -370,19 +370,17 @@ person can be born into one family and later adopted into another.
 person's own parent families, it reaches the one entry in that family's
 own child list that names *this* person, so `frel`/`mrel` mean that link's
 own relationship type, not a field on the person or the family themselves.
-Writing it as a comprehension makes that provenance explicit -- `ref.frel`/
-`ref.mrel` visibly belong to the bound `ref`, i.e. the link, not to `Person`
-or `Family`; the equivalent direct call, `any(child_refs, frel.value ==
-ChildRefType.ADOPTED or mrel.value == ChildRefType.ADOPTED)`, means the
-same thing but doesn't show that as clearly.
+The comprehension makes that provenance explicit -- `ref.frel`/`ref.mrel`
+visibly belong to the bound `ref`, i.e. the link, not to `Person` or
+`Family`.
 
 ### Goal: Find families that have a child named Steve
 
 ```
-Family "any(children, given_name == 'Steve')"
+Family "any(c.given_name == 'Steve' for c in children)"
 ```
 
-`any(children, ...)` matches a family if *any* of its children satisfies
+This matches a family if *any* of its children satisfies
 the condition -- unlike `father`/`mother`, which each always reach exactly
 one person, a family can have any number of children, so this needs its own
 "does at least one of them match" check rather than an ordinary field
@@ -391,22 +389,22 @@ reference.
 ### Goal: Find families with no children recorded at all
 
 ```
-Family "not any(children)"
+Family "not any(c for c in children)"
 ```
 
-Leaving out the condition (`any(children)` alone) just asks "does this
+Leaving out the condition (`any(c for c in children)` alone) just asks "does this
 family have any recorded child at all" -- `not` in front flips that to "no
 children recorded."
 
 ### Goal: Find people who don't have any notes attached to their record
 
 ```
-Person "not any(notes)"
+Person "not any(n for n in notes)"
 ```
 
 The same idea, starting from `Person` instead: `notes` reaches every note
-attached to a person's record, and `not any(notes)` matches whenever
-there aren't any.
+attached to a person's record, and `not any(n for n in notes)` matches
+whenever there aren't any.
 
 ### Goal: Find families with more than two children
 
@@ -415,26 +413,26 @@ Family "len(children) > 2"
 ```
 
 `len(children)` counts how many children a family has recorded --
-`any(children, ...)` can only tell you whether *at least one* child
-matches something, `len(...)` tells you *how many*.
+`any(...)` can only tell you whether *at least one* child matches
+something, `len(...)` tells you *how many*.
 
 ### Goal: Find families with more than one son
 
 ```
-Family "len(children, gender == Person.MALE) > 1"
+Family "len([c for c in children if c.gender == Person.MALE]) > 1"
 ```
 
-Adding a condition (the same kind of condition `any(...)` takes) counts
-only the children who match it -- here, only the sons.
+A list comprehension with an `if` (the same kind of condition `any(...)`
+takes) counts only the children who match it -- here, only the sons.
 
 ### Goal: Find people with a well-sourced record
 
 ```
-Person "any(citations, confidence >= Citation.CONF_HIGH)"
+Person "any(c.confidence >= Citation.CONF_HIGH for c in citations)"
 ```
 
-`any(children, ...)`/`len(children, ...)` aren't the only collections
-recorded per-person -- `notes`, `citations`, `media`, and `tags` are
+`children` isn't the only collection; there are more recorded
+per-person -- `notes`, `citations`, `media`, and `tags` are
 available the same way on almost every record type, plus a few more
 specific to each type: a person's `families` (as a spouse), `parent_families`
 (as a child), `associations` (links to other people), and `events` (every
@@ -443,7 +441,7 @@ recorded event, not just birth/death).
 ### Goal: Find people linked to someone named Bob via an association
 
 ```
-Person "any(associations, given_name == 'Bob')"
+Person "any(a.given_name == 'Bob' for a in associations)"
 ```
 
 ### Goal: Find citations for a specific source
@@ -519,24 +517,6 @@ Comparisons can be chained just like in real Python -- this means exactly
 1, 1950')`, just shorter to write. Any comparison operator works in a
 chain, including a mix of them.
 
-### Goal: Find families that have a child named Steve, written as a comprehension
-
-```
-Family "any(c.given_name == 'Steve' for c in children)"
-```
-
-The same query as the "child named Steve" example above, just spelled the
-way real Python would write "does any of these match" -- `any(...)`
-wrapping a generator expression is sugar for the direct `any(children, ...)`
-call and compiles to the exact same query, not merely an equivalent one.
-`len([...])` has a matching spelling too, as a list comprehension:
-`len([c for c in children if c.given_name == 'Robert']) == 1` means the
-same thing as `len(children, given_name == 'Robert') == 1`. This sugar
-isn't collection-only either -- `any(n.first_name == 'Doyle' for n in
-alternate_names)` means the same thing as `any(alternate_names,
-first_name == 'Doyle')` above, a plain intra-record array, not a
-registered collection.
-
 ### Goal: Find everyone born in Chicago – and show me where they're buried
 
 The "born in Chicago" half is straightforward:
@@ -581,21 +561,31 @@ column is named by the path itself. `len(events) as n_events` returns a
 count per row the same way (the alias is required there, since a count has
 no path to be named after).
 
-The "show me where they're buried" half needs a bit more care, for two reasons:
+The "show me where they're buried" half is a list comprehension taken by
+index: a person's burial isn't a shortcut field the way birth/death are,
+but the first of their events that is a burial can be picked out of the
+`events` collection, and the path goes on into it:
 
-1. where_expr is a filter language — every query it writes is a true/false test per person, not a report that hands back a value. Handing values back is `select`'s job instead, and `select` takes the *same* paths (see [Showing a value, not just filtering on it](#showing-a-value-not-just-filtering-on-it) above) — so "show me their birth place" is one query. Burial is the harder half, for reason 2 below: there's no path that reaches it, so there's nothing for `select` to name.
-2. Burial isn't a shortcut field the way birth/death are — birth/death reach a person's event directly by name, but a person's other events (burial included) are reached through the general events collection instead, using any(events, ...).
+> select: ["handle", "birth.place.title as born", "[e.place.title for e in events if e.type.value == EventType.BURIAL][0] as buried"]
 
-#### If you already know the cemetery
+with the "born in Chicago" filter above as the `where_expr`. Someone with
+no burial event recorded gets an empty `buried`.
+
+#### If you only want the ones buried in one cemetery
 
 in the Person view:
-> "birth.place.title == 'Chicago, Cook, Illinois, USA' and any(events, type.value == EventType.BURIAL and place.title == 'Rosehill Cemetery, Chicago, Cook, Illinois, USA')"
+> "birth.place.title == 'Chicago, Cook, Illinois, USA' and any(e.type.value == EventType.BURIAL and e.place.title == 'Rosehill Cemetery, Chicago, Cook, Illinois, USA' for e in events)"
 
-This matches everyone born in Chicago whose recorded burial event's place is exactly Rosehill Cemetery. The `type.value == EventType.BURIAL and place.title == '...'` part has to stay inside the any(events, ...) parentheses — it's a condition checked against each of that person's events, not against the person directly.
+This matches everyone born in Chicago whose recorded burial event's place is exactly Rosehill Cemetery. The `e.type.value == EventType.BURIAL and e.place.title == '...'` part is checked against each of that person's events together, so it has to be one event that is both a burial and at Rosehill.
 
-#### If you don't know the cemetery — the two-part scan version
+#### Before comprehensions could be taken by index
 
-When you want each person's burial place reported back, not filtered against a name you already know, there's no single where_expr that does it. As a gramps-connect Gramplet, the workaround is: let people(where, ...) do the part it's good at, then walk each match's own events by hand for the rest — the same technique the plugins/events.py/plugins/children.py examples use, since a burial event has no birth_ref_index-style shortcut to jump straight to it:
+The burial half used to need more care, for two reasons:
+
+1. where_expr is a filter language — every query it writes is a true/false test per person, not a report that hands back a value. Handing values back is `select`'s job instead, and `select` takes the *same* paths (see [Showing a value, not just filtering on it](#showing-a-value-not-just-filtering-on-it) above) — so "show me their birth place" is one query. Burial is the harder half, for reason 2 below: there's no path that reaches it, so there's nothing for `select` to name.
+2. Burial isn't a shortcut field the way birth/death are — birth/death reach a person's event directly by name, but a person's other events (burial included) are reached through the general events collection instead.
+
+As a gramps-connect Gramplet, the workaround was: let people(where, ...) do the part it's good at, then walk each match's own events by hand for the rest — the same technique the plugins/events.py/plugins/children.py examples use, since a burial event has no birth_ref_index-style shortcut to jump straight to it:
 
 ```
 # To use this, in the Gramps Connect Gramplet Editor:
@@ -639,7 +629,7 @@ This is a "scan" in the sense that the inner loop isn't indexed or query-optimiz
 ### Goal: Find notes that aren't attached to anything
 
 ```
-Note "not any(backlinks)"
+Note "not any(bl for bl in backlinks)"
 ```
 
 Every collection covered above reaches *outward* from a record --
@@ -651,7 +641,7 @@ once attached to (a person, a source, an event) was deleted or edited.
 ### Goal: Find notes that are only referenced by sources, not by people
 
 ```
-Note "any(backlinks) and not any(backlinks, _class == 'Person')"
+Note "any(bl for bl in backlinks) and not any(bl._class == 'Person' for bl in backlinks)"
 ```
 
 `_class` is the one field a `backlinks` condition can test -- the

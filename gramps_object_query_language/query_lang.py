@@ -152,7 +152,9 @@ from .query import (
     And,
     BacklinkClassFilter,
     Backlinks,
+    Arithmetic,
     CollectionCount,
+    CollectionPick,
     ColumnRef,
     Contains,
     Eq,
@@ -162,6 +164,7 @@ from .query import (
     Gte,
     In,
     JsonArrayCount,
+    JsonArrayPick,
     JsonArrayExists,
     Like,
     Lt,
@@ -584,6 +587,143 @@ def _translate_len_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:
     return {"length_of_matching": {"path": list(segments), "where": where}}
 
 
+def _pick_root(node: ast.AST) -> Optional[Tuple[ast.Call, List[Union[str, int]]]]:
+    """`(the _pick(...) call, the path after it)` when `node` is a picked
+    list comprehension entry, read on or not
+    (`[f for f in parent_families][0].father.surname`); else `None`."""
+    rest: List[Union[str, int]] = []
+    while True:
+        if isinstance(node, ast.Attribute):
+            rest.insert(0, node.attr)
+            node = node.value
+        elif isinstance(node, ast.Subscript) and not isinstance(node.value, ast.ListComp):
+            index = node.slice
+            if not (isinstance(index, ast.Constant) and isinstance(index.value, int)):
+                return None
+            rest.insert(0, index.value)
+            node = node.value
+        else:
+            break
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == _PICK
+        and len(node.args) == 4
+        and not node.keywords
+    ):
+        return node, rest
+    return None
+
+
+def _translate_pick(call: ast.Call, rest: List[Union[str, int]], spec: ObjectTypeSpec) -> dict:
+    """`{"pick": {...}}` for `[x.f for x in rel if cond][n].<rest>`: from a
+    collection (`parent_families`), the n-th matching record, read on like a
+    relationship; from a list in the record (`attribute_list`), the n-th
+    matching entry's field. Resolved in `json_column_to_ref`."""
+    source, condition, index, projection = call.args
+    field: List[Union[str, int]] = []
+    if not (isinstance(projection, ast.Constant) and projection.value is None):
+        field = _translate_path(projection)
+    field += rest
+    payload: dict = {"index": index.value, "field": field}  # type: ignore[attr-defined]
+    has_condition = not (isinstance(condition, ast.Constant) and condition.value is None)
+    collection = _try_resolve_bare_collection(source, spec)
+    if collection is not None:
+        if isinstance(collection, Backlinks) or collection.self_link_field:
+            raise QueryLangError(
+                f"can't take one entry of {source.id!r} -- it isn't a list of "  # type: ignore[attr-defined]
+                f"records stored on this one"
+            )
+        payload["relationship"] = source.id  # type: ignore[attr-defined]
+        if has_condition:
+            payload["where"] = _translate_top_level(condition, collection.target)
+        return {"pick": payload}
+    segments = _translate_path(source)
+    try:
+        _, element_spec = resolve_any_path(spec, segments)
+    except QueryError as error:
+        raise QueryLangError(str(error)) from error
+    payload["path"] = list(segments)
+    if has_condition:
+        payload["where"] = _translate_top_level(condition, element_spec)
+    return {"pick": payload}
+
+
+_ARITHMETIC_AST_OPS = {
+    ast.Add: "+",
+    ast.Sub: "-",
+    ast.Mult: "*",
+    ast.Div: "/",
+    ast.FloorDiv: "//",
+}
+
+
+def _is_number_literal(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, (int, float))
+        and not isinstance(node.value, bool)
+    )
+
+
+def _translate_arithmetic(node: ast.AST, spec: ObjectTypeSpec) -> dict:
+    """`{"arithmetic": {"op": ..., "left": ..., "right": ...}}` for `a + b`,
+    `(a - b) // 365`, ...: each side `{"number": n}` for a literal, another
+    arithmetic, or a column (`_translate_column_or_computed`). A unary minus
+    on a column is `0 - column`. At least one side somewhere must be a
+    column; `2 + 3` is just a number."""
+
+    def operand(side: ast.AST) -> dict:
+        if _is_number_literal(side):
+            return {"number": side.value}  # type: ignore[attr-defined]
+        if isinstance(side, ast.UnaryOp) and isinstance(side.op, (ast.USub, ast.UAdd)):
+            inner = operand(side.operand)
+            if isinstance(side.op, ast.UAdd):
+                return inner
+            if "number" in inner:
+                return {"number": -inner["number"]}
+            return {"arithmetic": {"op": "-", "left": {"number": 0}, "right": inner}}
+        if isinstance(side, ast.BinOp):
+            return _translate_arithmetic(side, spec)
+        if isinstance(side, ast.Constant):
+            raise QueryLangError(f"arithmetic needs numbers, not {side.value!r}")
+        return {"column": _translate_column_or_computed(side, spec)}
+
+    if not isinstance(node, ast.BinOp) or type(node.op) not in _ARITHMETIC_AST_OPS:
+        raise QueryLangError(
+            f"unsupported arithmetic operator (supported: + - * / //): {ast.dump(node)}"
+        )
+    result = {
+        "arithmetic": {
+            "op": _ARITHMETIC_AST_OPS[type(node.op)],
+            "left": operand(node.left),
+            "right": operand(node.right),
+        }
+    }
+    if not _reads_a_column(result):
+        raise QueryLangError(
+            f"arithmetic needs at least one field, not only numbers: {ast.dump(node)}"
+        )
+    return result
+
+
+def _reads_a_column(operand: dict) -> bool:
+    if "column" in operand:
+        return True
+    if "arithmetic" in operand:
+        payload = operand["arithmetic"]
+        return _reads_a_column(payload["left"]) or _reads_a_column(payload["right"])
+    return False
+
+
+def _is_arithmetic(node: ast.AST) -> bool:
+    return isinstance(node, ast.BinOp) or (
+        isinstance(node, ast.UnaryOp)
+        and isinstance(node.op, ast.USub)
+        and not _is_number_literal(node.operand)
+    )
+
+
 def _translate_column_or_computed(node: ast.AST, spec: ObjectTypeSpec) -> Union[str, dict]:
     """A comparison's column-like side: an ordinary path (`_translate_column`),
     or a `count(...)`/`len(...)` call -- the one place a "column" can be a
@@ -593,6 +733,15 @@ def _translate_column_or_computed(node: ast.AST, spec: ObjectTypeSpec) -> Union[
     scope only ever treats either as *the* column, never as something
     compared against another field (see ROADMAP.md).
     """
+    if isinstance(node, ast.BinOp):
+        return _translate_arithmetic(node, spec)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub) and not _is_number_literal(node.operand):
+        return _translate_arithmetic(
+            ast.BinOp(left=ast.Constant(value=0), op=ast.Sub(), right=node.operand), spec
+        )
+    picked = _pick_root(node)
+    if picked is not None:
+        return _translate_pick(*picked, spec)
     if _is_count_call(node):
         return _translate_count_call(node, spec)
     if _is_len_call(node):
@@ -743,13 +892,28 @@ def _translate_compare(node: ast.Compare, spec: ObjectTypeSpec) -> dict:
             )
     else:
         left = node.left
-        if _is_path_node(left) or _is_count_call(left) or _is_len_call(left):
+        if (
+            _is_path_node(left)
+            or _is_count_call(left)
+            or _is_len_call(left)
+            or _pick_root(left) is not None
+            or _is_arithmetic(left)
+        ):
             # "field OP value" / "field OP field" -- the shape this function
             # always assumed until operand-ordering was generalized. `left`
             # is the column (or `count(...)`/`len(...)`); `rhs` is either
             # another field (`value_column`) or an ordinary value.
             column = _translate_column_or_computed(left, spec)
-            if _is_path_node(rhs):
+            if _is_arithmetic(rhs):
+                # "death.date.dateval[2] > birth.date.dateval[2] + 80":
+                # a computed value on the right, compared field-vs-field.
+                if isinstance(column, dict) and ("count_of" in column or "length_of" in column):
+                    raise QueryLangError(
+                        f"count(...)/len(...) only support comparison against a literal "
+                        f"value, not a field: {ast.dump(node)}"
+                    )
+                leaf = {"column": column, "op": op, "value_column": _translate_column_or_computed(rhs, spec)}
+            elif _is_path_node(rhs):
                 if isinstance(column, dict) and ("count_of" in column or "length_of" in column):
                     # count(...)/len(...) are left-hand-side-only, against a
                     # literal (v1 scope, see ROADMAP.md) -- field-vs-field
@@ -768,7 +932,7 @@ def _translate_compare(node: ast.Compare, spec: ObjectTypeSpec) -> dict:
             else:
                 value = _translate_value(rhs)
                 leaf = {"column": column, "op": op, "value": value}
-        elif _is_path_node(rhs):
+        elif _is_path_node(rhs) or _is_arithmetic(rhs):
             # "value OP field", e.g. "Date('Jan 1, 1968') < mother.birth.sortval"
             # -- the literal happened to be written on the left. Flip the
             # operator so the column still renders on the wire's left, the
@@ -778,7 +942,7 @@ def _translate_compare(node: ast.Compare, spec: ObjectTypeSpec) -> dict:
             # qualifies as "the column" on this side, matching their
             # existing left-hand-side-only v1 scope untouched.
             value = _translate_value(left)
-            column = _translate_column(rhs, spec)
+            column = _translate_column_or_computed(rhs, spec) if _is_arithmetic(rhs) else _translate_column(rhs, spec)
             leaf = {"column": column, "op": _FLIP_OP[op], "value": value}
         else:
             raise QueryLangError(
@@ -1229,6 +1393,29 @@ def _make_call(name: str, iter_node: ast.expr, condition: Union[ast.expr, None])
     return ast.Call(func=ast.Name(id=name, ctx=ast.Load()), args=args, keywords=[])
 
 
+#: What `_ComprehensionDesugarer` rewrites `[x.f for x in rel if c][n]` into:
+#: `_pick(rel, c or None, n, f or None)`, read back by `_pick_root`.
+_PICK = "_pick"
+
+
+def _pick_projection(elt: ast.expr, bound_name: str) -> Optional[ast.expr]:
+    """What a picked comprehension reads from the entry: `None` for the
+    entry itself (`[a for a in ...]`), else the path after the loop
+    variable (`a.value` -> `value`)."""
+    if isinstance(elt, ast.Name) and elt.id == bound_name:
+        return None
+    root = elt
+    while isinstance(root, (ast.Attribute, ast.Subscript)):
+        root = root.value
+    if not (isinstance(root, ast.Name) and root.id == bound_name) or isinstance(elt, ast.Subscript) and elt.value is root:
+        raise QueryLangError(
+            f"a list comprehension taken by index must collect the loop variable "
+            f"or a field of it (e.g. '[a.value for a in attribute_list if ...][0]'): "
+            f"{ast.dump(elt)}"
+        )
+    return _BoundNameStripper(bound_name).visit(elt)
+
+
 class _ComprehensionDesugarer(ast.NodeTransformer):
     """Rewrites `any(cond for x in rel [if ...])` into `any(rel, cond)`,
     and `len([... for x in rel if ...])` into `len(rel, ...)`, run once
@@ -1277,6 +1464,42 @@ class _ComprehensionDesugarer(ast.NodeTransformer):
         # call`/`_translate_len_call` reject it later if it doesn't turn out
         # to be a real argument shape either.
         return node
+
+    def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
+        """`[x.f for x in rel if cond][n]` -> `_pick(rel, cond, n, f)`: the
+        n-th matching entry, read on by whatever path follows (see
+        `_translate_pick`)."""
+        self.generic_visit(node)
+        if not isinstance(node.value, ast.ListComp):
+            return node
+        index = node.slice
+        if not (
+            isinstance(index, ast.Constant)
+            and isinstance(index.value, int)
+            and not isinstance(index.value, bool)
+        ):
+            raise QueryLangError(
+                f"a list comprehension can only be indexed by a plain number, "
+                f"e.g. [...][0]: {ast.dump(node)}"
+            )
+        comp = node.value
+        generator = _comprehension_generator(comp, node)
+        bound = generator.target.id
+        projection = _pick_projection(comp.elt, bound)
+        stripper = _BoundNameStripper(bound)
+        ifs = [stripper.visit(if_node) for if_node in generator.ifs]
+        none = ast.Constant(value=None)
+        call = ast.Call(
+            func=ast.Name(id=_PICK, ctx=ast.Load()),
+            args=[
+                generator.iter,
+                _and_together(ifs) if ifs else none,
+                ast.Constant(value=index.value),
+                projection if projection is not None else none,
+            ],
+            keywords=[],
+        )
+        return ast.copy_location(call, node)
 
 
 #: The name an expression uses for caller-supplied values: `Env.NAME`, read
@@ -1432,6 +1655,115 @@ _OP_CLASSES: dict[str, type] = {
 VALID_LEAF_OPS = frozenset(_OP_CLASSES) | {"in", "like", "regex", "contains"}
 
 
+def _arithmetic_side(operand: dict, spec: ObjectTypeSpec) -> Tuple[Any, bool]:
+    """One side of `{"arithmetic": ...}`: `(value, whole)` -- a literal, a
+    numeric column, or a nested `Arithmetic`, and whether it's a whole
+    number. A column that isn't a number is refused, a date with a hint."""
+    if "number" in operand:
+        number = operand["number"]
+        if isinstance(number, bool) or not isinstance(number, (int, float)):
+            raise QueryError(f"arithmetic needs numbers, not {number!r}")
+        return number, isinstance(number, int)
+    if "arithmetic" in operand:
+        arithmetic = _arithmetic_from_json(operand["arithmetic"], spec)
+        return arithmetic, arithmetic.integral
+    ref = json_column_to_ref(operand["column"], spec)
+    if _value_kind(ref, spec) != "number" and not _holds_numbers(ref, spec):
+        try:
+            name = default_ref_key(ref)
+        except QueryError:
+            name = "this value"
+        hint = ""
+        if name.endswith("date"):
+            hint = f" -- for a date, use {name}.sortval (a day count) or {name}.dateval[2] (its year)"
+        raise QueryError(f"{name} isn't a number, so it can't be used in arithmetic{hint}")
+    return ref, _whole_number(ref, spec)
+
+
+def _schema_types(ref: ColumnRef, spec: ObjectTypeSpec) -> set:
+    """The JSON types the schema gives a column's value (no `null`), or an
+    empty set when it can't say."""
+    while isinstance(ref, RelatedObject):
+        spec, ref = ref.target, ref.field
+    if isinstance(ref, JsonArrayPick):
+        if ref.field is None:
+            return set()
+        spec, ref = ref.element_spec, ref.field
+    if isinstance(ref, FlatColumnRef):
+        ref = ref.name
+    if isinstance(ref, str):
+        ref = JsonPath((ref,))
+    try:
+        value_type = ref_value_type(spec, ref)
+    except QueryError:
+        return set()
+    types = set(value_type) if isinstance(value_type, list) else {value_type}
+    types.discard("null")
+    return types
+
+
+def _holds_numbers(ref: ColumnRef, spec: ObjectTypeSpec) -> bool:
+    """A list item the schema types as a number *or* a flag -- a date's
+    `dateval`, whose `[2]` is its year and `[3]` its BC flag."""
+    types = _schema_types(ref, spec)
+    return bool(types & {"integer", "number"}) and types <= {"integer", "number", "boolean"}
+
+
+def _whole_number(ref: ColumnRef, spec: ObjectTypeSpec) -> bool:
+    """Whether a numeric column holds whole numbers (the schema says
+    `integer`, or it's a count)."""
+    if isinstance(ref, (CollectionCount, JsonArrayCount, Length)):
+        return True
+    return _schema_types(ref, spec) - {"boolean"} == {"integer"}
+
+
+def _arithmetic_from_json(payload: dict, spec: ObjectTypeSpec) -> Arithmetic:
+    op = payload["op"]
+    left, left_whole = _arithmetic_side(payload["left"], spec)
+    right, right_whole = _arithmetic_side(payload["right"], spec)
+    if op == "/":
+        integral = False
+    elif op == "//":
+        integral = True
+    else:
+        integral = left_whole and right_whole
+    return Arithmetic(op, left, right, integral)
+
+
+def _pick_from_json(payload: dict, spec: ObjectTypeSpec) -> ColumnRef:
+    """`{"pick": ...}` (see `_translate_pick`) as a `RelatedObject` whose
+    handle is a `CollectionPick`, or a `JsonArrayPick`."""
+    index = payload["index"]
+    field = tuple(payload["field"])
+    if "relationship" in payload:
+        name = payload["relationship"]
+        collection = resolve_collection(spec, name)
+        if isinstance(collection, Backlinks) or collection.self_link_field:
+            raise QueryError(f"can't take one entry of {name!r}")
+        condition = (
+            where_list_to_ast(payload["where"], collection.target) if "where" in payload else None
+        )
+        if not field:
+            raise QueryError(
+                f"an entry of {name!r} is a {collection.target.table} record, not a "
+                f"value on its own -- add a field after it, e.g. [...][{index}].gramps_id"
+            )
+        return RelatedObject(
+            name=f"{name}[...]",
+            target=collection.target,
+            handle_ref=CollectionPick(collection, spec, condition, index),
+            field=resolve_column_path(collection.target, field),
+        )
+    array_ref, element_spec = resolve_any_path(spec, payload["path"])
+    condition = where_list_to_ast(payload["where"], element_spec) if "where" in payload else None
+    field_ref = None
+    if field:
+        field_ref = resolve_column_path(element_spec, field, element_spec.element_base_column)
+        if not isinstance(field_ref, JsonPath):
+            raise QueryError(f"can't follow a link from a list entry: {'.'.join(map(str, field))}")
+    return JsonArrayPick(array_ref, element_spec, condition, index, field_ref)
+
+
 def json_column_to_ref(column: Union[str, dict], spec: ObjectTypeSpec) -> ColumnRef:
     """A wire-format column reference (plain string, `{"json_path": [...]}`,
     `{"count_of": {...}}`, or `{"length_of": ...}`), resolved to a
@@ -1486,6 +1818,10 @@ def json_column_to_ref(column: Union[str, dict], spec: ObjectTypeSpec) -> Column
         inner = column["length_of"]
         segments = (inner,) if isinstance(inner, str) else tuple(inner["json_path"])
         return resolve_length_path(spec, segments, base_column)
+    if "pick" in column:
+        return _pick_from_json(column["pick"], spec)
+    if "arithmetic" in column:
+        return _arithmetic_from_json(column["arithmetic"], spec)
     if "length_of_matching" in column:
         payload = column["length_of_matching"]
         array_ref, element_spec = resolve_any_path(spec, payload["path"])
@@ -1499,8 +1835,12 @@ def _value_kind(column: ColumnRef, spec: ObjectTypeSpec) -> Optional[str]:
     scalar kind `column` holds (nullable or not); `None` for anything else
     (an object, an array, a mixed type, or a type the schema doesn't give).
     """
-    if isinstance(column, (CollectionCount, JsonArrayCount, Length)):
+    if isinstance(column, (CollectionCount, JsonArrayCount, Length, Arithmetic)):
         return "number"
+    if isinstance(column, JsonArrayPick):
+        if column.field is None:
+            return None
+        spec, column = column.element_spec, column.field
     while isinstance(column, RelatedObject):
         spec = column.target
         column = column.field
@@ -1773,7 +2113,10 @@ def parse_select_entry(
 
     try:
         ref = json_column_to_ref(
-            _translate_column_or_computed(_substitute_env(node, env), spec), spec
+            _translate_column_or_computed(
+                _desugar_comprehensions(_substitute_env(node, env)), spec
+            ),
+            spec,
         )
     except (QueryLangError, QueryError) as error:
         raise QueryLangError(f"invalid select entry {entry!r}: {error}") from error
@@ -1824,7 +2167,10 @@ def parse_order_by_entry(
         raise QueryLangError(f"could not parse order_by entry {entry!r}: {error}") from error
     try:
         ref = json_column_to_ref(
-            _translate_column_or_computed(_substitute_env(node, env), spec), spec
+            _translate_column_or_computed(
+                _desugar_comprehensions(_substitute_env(node, env)), spec
+            ),
+            spec,
         )
     except (QueryLangError, QueryError) as error:
         raise QueryLangError(f"invalid order_by entry {entry!r}: {error}") from error

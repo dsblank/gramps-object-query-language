@@ -81,6 +81,12 @@ _PARTIAL_OPERATOR_RE = re.compile(r"[=!<>]+$")
 _COMPARED_RE = re.compile(rf"(?<![A-Za-z0-9_.\])])({_CHAIN})\s*(?:==|!=|<=|>=|<|>)\s*$")
 _LISTED_RE = re.compile(rf"(?<![A-Za-z0-9_.\])])({_CHAIN})\s+(?:not\s+)?in\s*\[[^\[\]]*$")
 _INDEXED_RE = re.compile(rf"(?<![A-Za-z0-9_.\])])({_CHAIN})\[$")
+# After a list comprehension taken by index: `[...][0].` then a path and a
+# (possibly empty) word -- and `[...][`, its index.
+_PICKED_RE = re.compile(rf"\]\[[0-9]+\]((?:\.{_SEGMENT})*)\.({_NAME})?$")
+_PICK_INDEX_RE = re.compile(r"\]\[$")
+# A comprehension's own text: what it collects, then `for x in`.
+_COMPREHENSION_RE = re.compile(rf"\s*({_CHAIN})\s+for\s+{_NAME}\s+in\b")
 _TOKEN_RE = re.compile(
     r"""\s+"""
     r"""|(?P<string>'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*")"""
@@ -94,6 +100,8 @@ _TOKEN_RE = re.compile(
 # What the grammar expects at the cursor, from the tokens before the word
 # being typed (see `_expected`):
 # - "operand": the start of a condition -- a name, a function, `not`.
+# - "number": after an arithmetic operator (`+ - * / //`) -- a name or
+#   `len(`, something with a numeric value.
 # - "operator": what follows a complete operand -- a comparison, `in`/
 #   `is`/`not in`, `and`/`or`, and `for`/`if` inside `any(...)`/`[...]`.
 # - "value": the right-hand side of a comparison -- a name, a literal,
@@ -247,6 +255,8 @@ def _expected(text: str) -> Tuple[str, bool]:
         return "in_list", comprehension
     if last[1] in _OPERAND_AFTER and last[0] == "name":
         return "operand", comprehension
+    if last[0] == "other" and last[1] in "+-*/":
+        return "number", comprehension
     if last[0] == "operator":
         return "value", comprehension
     if _ends_operand(last):
@@ -313,6 +323,32 @@ def _index(context: _Context, count: int) -> Optional[_Context]:
     return context
 
 
+def _step_indexed(
+    vocabs: Dict[str, Any], context: _Context, name: str, indexes: int
+) -> Optional[_Context]:
+    """`_step` then `_index`, except that an indexed collection on a record
+    (`parent_families[0]`) steps to the record that entry links to, the
+    way a relationship does."""
+    if context[0] == "namespace" and indexes:
+        target = vocabs[context[1]]["collections"].get(name)
+        if target is not None:
+            return _index(("namespace", target), indexes - 1)
+    context = _step(vocabs, context, name)
+    return context and _index(context, indexes)
+
+
+def _indexable_collections(vocabs: Dict[str, Any], context: _Context) -> List[Tuple[str, str, Any]]:
+    """The collections an index can follow from a record (`families`,
+    `citations`, ...; not `backlinks` or `child_refs`)."""
+    if context[0] != "namespace":
+        return []
+    return [
+        (name, "collection", target)
+        for name, target in vocabs[context[1]]["collections"].items()
+        if target is not None
+    ]
+
+
 def _walk(
     vocabs: Dict[str, Any],
     root: str,
@@ -328,7 +364,8 @@ def _walk(
     yields an element of the collection's target, or end at a JSON array
     (`father.attribute_list`), which yields one of its items. A collection
     can't be reached across a relationship (`mother.events`) -- GOQL
-    rejects that.
+    rejects that. An indexed one can (`mother.families[0]`): like a
+    relationship, it leads to the record that entry links to.
     """
     if not segments:
         return None
@@ -341,13 +378,11 @@ def _walk(
             target = vocabs[root]["collections"].get(first, False)
             if target is not False:
                 return None if target is None else ("namespace", target)
-        context = _step(vocabs, ("namespace", root), first)
-        context = context and _index(context, first_indexes)
+        context = _step_indexed(vocabs, ("namespace", root), first, first_indexes)
     for name, indexes in rest:
         if context is None:
             return None
-        context = _step(vocabs, context, name)
-        context = context and _index(context, indexes)
+        context = _step_indexed(vocabs, context, name, indexes)
     if iterating and context and context[0] == "field":
         return _index(context, 1)
     return context
@@ -365,6 +400,44 @@ def _bindings(vocabs: Dict[str, Any], root: str, source: str) -> Dict[str, Optio
             vocabs, root, _segments(match.group(2)), bindings, iterating=True
         )
     return bindings
+
+
+def _comprehension_ending(text: str) -> Optional[str]:
+    """What a list comprehension ending at `text`'s final `]` collects
+    (`a.value` in `[a.value for a in attribute_list if ...]`), or `None`
+    if that `]` doesn't close one."""
+    depth = 0
+    for position in range(len(text) - 1, -1, -1):
+        char = text[position]
+        if char == "]":
+            depth += 1
+        elif char == "[":
+            depth -= 1
+            if depth == 0:
+                match = _COMPREHENSION_RE.match(text[position + 1 : -1])
+                return match.group(1) if match else None
+    return None
+
+
+def _picked_context(
+    vocabs: Dict[str, Any],
+    namespace: str,
+    text: str,
+    rest: str,
+    bindings: Dict[str, Optional[_Context]],
+) -> Optional[_Context]:
+    """Where `[x.f for x in rel if ...][n]<rest>` leads: what the
+    comprehension collects (`text` ends at its `]`), walked on by `rest`
+    (`.mother`)."""
+    collected = _comprehension_ending(text)
+    if collected is None:
+        return None
+    context = _walk(vocabs, namespace, _segments(collected), bindings)
+    for name, indexes in _segments(rest):
+        if context is None:
+            return None
+        context = _step_indexed(vocabs, context, name, indexes)
+    return context
 
 
 def _names_at(vocabs: Dict[str, Any], context: _Context) -> List[Tuple[str, str, Any]]:
@@ -499,6 +572,22 @@ def complete_from_vocabularies(
             for name in sorted(vocab["operators"])
             if name.startswith(typed)
         ]
+    picked = _PICKED_RE.search(before)
+    if picked is not None and _comprehension_ending(before[: picked.start() + 1]) is not None:
+        # `[a for a in attribute_list if ...][0].`: the entry's own names.
+        prefix = picked.group(2) or ""
+        bindings = _bindings(vocabs, namespace, source)
+        context = _picked_context(
+            vocabs, namespace, before[: picked.start() + 1], picked.group(1), bindings
+        )
+        candidates = (
+            [] if context is None
+            else _names_at(vocabs, context) + _indexable_collections(vocabs, context)
+        )
+        return _results(candidates, prefix, cursor - len(prefix), bindings, env)
+    if _PICK_INDEX_RE.search(before) and _comprehension_ending(before[:-1]) is not None:
+        # `[a for a in attribute_list if ...][`: which matching entry.
+        return [{"name": "0", "kind": "index", "detail": "first item", "start": cursor}]
     match = _AT_CURSOR_RE.search(before)
     if match is None:
         return []
@@ -559,6 +648,8 @@ def complete_from_vocabularies(
             candidates = [("[", "punctuation", "list")] + env_names
         elif expected == "path":
             candidates = paths
+        elif expected == "number":
+            candidates = paths + [("len", "function", None)] + env_names
         elif expected == "string":
             candidates = [('"', "punctuation", "text")]
         elif expected == "collection":
@@ -576,9 +667,21 @@ def complete_from_vocabularies(
             candidates = []
             indexed = _INDEXED_RE.search(before[:start])
             if indexed:
-                context = _walk(vocabs, namespace, _segments(indexed.group(1)), bindings)
+                listed = _segments(indexed.group(1))
+                context = _walk(vocabs, namespace, listed, bindings)
                 if context is not None and context[0] == "field" and "items" in context[1]:
                     candidates = [("0", "index", "first item")]
+                elif not listed[-1][1]:
+                    # `parent_families[`: a collection's first entry.
+                    owner = (
+                        _walk(vocabs, namespace, listed[:-1], bindings)
+                        if len(listed) > 1
+                        else ("namespace", namespace)
+                    )
+                    if owner is not None and any(
+                        name == listed[-1][0] for name, _kind, _target in _indexable_collections(vocabs, owner)
+                    ):
+                        candidates = [("0", "index", "first item")]
         elif expected == "literal":
             candidates = (
                 [('"', "punctuation", "text")]
@@ -611,15 +714,29 @@ def complete_from_vocabularies(
             role = _expected(before[:chain_start])[0]
             context = _walk(vocabs, namespace, segments, bindings)
             candidates = [] if context is None else _names_at(vocabs, context)
+            if context is not None and role in ("operand", "value", "is_value", "number"):
+                # `father.families[0]...`: one entry of a collection, across a hop.
+                candidates += _indexable_collections(vocabs, context)
             if role == "iterable":
                 candidates = [
                     (name, kind, detail)
                     for name, kind, detail in candidates
                     if kind == "relationship" or _is_array(detail)
                 ]
-            elif role not in ("operand", "value", "is_value", "path"):
+            elif role not in ("operand", "value", "is_value", "path", "number"):
                 candidates = []
 
+    return _results(candidates, prefix, start, bindings, env)
+
+
+def _results(
+    candidates: List[Tuple[str, str, Any]],
+    prefix: str,
+    start: int,
+    bindings: Dict[str, Optional[_Context]],
+    env: List[str],
+) -> List[Dict[str, Any]]:
+    """The candidates that complete `prefix`, as sorted result dicts."""
     seen = set()
     results = []
     for name, kind, detail in candidates:

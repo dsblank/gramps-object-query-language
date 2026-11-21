@@ -36,6 +36,7 @@ from gramps.gen.db.utils import make_database
 from gramps.gen.dbstate import DbState
 from gramps.gen.lib import (
     Attribute,
+    AttributeType,
     ChildRef,
     ChildRefType,
     Citation,
@@ -2314,3 +2315,401 @@ def test_deferred_page_sorts_by_the_requested_collation(collation_db, pg_conn, c
     rows = _page_through(run, PERSON, select, order_by, collation=collation)
     assert [row[0] for row in rows] == [handles[key] for key in order]
     assert rows == _one_query(run, PERSON, select, order_by, collation=collation)
+
+
+# --- <collection>[n].<field>: following one entry of a collection ------------
+
+
+@pytest.fixture(scope="module")
+def indexed_hop_db():
+    """Two parents and a child whose parent_family_list names their family
+    (then a second, step family), an orphan with no parent family, a source
+    with a citation, and attributes on the father, for
+    `parent_families[0].father...`, `families[0].children[0]...` and
+    `citations[0].source...`."""
+    from gramps.gen.lib import Citation, Source
+
+    dbman = CLIDbManager(DbState())
+    dirpath, db_name = dbman.create_new_db_cli("_test_evaluator_indexed_hop", dbid="sqlite")
+    db = make_database("sqlite")
+    db.load(dirpath)
+    handles = {}
+    with DbTxn("setup", db) as trans:
+        source = Source()
+        source.set_title("Parish Register")
+        handles["source"] = db.add_source(source, trans)
+        citation = Citation()
+        citation.set_reference_handle(handles["source"])
+        handles["citation"] = db.add_citation(citation, trans)
+
+        father = Person()
+        father.set_primary_name(_name("Karl", "Anderson"))
+        father.add_citation(handles["citation"])
+        for attr_type, value in (
+            (AttributeType.NICKNAME, "Kalle"),
+            (AttributeType.OCCUPATION, "Farmer"),
+            (AttributeType.OCCUPATION, "Miller"),
+        ):
+            attr = Attribute()
+            attr.set_type(attr_type)
+            attr.set_value(value)
+            father.add_attribute(attr)
+        handles["father"] = db.add_person(father, trans)
+        mother = Person()
+        mother.set_primary_name(_name("Lena", "Baker"))
+        handles["mother"] = db.add_person(mother, trans)
+        child = Person()
+        child.set_primary_name(_name("Steve", "Anderson"))
+        handles["child"] = db.add_person(child, trans)
+        orphan = Person()
+        orphan.set_primary_name(_name("Olive", "Orr"))
+        handles["orphan"] = db.add_person(orphan, trans)
+
+        family = Family()
+        family.set_father_handle(handles["father"])
+        family.set_mother_handle(handles["mother"])
+        child_ref = ChildRef()
+        child_ref.set_reference_handle(handles["child"])
+        family.add_child_ref(child_ref)
+        handles["family"] = db.add_family(family, trans)
+
+        # The child's second parent family: a stepfather and his wife.
+        stepfather = Person()
+        stepfather.set_primary_name(_name("Ed", "Jones"))
+        handles["stepfather"] = db.add_person(stepfather, trans)
+        stepmother = Person()
+        stepmother.set_primary_name(_name("Ann", "Lee"))
+        handles["stepmother"] = db.add_person(stepmother, trans)
+        family2 = Family()
+        family2.set_father_handle(handles["stepfather"])
+        family2.set_mother_handle(handles["stepmother"])
+        step_ref = ChildRef()
+        step_ref.set_reference_handle(handles["child"])
+        step_ref.set_father_relation(ChildRefType.STEPCHILD)
+        family2.add_child_ref(step_ref)
+        handles["family2"] = db.add_family(family2, trans)
+
+        # Gramps keeps both sides of a family link; DbTxn doesn't do it for us.
+        for key, method, family_key in (
+            ("father", "add_family_handle", "family"),
+            ("mother", "add_family_handle", "family"),
+            ("child", "add_parent_family_handle", "family"),
+            ("stepfather", "add_family_handle", "family2"),
+            ("stepmother", "add_family_handle", "family2"),
+            ("child", "add_parent_family_handle", "family2"),
+        ):
+            person = db.get_person_from_handle(handles[key])
+            getattr(person, method)(handles[family_key])
+            db.commit_person(person, trans)
+    yield db, handles
+    db.close()
+    dbman.remove_database(db_name)
+
+
+_PEOPLE = ("father", "mother", "child", "orphan")
+
+
+@pytest.mark.parametrize(
+    "entry, expected",
+    [
+        ("parent_families[0].father.surname", {"child": "Anderson"}),
+        ("parent_families[0].mother.primary_name.first_name", {"child": "Lena"}),
+        ("parent_families[1].father.surname", {"child": "Jones"}),
+        ("parent_families[2].father.surname", {}),
+        ("parent_families[0].gramps_id", {"child": "F0000"}),
+        ("families[0].children[0].given_name", {"father": "Steve", "mother": "Steve"}),
+        ("citations[0].source.title", {"father": "Parish Register"}),
+        (
+            "len([f for f in parent_families if f.father.surname == 'Anderson'])",
+            {"child": 1, "father": 0, "mother": 0, "orphan": 0},
+        ),
+    ],
+)
+def test_indexed_collection_hop_select(indexed_hop_db, pg_conn, entry, expected):
+    """A select of `<collection>[n].<field>` gives the linked record's value,
+    and NULL where the entry isn't there -- on SQLite, PostgreSQL and the
+    evaluator alike."""
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+    from gramps_object_query_language.query_lang import parse_select
+
+    db, handles = indexed_hop_db
+    [(ref, key)] = parse_select(PERSON, [entry + " as v"])
+    assert key == "v"
+    want = {handles[person]: expected.get(person) for person in _PEOPLE}
+
+    query = Query(select=["handle", ref])
+    sql, params = compile_query(PERSON, query, dialect=Dialect.SQLITE)
+    db.dbapi.execute(sql, params)
+    got = {handle: value for handle, value in db.dbapi.fetchall() if handle in want}
+    assert got == want, "SQLite"
+    if pg_conn is not None:
+        sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
+        rows = _rows_on_postgresql(pg_conn, db, sql, params)
+        assert {h: v for h, v in rows if h in want} == want, "PostgreSQL"
+    for handle, value in want.items():
+        person = db.get_person_from_handle(handle)
+        assert resolve_column_ref(db, person, ref, PERSON) == value, "evaluator"
+
+
+@pytest.mark.parametrize(
+    "where_expr, expected",
+    [
+        ("parent_families[0].father.surname == 'Anderson'", {"child"}),
+        # `!=` is null-safe: no parent family at all also differs.
+        ("parent_families[0].father.surname != 'Anderson'", {"father", "mother", "orphan"}),
+        ("families[0].children[0].given_name == 'Steve'", {"father", "mother"}),
+        ("len([f for f in parent_families if f.mother.surname == 'Baker']) == 1", {"child"}),
+    ],
+)
+def test_indexed_collection_hop_where(indexed_hop_db, pg_conn, where_expr, expected):
+    db, handles = indexed_hop_db
+    _assert_sql_and_evaluator_agree(
+        db, handles, PERSON, _PEOPLE, where_expr, expected, pg_conn
+    )
+
+
+def test_birth_children_column(indexed_hop_db, pg_conn):
+    """The comprehension a Families column uses to count birth children,
+    where an adopted child doesn't count."""
+    from gramps.gen.lib import ChildRefType
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+    from gramps_object_query_language.query_lang import parse_select
+
+    db, handles = indexed_hop_db
+    [(ref, _)] = parse_select(FAMILY, [
+        "len([c for c in child_ref_list if c.frel.value == ChildRefType.BIRTH "
+        "and c.mrel.value == ChildRefType.BIRTH]) as n"
+    ])
+    family = db.get_family_from_handle(handles["family"])
+    adopted = ChildRef()
+    adopted.set_reference_handle(handles["orphan"])
+    adopted.set_father_relation(ChildRefType.ADOPTED)
+    family.add_child_ref(adopted)
+    with DbTxn("adopt", db) as trans:
+        db.commit_family(family, trans)
+    try:
+        query = Query(select=["handle", ref])
+        sql, params = compile_query(FAMILY, query, dialect=Dialect.SQLITE)
+        db.dbapi.execute(sql, params)
+        assert dict(db.dbapi.fetchall())[handles["family"]] == 1, "SQLite"
+        if pg_conn is not None:
+            sql, params = compile_query(FAMILY, query, dialect=Dialect.POSTGRESQL)
+            assert dict(_rows_on_postgresql(pg_conn, db, sql, params))[handles["family"]] == 1
+        assert resolve_column_ref(db, family, ref, FAMILY) == 1, "evaluator"
+    finally:
+        family.set_child_ref_list(family.get_child_ref_list()[:1])
+        with DbTxn("undo adopt", db) as trans:
+            db.commit_family(family, trans)
+
+
+def test_indexed_collection_hop_sorts(indexed_hop_db):
+    """`order_by` takes the same path; people with no parent family (NULL)
+    sort first ascending, as a missing birth date does."""
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+    from gramps_object_query_language.query_lang import parse_order_by
+
+    db, handles = indexed_hop_db
+    order_by = parse_order_by(PERSON, ["-families[0].children[0].given_name", "gramps_id"])
+    sql, params = compile_query(
+        PERSON, Query(select=["handle"], order_by=order_by), dialect=Dialect.SQLITE
+    )
+    db.dbapi.execute(sql, params)
+    order = [row[0] for row in db.dbapi.fetchall()]
+    assert set(order[:2]) == {handles["father"], handles["mother"]}
+
+
+# --- [x.f for x in rel if cond][n]: one entry, chosen by a condition ---------
+
+
+_OCCUPATIONS = "[a.value for a in attribute_list if a.type.value == AttributeType.OCCUPATION]"
+
+
+@pytest.mark.parametrize(
+    "entry, expected",
+    [
+        (_OCCUPATIONS + "[0]", {"father": "Farmer"}),
+        (_OCCUPATIONS + "[1]", {"father": "Miller"}),
+        (_OCCUPATIONS + "[2]", {}),
+        (
+            "[a for a in attribute_list if a.type.value == AttributeType.OCCUPATION][0].value",
+            {"father": "Farmer"},
+        ),
+        ("[a.value for a in attribute_list][0]", {"father": "Kalle"}),
+        (
+            "[f for f in parent_families if f.father.surname == 'Jones'][0]"
+            ".mother.primary_name.first_name",
+            {"child": "Ann"},
+        ),
+        ("[f for f in parent_families][1].father.surname", {"child": "Jones"}),
+        (
+            "[f.father.surname for f in parent_families if f.mother.surname == 'Baker'][0]",
+            {"child": "Anderson"},
+        ),
+        ("[f for f in parent_families if f.father.surname == 'Nobody'][0].gramps_id", {}),
+    ],
+)
+def test_picked_entry_select(indexed_hop_db, pg_conn, entry, expected):
+    """A select of a list comprehension taken by index gives that matching
+    entry's value, in stored order, NULL past the last match -- on SQLite,
+    PostgreSQL and the evaluator alike."""
+    test_indexed_collection_hop_select(indexed_hop_db, pg_conn, entry, expected)
+
+
+@pytest.mark.parametrize(
+    "where_expr, expected",
+    [
+        (_OCCUPATIONS + "[0] == 'Farmer'", {"father"}),
+        (_OCCUPATIONS + "[1] == 'Farmer'", set()),
+        ("[f for f in parent_families if f.father.surname == 'Jones'][0].mother.surname == 'Lee'", {"child"}),
+    ],
+)
+def test_picked_entry_where(indexed_hop_db, pg_conn, where_expr, expected):
+    db, handles = indexed_hop_db
+    _assert_sql_and_evaluator_agree(
+        db, handles, PERSON, _PEOPLE, where_expr, expected, pg_conn
+    )
+
+
+def test_picked_entry_sorts(indexed_hop_db):
+    """order_by takes a picked entry too: the one person with an occupation
+    sorts last ascending (NULLs first)."""
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+    from gramps_object_query_language.query_lang import parse_order_by
+
+    db, handles = indexed_hop_db
+    order_by = parse_order_by(PERSON, [_OCCUPATIONS + "[0]", "gramps_id"])
+    sql, params = compile_query(
+        PERSON, Query(select=["handle"], order_by=order_by), dialect=Dialect.SQLITE
+    )
+    db.dbapi.execute(sql, params)
+    assert [row[0] for row in db.dbapi.fetchall()][-1] == handles["father"]
+
+
+# --- arithmetic ----------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def lifespan_db():
+    """People with birth and death dates -- a full lifespan, one still
+    living (no death), one with no birth, and a year-only pair -- for
+    `death.date.dateval[2] - birth.date.dateval[2]` and friends."""
+    dbman = CLIDbManager(DbState())
+    dirpath, db_name = dbman.create_new_db_cli("_test_evaluator_lifespan", dbid="sqlite")
+    db = make_database("sqlite")
+    db.load(dirpath)
+    handles = {}
+
+    def event(trans, event_type, year, month=0, day=0):
+        ev = Event()
+        ev.set_type(event_type)
+        date = Date()
+        date.set_yr_mon_day(year, month, day)
+        ev.set_date_object(date)
+        return db.add_event(ev, trans)
+
+    with DbTxn("setup", db) as trans:
+        for key, birth, death in (
+            ("long", (1850, 3, 1), (1930, 2, 1)),  # 80 by year, 79 by days
+            ("short", (1900, 1, 1), (1905, 6, 1)),
+            ("living", (1990, 1, 1), None),
+            ("unborn", None, (1950, 1, 1)),
+            ("years", (1700, 0, 0), (1790, 0, 0)),
+        ):
+            person = Person()
+            person.set_primary_name(_name(key.title(), "Life"))
+            if birth:
+                person.set_birth_ref(_event_ref(event(trans, EventType.BIRTH, *birth)))
+            if death:
+                ref = _event_ref(event(trans, EventType.DEATH, *death))
+                person.add_event_ref(ref)
+                person.set_death_ref(ref)
+            handles[key] = db.add_person(person, trans)
+    yield db, handles
+    db.close()
+    dbman.remove_database(db_name)
+
+
+_LIVES = ("long", "short", "living", "unborn", "years")
+
+
+@pytest.mark.parametrize(
+    "entry, expected",
+    [
+        ("death.date.dateval[2] - birth.date.dateval[2]", {"long": 80, "short": 5, "years": 90}),
+        ("(death.date.sortval - birth.date.sortval) // 365", {"long": 79, "short": 5, "years": 90}),
+        ("birth.date.dateval[2] // 0", {}),
+        ("-birth.date.dateval[2] // 7", {"long": -265, "short": -272, "living": -285, "years": -243}),
+        ("len(event_ref_list) * 10 + 1", {"long": 21, "short": 21, "living": 11, "unborn": 11, "years": 21}),
+    ],
+)
+def test_arithmetic_select(lifespan_db, pg_conn, entry, expected):
+    """Arithmetic gives the same numbers on SQLite, PostgreSQL and the
+    evaluator, whole numbers staying whole, and no value where a side has
+    none or a divisor is zero."""
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+    from gramps_object_query_language.query_lang import parse_select
+
+    db, handles = lifespan_db
+    [(ref, _)] = parse_select(PERSON, [entry + " as v"])
+    want = {handles[key]: expected.get(key) for key in _LIVES}
+    query = Query(select=["handle", ref])
+    sql, params = compile_query(PERSON, query, dialect=Dialect.SQLITE)
+    db.dbapi.execute(sql, params)
+    assert dict(db.dbapi.fetchall()) == want, "SQLite"
+    if pg_conn is not None:
+        sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
+        got = dict(_rows_on_postgresql(pg_conn, db, sql, params))
+        assert got == want, "PostgreSQL"
+        assert all(type(v) is int for v in got.values() if v is not None)
+    for handle, value in want.items():
+        assert resolve_column_ref(db, db.get_person_from_handle(handle), ref, PERSON) == value
+
+
+def test_true_division_is_a_float(lifespan_db, pg_conn):
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+    from gramps_object_query_language.query_lang import parse_select
+
+    db, handles = lifespan_db
+    [(ref, _)] = parse_select(PERSON, ["(death.date.dateval[2] - birth.date.dateval[2]) / 4 as v"])
+    query = Query(select=["handle", ref])
+    sql, params = compile_query(PERSON, query, dialect=Dialect.SQLITE)
+    db.dbapi.execute(sql, params)
+    assert dict(db.dbapi.fetchall())[handles["short"]] == 1.25
+    if pg_conn is not None:
+        sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
+        assert dict(_rows_on_postgresql(pg_conn, db, sql, params))[handles["short"]] == 1.25
+    assert resolve_column_ref(db, db.get_person_from_handle(handles["short"]), ref, PERSON) == 1.25
+
+
+@pytest.mark.parametrize(
+    "where_expr, expected",
+    [
+        ("death.date.dateval[2] - birth.date.dateval[2] > 85", {"years"}),
+        ("death.date.dateval[2] > birth.date.dateval[2] + 85", {"years"}),
+        ("10 > death.date.dateval[2] - birth.date.dateval[2]", {"short"}),
+        ("death.date.dateval[2] == birth.date.dateval[2] + 80", {"long"}),
+        # No value isn't "not more than 50" either (see Not's missing-value rule).
+        ("not (death.date.dateval[2] - birth.date.dateval[2] > 50)", {"short"}),
+    ],
+)
+def test_arithmetic_where(lifespan_db, pg_conn, where_expr, expected):
+    db, handles = lifespan_db
+    _assert_sql_and_evaluator_agree(db, handles, PERSON, _LIVES, where_expr, expected, pg_conn)
+
+
+def test_arithmetic_sort_pages_on_postgresql(lifespan_db, pg_conn):
+    """Sorting by a computed value pages like any other sort key."""
+    from gramps_object_query_language.query_lang import parse_order_by, parse_select
+
+    if pg_conn is None:
+        pytest.skip("needs GOQL_TEST_POSTGRES_DSN")
+    db, _ = lifespan_db
+    select = [ref for ref, _ in parse_select(PERSON, ["handle", "death.date.dateval[2] - birth.date.dateval[2] as age"])]
+    order_by = parse_order_by(PERSON, ["-(death.date.dateval[2] - birth.date.dateval[2])"])
+
+    def run(sql, params):
+        return _rows_on_postgresql(pg_conn, db, sql, params)
+
+    expected = _one_query(run, PERSON, select, order_by)
+    assert len(expected) == 5
+    assert _page_through(run, PERSON, select, order_by) == expected

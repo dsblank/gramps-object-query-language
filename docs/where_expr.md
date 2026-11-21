@@ -200,15 +200,15 @@ same query needs to run correctly against both backends.
 ## `is`, `is not`, and `not in`
 
 ```python
-Person "mother is None"
-Person "mother is not None"
+Person "death.date.sortval is None"
+Family "mother.gramps_id is not None"
 Person "gender not in [Person.FEMALE, Person.OTHER]"
 Person "'Jan' not in given_name"
 ```
 
 `is`/`is not` are exactly `==`/`!=` -- this language has no notion of object
-identity distinct from value equality, so `mother is None` and
-`mother == None` compile to the identical wire node, and read the same as
+identity distinct from value equality, so `death.date.sortval is None` and
+`death.date.sortval == None` compile to the identical wire node, and read the same as
 `gender is Person.MALE`/`gender == Person.MALE` do. `not in` is `in`
 negated -- both of `in`'s shapes (list membership and substring test) work
 the same on the left of `not in`, since `x not in y` is just `not (x in y)`
@@ -263,6 +263,71 @@ subquery -- not a `JOIN` -- so sibling hops through the same table (a
 family's father and mother are both `Person` rows) and multi-level chains
 both compose correctly.
 
+### One entry of a collection: `parent_families[0].father`
+
+A [collection](#one-to-many-relationships-any) such as a person's
+`parent_families` is a list of links. Indexing it picks one entry, and the
+path then goes on into the record that entry links to, exactly as it would
+after a relationship name:
+
+```python
+Person "parent_families[0].father.surname == 'Smith'"
+```
+
+`parent_families[0]` is a person's first parent family, which Gramps treats
+as their main parents, so this matches everyone whose father's surname is
+Smith. It works with every collection stored on the record itself
+(`families`, `parent_families`, `children`, `events`, `citations`,
+`media`, `notes`, `tags`, `associations`, `enclosing_places`,
+`repositories`), at any point in a path, and chains like any other hop:
+
+| Path | Reads |
+|------|-------|
+| `parent_families[0].mother.primary_name` | a person's mother |
+| `families[0].children[0].birth.date` | a person's first child's birth date (in their first family) |
+| `father.parent_families[0].father.primary_name` | a family's paternal grandfather |
+| `citations[0].source.title` | the source of a record's first citation |
+
+As with a relationship, something has to follow the index
+(`parent_families[0].gramps_id`, not `parent_families[0]` alone). An entry
+that isn't there (a person with no parent family) gives no value, like a
+missing birth event. `backlinks` and `child_refs` can't be indexed:
+`backlinks` isn't stored on the record, and a `child_refs` entry is about
+this person, not a record to go to.
+
+To test *every* entry instead of one, use a comprehension:
+`any(f.father.surname == 'Smith' for f in parent_families)`.
+
+### One entry chosen by a condition: `[...][0]`
+
+A list comprehension taken by index picks the first (or second, ...)
+entry that matches its `if`, in the order the list stores them:
+
+```python
+Person "[a.value for a in attribute_list if a.type.value == AttributeType.OCCUPATION][0] == 'Farmer'"
+```
+
+reads "the person's first Occupation attribute is Farmer". What the
+comprehension collects is what you get: `a.value` gives the attribute's
+value; `a` gives the whole attribute, which a path after the index can then
+read (`[a for a in attribute_list if ...][0].value` means the same).
+
+Over a [collection](#one-to-many-relationships-any), the entry is a
+record, and the path goes on into it as after `parent_families[0]`:
+
+| Expression | Reads |
+|------------|-------|
+| `[f for f in parent_families if f.father.surname == 'Smith'][0].mother.primary_name` | the mother in a person's first parent family whose father is a Smith |
+| `[f.father.primary_name for f in parent_families if len(f.children) > 2][0]` | the father of a person's first parent family with more than two children |
+| `[n.type for n in alternate_names][1]` | the type of a person's second alternate name |
+
+Without an `if` it's the same as plain indexing
+(`[f for f in parent_families][1]` is `parent_families[1]`). When fewer
+entries match than the index asks for, there's no value, as for a missing
+birth event. The index is a plain number, 0 or more. `backlinks` and
+`child_refs` can't be picked from, for the same reasons they can't be
+indexed.
+
 ### Field-vs-field comparisons
 
 The right-hand side of a comparison can be a path too, not just a literal --
@@ -298,24 +363,26 @@ surname"`).
 Every relationship in the table above is one-to-one -- a family has exactly
 *one* father, a person has exactly *one* birth event. Some relationships are
 naturally one-to-many instead -- a family has any number of children, a
-person can have any number of notes -- and those need a different construct:
-`any(name, condition)`, a whitelisted function-call form (like
-`like(...)`), not an ordinary path:
+person can have any number of notes -- and those are written the way
+Python asks whether any item of a list matches, with `any(...)` around a
+generator expression:
 
 ```python
-Family "any(children, given_name == 'Steve')"
-Family "not any(children, given_name == 'Steve')"
-Family "any(children)"
+Family "any(c.given_name == 'Steve' for c in children)"
+Family "not any(c.given_name == 'Steve' for c in children)"
+Family "any(c for c in children)"
 ```
 
 `children`/`notes`/... are **collection** names -- registered separately
-from the relationship table above, and never usable as a dotted-path
-segment (`children.surname` would be ambiguous: which child?), only as
-`any`'s (or `len`'s, see below) first argument. Registered on every one
-of the ten record types, following Gramps' own object model exactly (a
-`Source` has no `citations` since a source doesn't cite other citations; a
-`Repository` has neither `citations` nor `media`; `Tag` has none at all --
-a tag doesn't tag itself):
+from the relationship table above. A whole collection is never a dotted-path
+segment (`children.surname` would be ambiguous: which child?); it's what a
+comprehension's `for c in ...` goes through, or, with an index, one entry
+of it (`children[0].surname`, see
+[One entry of a collection](#one-entry-of-a-collection-parent_families0father)).
+Registered on every one of the ten record types, following Gramps' own
+object model exactly (a `Source` has no `citations` since a source doesn't
+cite other citations; a `Repository` has neither `citations` nor `media`;
+`Tag` has none at all -- a tag doesn't tag itself):
 
 | On a...     | ...`name`                    | reaches | via |
 |-------------|-------------------------------|---------|-----|
@@ -344,15 +411,17 @@ a tag doesn't tag itself):
 `Person`) -- worth knowing only because it's the one case where the SQL
 compiler has to alias the related row's table so it doesn't collide with
 the outer row's own table name; nothing about writing the query itself
-changes, `any(associations, ...)` reads and behaves exactly like any
-other collection.
+changes, `any(a.given_name == 'Bob' for a in associations)` reads and
+behaves exactly like any other collection.
 
-`condition` is a second, ordinary `where_expr` -- anything legal as a
-top-level expression is legal here too (`and`/`or`/`not`, chained
-relationships, even a nested `any`) -- just evaluated against the
-collection's target type (`Person`, for `children`) instead of the outer one.
-It can be left out entirely (`any(children)`), meaning "at least one
-related row at all," with no further condition on it.
+The condition (`c.given_name == 'Steve'`) is an ordinary `where_expr`
+about one related record, reached through the loop variable -- anything
+legal as a top-level expression is legal here too (`and`/`or`/`not`,
+chained relationships such as `c.birth.place.title`, even a nested
+`any`). An `if` adds to it: `any(c for c in children if c.gender ==
+Person.MALE)` and `any(c.gender == Person.MALE for c in children)` mean
+the same. With neither (`any(c for c in children)`), it asks for at least
+one related row at all.
 
 Under the hood, `any(...)` compiles to a real `EXISTS (...)` subquery that
 iterates the JSON array (`json_each` on SQLite, `jsonb_array_elements`/
@@ -363,45 +432,36 @@ is, since there can be any number of matching rows, not just one.
 One consequence worth knowing: unlike an ordinary comparison, `any(...)`
 never produces SQL's `UNKNOWN` -- a family with no children at all simply
 has zero matching rows in the subquery, the same as a family whose children
-don't happen to match `condition`, so `any(...)` there is a definite
+don't happen to match the condition, so `any(...)` there is a definite
 `False` either way (never `None`/"missing"). That means `not any(...)`
 is always plain negation, with none of the "a missing value under `not`
 stays excluded, not included" three-valued-logic subtlety described above
 for ordinary comparisons.
 
-`exists(...)` is an older, still-supported spelling for this exact same
-form -- `exists(children, ...)` and `any(children, ...)` compile to the
-identical query -- kept for backwards compatibility, not recommended for
-new queries.
-
 ## Counting a collection: `len(...)`
 
-`any(...)` only answers "at least one" -- `len(name, condition)` asks
-"how many," over the same registered collections:
+`any(...)` only answers "at least one" -- `len(...)` asks "how many," over
+the same registered collections: on its own for all of them, or around a
+list comprehension with an `if` for the ones that match:
 
 ```python
 Family "len(children) > 2"
-Family "len(children, gender == Person.MALE) >= 1"
+Family "len([c for c in children if c.gender == Person.MALE]) >= 1"
 ```
 
 Unlike `any(...)`, `len(...)` isn't itself a condition -- it produces a
-*number*, so it has to appear as the left-hand side of an ordinary
-comparison (`len(children) > 2`, not a bare `len(children)`) the same
-way a field reference does. `condition` is optional, exactly as with
-`any`, and parses the same way (a full nested `where_expr` against the
-collection's target type); leaving it out (`len(children)`) counts every
-related row, unfiltered.
+*number*, so it's compared like a field (`len(children) > 2`, not a bare
+`len(children)`), shown as a column, sorted by, or used in
+[arithmetic](#arithmetic). The list comprehension collects the loop
+variable (`[c for c in ...]`) or a plain literal (`[1 for c in ...]`); what
+it counts comes from its `if`.
 
 ```python
 Family "len(children) in [0, 1]"
 ```
 
-`len(...)`, here, is deliberately narrower than a plain field: it's only
-recognized on a comparison's left-hand side, never on the right and never
-compared against another field or another `len(...)` (`len(a) ==
-len(b)` isn't supported) -- the same restriction `len(...)`'s own
-array-length form has (see [Array length](#array-length-lenpath) below),
-kept consistent between the two.
+A count goes on the left of a comparison; comparing two counts directly
+(`len(a) == len(b)`) isn't supported.
 
 Under the hood, `len(...)` reuses `any(...)`'s own subquery shape
 verbatim, just wrapped as `(SELECT COUNT(*) FROM ...)` instead of
@@ -409,25 +469,13 @@ verbatim, just wrapped as `(SELECT COUNT(*) FROM ...)` instead of
 at all) is `0`, not `NULL`, the same way `COUNT(*)` over zero matching rows
 always is in SQL.
 
-`count(...)` is an older, still-supported spelling for this exact same
-form -- `count(children, ...)` and `len(children, ...)` compile to the
-identical query -- kept for backwards compatibility, not recommended for
-new queries.
-
 ## Array length: `len(path)`
 
-`len(...)` is actually two things at once, disambiguated by what its first
-argument is: `len(name)`/`len(name, condition)`, where `name` is a
-registered collection, is the collection form documented in
-[Counting a collection](#counting-a-collection-len) above. This section is
-about the *other* thing: `len(path)`, where `path` isn't a collection name
-at all.
-
-The collection form of `len(...)` measures a *collection* -- a list of
-handles reaching into another table (`Family.children`, `Person.notes`).
-`len(path)` measures a plain JSON array already living inside the current
-row itself, no second table involved -- an attribute list, a URL list, or
-(the motivating case) a person's *other* recorded surnames:
+The collections above are lists of handles reaching into another table
+(`Family.children`, `Person.notes`). `len(path)` measures a plain JSON
+array already living inside the current row itself, no second table
+involved -- an attribute list, a URL list, or (the motivating case) a
+person's *other* recorded surnames:
 
 ```python
 Person "len(primary_name.surname_list) > 1"
@@ -442,12 +490,6 @@ particular index position was filled in
 "at least two," and breaks down for "at least three" or more. `len(...)`
 counts how many are actually there.
 
-Like the collection form above, this `len(...)` produces a *number*, so it
-appears as the left-hand side of a comparison (`len(note_list) > 0`, not a
-bare `len(note_list)`), supports `in` (`len(note_list) in [0, 1]`), and is
-deliberately narrower than a plain field: only ever the left-hand operand,
-never compared against another field or another `len(...)`.
-
 `path` can cross a relationship first, the same way any other field
 reference can:
 
@@ -460,77 +502,37 @@ A missing path and a non-array value at that path both count as `0`, not
 matching the collection form's own "missing collection is `0`" behavior
 above.
 
-This array-length form is a different feature from the collection form's
-own list-comprehension sugar spelling, `len([... for x in rel])` (see
-[Comprehension sugar](#comprehension-sugar-any-and-len) below) -- Python's
-own call syntax keeps the two apart: `len(...)` wrapping a real list
-comprehension is that sugar; `len(...)` wrapping a plain path is this
-array-length form instead.
+## Lists inside a record
 
-## Array membership: `any(path, condition)`
-
-`any(...)`, like `len(...)`, is two things disambiguated by its first
-argument: `any(name)`/`any(name, condition)` over a registered collection is
-the collection form documented in
-[One-to-many relationships](#one-to-many-relationships-any) above. This
-section is the other thing, `any(...)`'s own capability beyond that: a
-*condition* on one element of a plain intra-record JSON array, the thing
-`len(path)` alone can't express -- `len(path) > 0` only ever answers "is the
-array non-empty," never "does *this specific* element match something":
+A comprehension goes through a list stored inside the record just as it
+goes through a collection -- the condition is then about one entry of
+that list:
 
 ```python
-Person "any(alternate_names, first_name == 'Doyle')"
-Family "any(children, gender == Person.MALE)"
+Person "any(n.first_name == 'Doyle' for n in alternate_names)"
+Person "len([n for n in alternate_names if n.first_name == 'Doyle']) > 1"
+Family "any(a.value == 'Blacksmith' for a in father.attribute_list)"
 ```
 
-The second line is just `any(...)`'s already-documented collection form --
-`children` is a registered collection, so `any(...)` resolves it the way
-it always does. The first line is different: `alternate_names` isn't a
-collection (a `Name` has no `gramps_id`, no page of its own -- it only ever
-exists embedded inside the person record it belongs to), so only this
-array-membership form can reach it, not the collection form above. Rule of
-thumb for telling the two apart: if the thing you're filtering on would show
-up as its own record elsewhere in the tree (a child, a note, a citation),
-it's a collection, reachable the `any(...)` way already documented above; if
-it's just one of several alternative values recorded directly on this same
-field (a name, an address, an attribute), it's an array, and needs this
-section's form.
+`alternate_names` isn't a collection (a `Name` has no `gramps_id`, no
+page of its own -- it only ever exists embedded inside the person record
+it belongs to). Rule of thumb for telling the two apart: if the thing
+you're filtering on would show up as its own record elsewhere in the tree
+(a child, a note, a citation), it's a collection; if it's just one of
+several alternative values recorded directly on this record (a name, an
+address, an attribute), it's a list inside the record. The same spelling
+covers both. A list inside a record can be reached across a relationship
+first (`father.attribute_list`, above); a collection can't yet
+(`any(n for n in father.notes)` is rejected).
 
-`any(path)` -- one argument, no condition -- means "the array has at least
-one element at all," exactly what `len(path) > 0` already means (and
-compiles to the identical query, reusing that cheaper rendering rather than
-scanning the array for real):
+Only a **list-of-structs** array -- one whose elements are themselves
+records with their own fields (`Name`, `Attribute`, `Address`, `Surname`)
+-- can take a condition; a plain list of values (`note_list`, `tag_list`)
+has no sub-field to write one against, and is rejected with a clear error
+if you try (`len(note_list) > 0` already covers "has any at all" for
+those).
 
-```python
-Person "any(attribute_list)"
-```
-
-`len(path, condition)` is `any(path, condition)`'s own value-producing
-counterpart -- how many elements match, not just whether any do:
-
-```python
-Person "len(alternate_names, first_name == 'Doyle') > 1"
-```
-
-Both take an optional relationship hop before the array, the same as every
-other construct on this page:
-
-```python
-Family "any(father.attribute_list, value == 'Blacksmith')"
-```
-
-A condition's fields resolve *relative to one array element*, not the
-outer row -- inside `any(alternate_names, first_name == 'Doyle')`,
-`first_name` means that specific alternate name's own `first_name`, the
-same way `condition` inside `any(children, ...)` resolves against one
-child, not the family. Only a **list-of-structs** array -- one whose
-elements are themselves records with their own fields (`Name`, `Attribute`,
-`Address`, `Surname`) -- can take a condition this way; a plain list of
-values (`note_list`, `tag_list`) has no sub-field to write one against, and
-is rejected with a clear error if you try (`any(path)`/`len(path) > 0`, no
-condition, already covers "has any at all" for those).
-
-## Reverse references: `any(backlinks, ...)`
+## Reverse references: `backlinks`
 
 Every collection above reaches *outward* -- a family's own `children`, a
 person's own `notes`. `backlinks` is the one collection that reaches the
@@ -543,9 +545,9 @@ comes from Gramps' own `reference` table, the same index
 `find_backlink_handles()` uses internally to answer "what points here":
 
 ```python
-Note "not any(backlinks)"
-Note "any(backlinks, _class == 'Person')"
-Note "any(backlinks) and len(backlinks) > 1"
+Note "not any(bl for bl in backlinks)"
+Note "any(bl._class == 'Person' for bl in backlinks)"
+Note "any(bl for bl in backlinks) and len(backlinks) > 1"
 ```
 
 `_class` is the one field a `backlinks` condition can test -- the
@@ -554,34 +556,30 @@ name every record's own serialized JSON already uses for its type. Unlike
 `children`/`notes`/every other collection above, `backlinks` has no single
 target type to reach further into -- a backlink's referrer can be any of
 the ten record types at once -- so `_class` can't be followed any deeper
-(`_class.primary_name` isn't supported): `==`/`!=`/`is`/`is not`/`in`
+(`bl._class.primary_name` isn't supported): `==`/`!=`/`is`/`is not`/`in`
 against a class-name string (or a list of them, for `in`) is the whole
 vocabulary:
 
 ```python
-Note "any(backlinks, _class in ['Person', 'Family'])"
-Note "any(backlinks, _class != 'Media')"
+Note "any(bl._class in ['Person', 'Family'] for bl in backlinks)"
+Note "any(bl._class != 'Media' for bl in backlinks)"
 ```
 
 `len(backlinks)` works exactly like `len(...)` above -- `len(backlinks)
-== 0` is another way to spell `not any(backlinks)`. Reaching into the
-referrer's own fields beyond its class (e.g. a Note referenced by a Person
-whose surname is Smith) isn't supported yet -- see `ROADMAP.md`'s "Reverse
-relationships" item for why that needs a genuinely different, per-class
-construct rather than a straightforward extension of this one.
-
-`exists(backlinks)`/`count(backlinks)` are older, still-supported spellings
-for this exact same collection -- kept for backwards compatibility, not
-recommended for new queries.
+== 0` is another way to spell `not any(bl for bl in backlinks)`. Reaching
+into the referrer's own fields beyond its class (e.g. a Note referenced by
+a Person whose surname is Smith) isn't supported yet -- see `ROADMAP.md`'s
+"Reverse relationships" item for why that needs a genuinely different,
+per-class construct rather than a straightforward extension of this one.
 
 ## A self-linked collection: `Person.child_refs`
 
-Every collection so far reads like `any(children, given_name == 'Steve')`
--- a condition tested against the *joined row's own fields* (`children`'s
-condition sees a `Person`, `notes`' sees a `Note`). `child_refs` is the one
-exception: it's still a registered collection, reached the same way, but its
-condition is about a field on the *link* between the two records, not
-either record itself:
+Every collection so far reads like `any(c.given_name == 'Steve' for c in
+children)` -- a condition tested against the *joined row's own fields*
+(`children`'s condition sees a `Person`, `notes`' sees a `Note`).
+`child_refs` is the one exception: it's still a registered collection,
+reached the same way, but its condition is about a field on the *link*
+between the two records, not either record itself:
 
 ```python
 Person "any(ref for ref in child_refs if ref.frel.value == ChildRefType.ADOPTED or ref.mrel.value == ChildRefType.ADOPTED)"
@@ -595,90 +593,40 @@ own parent families (`parent_family_list`, the same list `parent_families`
 above reaches) and, for each one, finds *the one entry in that family's own
 `child_ref_list` that names this person* -- `frel`/`mrel` (along with every
 other `ChildRef` field: `note_list`, `citation_list`, `private`) are that
-entry's own fields, not `Family`'s. The comprehension form above (see
-[Comprehension sugar](#comprehension-sugar-any-and-len) below) is worth
-reaching for specifically here: writing `ref.frel`/`ref.mrel` visibly ties
-those two fields back to the bound loop variable, making it obvious they
-come from the `ChildRef` link itself, not from `Person` or `Family` --
-easy to miss in the equivalent direct call, `any(child_refs, frel.value ==
-ChildRefType.ADOPTED or mrel.value == ChildRefType.ADOPTED)`, where nothing
-in the spelling names what `frel`/`mrel` are attached to.
+entry's own fields, not `Family`'s. Writing `ref.frel`/`ref.mrel` ties
+those two fields to the loop variable, the `ChildRef` link itself.
 
-`child_refs` composes with every keyword this page already covers --
-`any(child_refs, ...)`, `len(child_refs, ...)`, and (older, still-supported
-spellings) `exists(child_refs, ...)`/`count(child_refs, ...)` all reach it
-identically, since it's a real registered collection like any other. What's
-different is entirely internal to how its own condition is resolved --
-nothing about writing the query itself changes.
+`child_refs` works with `any(...)` and `len([...])` like any other
+collection; it can't be indexed or picked from (`child_refs[0]`), since its
+entries are about this person, not records to go to.
 
-## Comprehension sugar: `any(...)` and `len([...])`
+## Comprehension rules
 
-`any(children, given_name == 'Steve')` reads reasonably close to plain
-English, but for anyone more used to reaching for Python's own idiom, the
-same query can be spelled as a generator expression instead:
+The comprehensions on this page are a few fixed shapes of Python's, not
+Python itself:
 
-```python
-Family "any(c.given_name == 'Steve' for c in children)"
-```
-
-This is pure syntax sugar -- parsed and immediately rewritten into exactly
-the `any(children, given_name == 'Steve')` form above before anything else
-runs, so it compiles to the identical query, not merely an equivalent one.
-`len([...])` has a matching spelling, as a list comprehension:
-
-```python
-Family "len([c for c in children if c.given_name == 'Robert']) == 1"
-```
-
-which rewrites to `len(children, given_name == 'Robert') == 1`. Both
-directions are checked directly in
-[`test_query_lang.py`](../gramps_object_query_language/tests/test_query_lang.py)
-(`parse_expr("any(...)") == parse_expr("any(name, ...)")`, and likewise for
-`len([...])`), not just documented as equivalent.
-
-The rewrite target is `any(...)`/`len(...)` themselves, not `exists(...)`/
-`count(...)` -- so this sugar isn't collection-only either: it reaches
-[Array membership](#array-membership-anypath-condition)'s plain
-intra-record array form too, the same way the direct call does:
-
-```python
-Person "any(n.first_name == 'Doyle' for n in alternate_names)"
-```
-
-rewrites to `any(alternate_names, first_name == 'Doyle')`, not a
-registered collection at all.
-
-A few rules of thumb, all mirroring what `any(...)`/`len(...)`'s own direct
-call already supports rather than adding anything new underneath:
-
-- `any(...)`'s comprehension `elt` *is* the condition (`any(c.a == 1 for c
-  in rel)`); a bare loop variable with no attribute after it (`any(c for c
-  in rel)`) has no condition of its own, matching `any(rel)` with
-  nothing to filter on. An `if` clause on the generator ANDs in as an
-  additional condition either way (`any(c for c in rel if c.a == 1)` and
-  `any(c.a == 1 for c in rel)` compile identically).
-- `len([...])`'s projection (its `elt`) is required to be trivial -- the
-  loop variable itself, or a plain literal like `1` -- since unlike
-  `any(...)`'s `elt`, it was never a condition to begin with; the condition
-  comes entirely from the comprehension's `if` clause(s), if any.
-- Only one `for` clause is allowed, and the loop variable must be a plain
-  name (no tuple-unpacking) -- exactly what a single `any`/`len` call
-  already assumes.
-- Nested comprehensions work, mapping onto nested `any`/`len` calls
-  the same way a hand-written nested call would --
+- `any(<condition> for x in <list>)` -- the condition is about `x`; a bare
+  `x` (`any(x for x in rel)`) has none. An `if` on the generator adds to
+  it (`any(x for x in rel if x.a == 1)` is `any(x.a == 1 for x in rel)`).
+- `len([x for x in <list> if <condition>])` -- counts by the `if`; what it
+  collects must be `x` itself or a plain literal (`[1 for x in ...]`).
+- `[x.<path> for x in <list> if <condition>][n]` -- one matching entry,
+  see [One entry chosen by a condition](#one-entry-chosen-by-a-condition-0).
+- Only one `for` clause, and the loop variable is a plain name (no
+  tuple-unpacking).
+- `<list>` is a collection name, a list inside the record (optionally
+  across a relationship, `father.attribute_list`), or -- inside another
+  comprehension -- exactly one attribute off the enclosing loop variable:
   `any(any(e.type.value == EventType.BIRTH for e in c.events) for c in
-  children)` is `any(children, any(events, type.value ==
-  EventType.BIRTH))` -- but the inner `for ... in ...` is restricted to a
-  bare name (a collection or a path, like `alternate_names`) or exactly one
-  attribute off the *enclosing* comprehension's own loop variable
-  (`c.events`, not a longer chain), the same restriction `any`/`len`'s own
-  first argument already has.
+  children)`, not a longer chain.
+- `all(...)`/`sum(...)` aren't recognized -- there's no established
+  motivating query for them yet, and `all(...)` in particular would need a
+  double negation (`not any(not ... for ...)`) under the hood.
 
-`all(...)`/`sum(...)` aren't recognized -- there's no established
-motivating query for them yet, and `all(...)` in particular would need a
-double negation (`not any(rel, not cond)`) under the hood to mean the
-same thing SQL's `NOT EXISTS` doesn't already give you a shorter way to
-reach for.
+Older spellings -- `exists(rel, cond)`, `count(rel, cond)`, `any(rel,
+cond)` and `len(rel, cond)` -- still parse, for saved filters that use
+them, and mean the same as the comprehensions above. They aren't
+documented further and shouldn't be used in new queries.
 
 ## Genealogy examples
 
@@ -742,36 +690,36 @@ Person "birth.place.title == death.place.title"
 Family "father.death.place.title == mother.death.place.title"
 ```
 
-**`any(children, ...)`** -- a family with at least one child matching a
-condition, and its negation:
+**`any(... for c in children)`** -- a family with at least one child
+matching a condition, and its negation:
 
 ```python
-Family "any(children, given_name == 'Steve')"
-Family "not any(children, given_name == 'Steve')"
+Family "any(c.given_name == 'Steve' for c in children)"
+Family "not any(c.given_name == 'Steve' for c in children)"
 ```
 
-**`any(children)`** -- a family with any recorded child at all, condition
-omitted:
+**`any(c for c in children)`** -- a family with any recorded child at all,
+no condition:
 
 ```python
-Family "any(children)"
+Family "any(c for c in children)"
 ```
 
-**`any(notes)`** -- starting from `Person` instead of `Family`, and over a
-flat handle list (`note_list`) rather than a list of ref objects
+**`any(n for n in notes)`** -- starting from `Person` instead of `Family`,
+and over a flat handle list (`note_list`) rather than a list of ref objects
 (`child_ref_list`) -- the two collection shapes registered today, both
 spelled the same way from `where_expr`:
 
 ```python
-Person "not any(notes)"
+Person "not any(n for n in notes)"
 ```
 
-**`len(children, ...)`** -- how many children match a condition (or none,
-to count every child):
+**`len(...)`** -- how many children there are, or how many match a
+condition:
 
 ```python
 Family "len(children) > 0"
-Family "len(children, given_name == 'Robert') == 1"
+Family "len([c for c in children if c.given_name == 'Robert']) == 1"
 ```
 
 **`Citation -> source -> Source`** -- the newest one-to-one relationship
@@ -786,14 +734,14 @@ Citation "source.title == 'Census Records'"
 at least one high-confidence citation:
 
 ```python
-Person "any(citations, confidence >= Citation.CONF_HIGH)"
+Person "any(c.confidence >= Citation.CONF_HIGH for c in citations)"
 ```
 
 **`associations` (self-referencing)** -- a person linked to another person
 by name, via an association:
 
 ```python
-Person "any(associations, given_name == 'Bob')"
+Person "any(a.given_name == 'Bob' for a in associations)"
 ```
 
 ## Constants
@@ -879,8 +827,8 @@ matches everything (even a record whose field is missing -- an empty list
 is plain false, not unknown).
 
 `parse_select`/`parse_order_by` (and their `_entry` forms) take the same
-`env`, for an `Env` inside a `count(...)`/`len(...)` condition, e.g. a
-select entry `"count(events, description == Env.D) as n"`.
+`env`, for an `Env` inside a comprehension's condition, e.g. a select
+entry `"len([e for e in events if e.description == Env.D]) as n"`.
 
 A value of the wrong type for the field it's compared with
 (`len(event_ref_list) > Env.N` with `N` = `"a"`, `gramps_id == 3`) is
@@ -998,6 +946,40 @@ give you at all:
 Person "birth.date.dateval[6] == 1970"
 ```
 
+## Arithmetic
+
+Numbers can be combined with `+`, `-`, `*`, `/` and `//`, with Python's
+precedence and parentheses, anywhere a value is used -- a comparison (on
+either side), `select` and `order_by`:
+
+```python
+Person "death.date.dateval[2] - birth.date.dateval[2] > 90"
+Person "(death.date.sortval - birth.date.sortval) // 365 > 90"
+Family "mother.birth.date.dateval[2] > father.birth.date.dateval[2] + 10"
+```
+
+The first reads "died more than 90 years after the year they were born";
+the second counts whole years from the exact dates (`sortval` is a day
+count), so someone born in March 1850 who died in February 1930 is 79
+there, 80 by year. The third finds families where the mother is more than
+ten years younger than the father.
+
+- **Numbers only.** Each side is a number, a numeric field, a count
+  (`len(...)`) or a [picked entry](#one-entry-chosen-by-a-condition-0). A
+  date isn't a number: use its `.sortval` (days) or `.dateval[2]` (year).
+  At least one side has to be a field; `2 + 3` is rejected.
+- **`/` and `//`.** `/` divides exactly (`7 / 2` is `3.5`); `//` rounds
+  down, as in Python (`-7 // 2` is `-4`, not SQL's `-3`).
+- **Missing values.** A side with no value (no death event) gives no
+  value, and so does dividing by zero, rather than an error. A comparison
+  against no value is false, as for any missing field.
+- **A date that is there but empty** (an event with no date, or a
+  text-only one) has `sortval` 0 and year 0, which *are* values: a
+  person whose birth event has no date gets a lifespan of nearly 2,000
+  years. Guard with `birth.date.sortval > 0 and death.date.sortval > 0`
+  where it matters.
+- `%` and `**` aren't supported.
+
 ## Selecting values: the same paths in `select`
 
 Everything above describes *which rows* come back. The same path grammar
@@ -1027,7 +1009,10 @@ Three details are specific to `select`:
 - **`as <key>` renames the response key.** Without it the key is the path
   text itself (`"birth.place.title"`). An alias must be a plain name.
 - **`len(...)` requires an alias.** Unlike a path, it has no text to derive
-  a name from.
+  a name from. (Neither does a comprehension taken by index; without an
+  alias its key is the entry's own text.) `len(...)` takes the same
+  comprehension a filter does:
+  `len([c for c in child_ref_list if c.frel.value == ChildRefType.BIRTH and c.mrel.value == ChildRefType.BIRTH]) as birth_children`.
 - **Paths are checked, in `select` and `where` alike.** See
   [Every path is checked](#every-path-is-checked) below.
 
@@ -1052,7 +1037,7 @@ parse_order_by(FAMILY, ["-len(child_ref_list)"])
 ```
 
 Anything a `select` entry can name works here: a flat column, a path, a
-relationship path, `count(...)` or `len(...)`. `as` has no meaning in a sort,
+relationship path, `len(...)`, a picked entry or arithmetic. `as` has no meaning in a sort,
 so it's an error, as is a comparison (`birth.date.sortval > 0`). Sorting by a
 path costs what selecting it does; see [What sorting costs](#what-sorting-costs)
 below.
@@ -1165,19 +1150,24 @@ changes.
 - Arbitrary function calls, lambdas, f-strings, imports -- the parser
   whitelists node *shapes*, so anything it doesn't explicitly recognize is
   rejected, not silently ignored.
-- Comprehensions, mostly -- `any(cond for x in rel)` and `len([... for x in
-  rel])` are recognized (see [Comprehension sugar](#comprehension-sugar-any-and-len)
-  above), but only in exactly that shape: every other comprehension form
-  (a bare list/set/dict comprehension not wrapped in `any(...)`/`len(...)`,
+- Comprehensions, mostly -- `any(cond for x in rel)`, `len([... for x in
+  rel])` and `[x.f for x in rel if ...][n]` are recognized (see
+  [Comprehension rules](#comprehension-rules) and
+  [One entry chosen by a condition](#one-entry-chosen-by-a-condition-0)
+  above), but only in exactly those shapes: every other comprehension form
+  (a bare list/set/dict comprehension not wrapped in `any(...)`/`len(...)`
+  or indexed,
   more than one `for` clause, a tuple-unpacking loop target, `all(...)`/
   `sum(...)`, ...) is rejected the same as any other unrecognized node.
-- A collection reached through a relationship hop -- `any(father.notes,
-  ...)` is rejected with a clear error, even though `father.notes` looks
+- A collection reached through a relationship hop -- `any(n for n in
+  father.notes)` is rejected with a clear error, even though `father.notes` looks
   just like the relationship-hop *paths* this page covers elsewhere
   (`father.attribute_list`, a plain array, works fine). `notes`/`children`/
   etc. are only ever reachable directly on the type being queried today,
   never one hop away -- not a design decision so much as nobody has needed
-  it yet.
+  it yet. One *entry* of one is reachable across a hop
+  (`father.parent_families[0].father.surname`, see
+  [One entry of a collection](#one-entry-of-a-collection-parent_families0father)).
 
 ## Using it from Python
 
