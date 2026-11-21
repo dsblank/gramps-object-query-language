@@ -2054,3 +2054,263 @@ def test_keyset_page_with_a_related_select_named_like_the_sort(parse_once_db, pg
     query = Query(select=select, order_by=order_by, after=after)
     for backend, rows in _person_rows(db, pg_conn, query).items():
         assert [row[0] for row in rows] == order[1:], backend
+
+
+# --- PostgreSQL pages: choose the rows, then read their select ---------------
+#
+# PostgreSQL computes plain `SELECT` expressions before the `ORDER BY` sort,
+# so a page of JSON fields sorted without an index read every matching
+# row's JSON. A page with a JSON `select` now picks its rows (handle and sort
+# keys) in an inner query and reads the `select` for those rows only.
+
+
+@pytest.mark.parametrize(
+    "dialect_name, select, limit, deferred",
+    [
+        ("POSTGRESQL", ["handle", "primary_name.first_name"], 2, True),
+        ("POSTGRESQL", ["handle", "birth.date"], 2, True),
+        ("POSTGRESQL", ["handle", "primary_name.first_name"], None, False),
+        ("POSTGRESQL", ["handle", "gramps_id", "surname"], 2, False),
+        ("SQLITE", ["handle", "primary_name.first_name"], 2, False),
+    ],
+)
+def test_which_pages_read_select_after_choosing_rows(dialect_name, select, limit, deferred):
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+    from gramps_object_query_language.query_lang import parse_order_by, parse_select
+
+    query = Query(
+        select=[ref for ref, _ in parse_select(PERSON, select)],
+        order_by=parse_order_by(PERSON, ["surname"]),
+        limit=limit,
+    )
+    sql, _ = compile_query(PERSON, query, dialect=Dialect[dialect_name], treeid=7)
+    assert ("goql_page" in sql) == deferred
+
+
+def _page_through(run, spec, select, order_by, *, where=None, collation=None, treeid=None):
+    """Every row of the deferred statement, two at a time, each page
+    continuing from the last one's cursor as gramps-web-api does (the
+    cursor values looked up by `compile_after_lookup`). `run(sql, params)`
+    executes PostgreSQL-dialect SQL."""
+    from gramps_object_query_language.query import (
+        Dialect, Query, compile_after_lookup, compile_query,
+    )
+
+    rows, after = [], None
+    for _ in range(20):  # a cursor that stops advancing fails, not hangs
+        sql, params = compile_query(
+            spec,
+            Query(select=select, where=where, order_by=order_by, limit=2, after=after),
+            collation=collation, dialect=Dialect.POSTGRESQL, treeid=treeid,
+        )
+        assert "goql_page" in sql
+        page = run(sql, params)
+        rows.extend(page)
+        if len(page) < 2:
+            return rows
+        lookup_sql, lookup_params = compile_after_lookup(
+            spec, order_by, page[-1][0], dialect=Dialect.POSTGRESQL, treeid=treeid
+        )
+        after = tuple(run(lookup_sql, lookup_params)[0])
+    raise AssertionError(f"paging did not finish: {len(rows)} rows so far")
+
+
+def _one_query(run, spec, select, order_by, *, where=None, collation=None, treeid=None):
+    """The same rows as one unpaged statement, which never defers."""
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+
+    sql, params = compile_query(
+        spec,
+        Query(select=select, where=where, order_by=order_by, limit=None),
+        collation=collation, dialect=Dialect.POSTGRESQL, treeid=treeid,
+    )
+    assert "goql_page" not in sql
+    return run(sql, params)
+
+
+_DEFERRED_PEOPLE_SELECT = [
+    "handle", "gramps_id", "primary_name.first_name", "primary_name.surname_list",
+    "birth.date.sortval", "count(events)", "event_ref_list",
+]
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        ["surname", "given_name"],
+        ["-surname", "-given_name"],
+        ["birth.date.sortval"],  # NULL for two people: NULLs first
+        ["-birth.date.sortval"],  # ... and last
+        ["primary_name.first_name"],
+        ["-gramps_id"],
+    ],
+)
+def test_pages_read_after_choosing_rows_match_one_query(parse_once_db, pg_conn, order):
+    """Paging two rows at a time through the deferred statement, cursor by
+    cursor, gives exactly the rows and values of one unpaged query, on
+    PostgreSQL -- with a JSON field, a parsed-once pair of fields, a hop and
+    a count beside flat columns."""
+    from gramps_object_query_language.query_lang import parse_order_by, parse_select
+
+    if pg_conn is None:
+        pytest.skip("needs GOQL_TEST_POSTGRES_DSN")
+    db, _ = parse_once_db
+    select = [ref for ref, _ in parse_select(PERSON, _DEFERRED_PEOPLE_SELECT)]
+    order_by = parse_order_by(PERSON, order)
+
+    def run(sql, params):
+        return _rows_on_postgresql(pg_conn, db, sql, params)
+
+    expected = _one_query(run, PERSON, select, order_by)
+    assert len(expected) == 4
+    assert _page_through(run, PERSON, select, order_by) == expected
+
+
+def test_deferred_page_with_a_filter_and_a_parsed_row_inside(parse_once_db, pg_conn):
+    """A filter (its parameters bind between the select's and the limit's),
+    sort keys that read the row's JSON twice -- so the inner query gets its
+    own parsed-row join -- and a select reading it only once, so the outer
+    query doesn't: the inner query keeps its join, and the pages still match
+    one unpaged query."""
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+    from gramps_object_query_language.query_lang import (
+        parse_expr_for_spec, parse_order_by, parse_select, where_list_to_ast,
+    )
+
+    db, handles = parse_once_db
+    select = [ref for ref, _ in parse_select(PERSON, ["handle", "gramps_id", "primary_name.first_name"])]
+    order_by = parse_order_by(PERSON, ["-primary_name.surname_list[0].surname", "primary_name.first_name"])
+    where = where_list_to_ast(parse_expr_for_spec(PERSON, "primary_name.first_name != 'Cat'"), PERSON)
+
+    sql, _ = compile_query(
+        PERSON, Query(select=select, where=where, order_by=order_by, limit=2), dialect=Dialect.POSTGRESQL
+    )
+    inner = sql[sql.index("FROM (SELECT"): sql.index(") AS goql_page")]
+    outer = sql.replace(inner, "")
+    # The inner query's sort keys and filter read its parsed copy of the row.
+    assert "CROSS JOIN LATERAL" in inner and inner.count("goql_row.json_data_jsonb") >= 2
+    assert "CROSS JOIN LATERAL" not in outer and "goql_row" not in outer
+
+    if pg_conn is None:
+        pytest.skip("needs GOQL_TEST_POSTGRES_DSN")
+
+    def run(sql, params):
+        return _rows_on_postgresql(pg_conn, db, sql, params)
+
+    expected = _one_query(run, PERSON, select, order_by, where=where)
+    # Smiths first (surname descending), each surname by first name; no Cat.
+    assert [row[0] for row in expected] == [handles[key] for key in ("p_ann", "p_bob", "p_dan")]
+    assert _page_through(run, PERSON, select, order_by, where=where) == expected
+
+
+def _rows_on_postgresql_in_two_trees(conn, db, sql: str, params: list) -> list:
+    """`_rows_on_postgresql`, but laid out as SharedPostgreSQL shares its
+    tables: each table gets a `treeid` column and holds `db`'s rows twice,
+    as tree 1 and tree 2 -- the same handles, as in a copied tree. Tree 2's
+    flat `gramps_id` is prefixed with "T2-", so a value read from the wrong
+    tree shows."""
+    try:
+        with conn.cursor() as cur:
+            for table in _PRIMARY_TABLES:
+                db.dbapi.execute(f"PRAGMA table_info({table})")
+                info = db.dbapi.fetchall()
+                names = [row[1] for row in info]
+                quoted = [f'"{name}"' for name in names]
+                types = ["INTEGER" if row[2].upper() == "INTEGER" else "TEXT" for row in info]
+                cur.execute(
+                    f"CREATE TEMP TABLE {table} (treeid INTEGER NOT NULL, "
+                    f"{', '.join(f'{c} {t}' for c, t in zip(quoted, types))})"
+                )
+                db.dbapi.execute(f"SELECT {', '.join(quoted)} FROM {table}")
+                rows = db.dbapi.fetchall()
+                placeholders = ", ".join(["%s"] * (len(info) + 1))
+                for treeid in (1, 2):
+                    for row in rows:
+                        row = list(row)
+                        if treeid == 2 and "gramps_id" in names:
+                            row[names.index("gramps_id")] = f"T2-{row[names.index('gramps_id')]}"
+                        cur.execute(f"INSERT INTO {table} VALUES ({placeholders})", [treeid, *row])
+            cur.execute(sql.replace("?", "%s"), params)
+            return cur.fetchall()
+    finally:
+        conn.rollback()
+
+
+@pytest.mark.parametrize("treeid", [1, 2])
+def test_deferred_page_reads_its_own_tree_when_trees_share_handles(parse_once_db, pg_conn, treeid):
+    """In tables shared by several trees, two trees can hold the same
+    handles (a copied tree). The page's rows are joined back to its own
+    tree's records: each person once, with that tree's values."""
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+    from gramps_object_query_language.query_lang import parse_order_by, parse_select
+
+    db, handles = parse_once_db
+    select = [ref for ref, _ in parse_select(PERSON, _DEFERRED_PEOPLE_SELECT)]
+    order_by = parse_order_by(PERSON, ["surname", "given_name"])
+    sql, params = compile_query(
+        PERSON, Query(select=select, order_by=order_by, limit=2), dialect=Dialect.POSTGRESQL, treeid=treeid
+    )
+    assert "person.treeid = ?" in sql and params.count(treeid) >= 3  # inner filter, join, hops
+
+    if pg_conn is None:
+        pytest.skip("needs GOQL_TEST_POSTGRES_DSN")
+
+    def run(sql, params):
+        return _rows_on_postgresql_in_two_trees(pg_conn, db, sql, params)
+
+    rows = _page_through(run, PERSON, select, order_by, treeid=treeid)
+    assert sorted(row[0] for row in rows) == sorted(handles[key] for key in _PARSE_ONCE_PEOPLE)
+    prefix = "T2-" if treeid == 2 else ""
+    assert all(row[1].startswith(prefix) and (treeid == 2 or not row[1].startswith("T2-")) for row in rows)
+    assert rows == _one_query(run, PERSON, select, order_by, treeid=treeid)
+
+
+@pytest.fixture(scope="module")
+def collation_db():
+    """People whose surnames sort differently by code point ("C": capitals
+    first, then lower case, then accented) and by a locale ("und-x-icu":
+    alphabetical, ignoring case and accents)."""
+    dbman = CLIDbManager(DbState())
+    dirpath, db_name = dbman.create_new_db_cli("_test_evaluator_collation", dbid="sqlite")
+    db = make_database("sqlite")
+    db.load(dirpath)
+    handles = {}
+    with DbTxn("setup", db) as trans:
+        for key, given, surname in (
+            ("zeller", "Zoe", "Zeller"), ("devos", "Dirk", "de Vos"),
+            ("adams", "Amy", "Adams"), ("emile", "Eve", "\u00c9mile"),
+            ("baker", "Bob", "Baker"),
+        ):
+            person = Person()
+            person.set_primary_name(_name(given, surname))
+            handles[key] = db.add_person(person, trans)
+    yield db, handles
+    db.close()
+    dbman.remove_database(db_name)
+
+
+@pytest.mark.parametrize(
+    "collation, order",
+    [
+        ("C", ["adams", "baker", "zeller", "devos", "emile"]),
+        ("und-x-icu", ["adams", "baker", "devos", "emile", "zeller"]),
+    ],
+)
+def test_deferred_page_sorts_by_the_requested_collation(collation_db, pg_conn, collation, order):
+    """A locale collation (gramps-web-api's `locale` parameter) rides on the
+    inner query's sort keys: both levels sort by it, and the pages come out
+    in that collation's order, matching one unpaged query."""
+    from gramps_object_query_language.query_lang import parse_order_by, parse_select
+
+    if pg_conn is None:
+        pytest.skip("needs GOQL_TEST_POSTGRES_DSN")
+    db, handles = collation_db
+    select = [ref for ref, _ in parse_select(PERSON, ["handle", "primary_name.first_name"])]
+    order_by = parse_order_by(PERSON, ["surname"])
+
+    def run(sql, params):
+        return _rows_on_postgresql(pg_conn, db, sql, params)
+
+    rows = _page_through(run, PERSON, select, order_by, collation=collation)
+    assert [row[0] for row in rows] == [handles[key] for key in order]
+    assert rows == _one_query(run, PERSON, select, order_by, collation=collation)
