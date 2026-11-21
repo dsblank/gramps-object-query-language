@@ -91,6 +91,8 @@ from .query import (
     ObjectTypeSpec,
     Or,
     RelatedObject,
+    undated_guard,
+    _FIELD_VALUE_TYPES,
 )
 
 # Real getter method name for each `ObjectTypeSpec.table`, for callers that
@@ -576,6 +578,9 @@ def _arithmetic(reader: RecordReader, data: Any, arithmetic: Arithmetic, spec: O
         value = _resolve(reader, data, operand, spec)
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return None
+        guard = undated_guard(operand, spec)
+        if guard is not None and not _resolve(reader, data, guard, spec):
+            return None  # read from a date that has none (sortval 0)
         return value
 
     left, right = side(arithmetic.left), side(arithmetic.right)
@@ -785,7 +790,7 @@ def _evaluate_tri(reader: RecordReader, data: Any, expr: Any, spec: ObjectTypeSp
         value = _resolve(reader, data, expr.column, spec)
         if value is None:
             return None
-        if isinstance(expr.value, (JsonPath, RelatedObject, FlatColumnRef, Arithmetic)):
+        if isinstance(expr.value, _FIELD_VALUE_TYPES):
             substring = _resolve(reader, data, expr.value, spec)
             if substring is None:
                 return None
@@ -794,7 +799,7 @@ def _evaluate_tri(reader: RecordReader, data: Any, expr: Any, spec: ObjectTypeSp
         return str(substring).lower() in str(value).lower()
     if isinstance(expr, Comparison):
         left = _resolve(reader, data, expr.column, spec)
-        if isinstance(expr.value, (JsonPath, RelatedObject, FlatColumnRef, Arithmetic)):
+        if isinstance(expr.value, _FIELD_VALUE_TYPES):
             right = _resolve(reader, data, expr.value, spec)
         else:
             right = expr.value

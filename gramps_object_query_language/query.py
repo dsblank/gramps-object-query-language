@@ -770,7 +770,9 @@ class Arithmetic:
     count, a picked entry) or another `Arithmetic`.
 
     Means what Python means, with SQL's missing values: a side with no value
-    gives no value, and so does dividing by zero (rather than an error).
+    gives no value, and so does dividing by zero (rather than an error). A
+    number read from a date that has none (`sortval` 0) counts as no value
+    -- see `undated_guard`.
     `/` is true division; `//` rounds down (toward minus infinity, as in
     Python, not toward zero as SQL's integer division does).
 
@@ -1984,6 +1986,18 @@ def _coerce_bool_literal(column: ColumnRef, value: Any, spec: ObjectTypeSpec) ->
     return value
 
 
+#: What a comparison's right-hand `value` can be besides a literal: another
+#: field, or a computed value -- compared field-vs-field.
+_FIELD_VALUE_TYPES = (
+    JsonPath, RelatedObject, FlatColumnRef, Arithmetic, CollectionCount, JsonArrayCount, Length,
+    JsonArrayPick,
+)
+
+#: Computed values that are always numbers, so the other side of a
+#: comparison is read as a number too (PostgreSQL's cast).
+_NUMBER_TYPES = (Arithmetic, CollectionCount, JsonArrayCount, Length)
+
+
 class Comparison:
     """Base class for single-column comparison leaves (`Eq`, `Lt`, ...).
 
@@ -2015,7 +2029,7 @@ class Comparison:
         treeid: Optional[int] = None,
         collation: Optional[str] = None,
     ) -> Tuple[str, list]:
-        is_field_comparison = isinstance(self.value, (JsonPath, RelatedObject, FlatColumnRef, Arithmetic))
+        is_field_comparison = isinstance(self.value, _FIELD_VALUE_TYPES)
         # A field-vs-field comparison has no literal runtime value to infer
         # a numeric/boolean cast from (unlike field-vs-value) -- pick it
         # structurally instead: an *ordering* comparison between two paths
@@ -2030,8 +2044,10 @@ class Comparison:
         # still renders as TEXT on both sides via the existing type checks).
         # A computed side (`a + b`) is always a number, so the other side
         # is read as one too, for `==` as much as for `<`.
-        numeric = self.op in _ORDERING_OPS or isinstance(self.value, Arithmetic) or isinstance(
-            self.column, Arithmetic
+        numeric = (
+            self.op in _ORDERING_OPS
+            or isinstance(self.value, _NUMBER_TYPES)
+            or isinstance(self.column, _NUMBER_TYPES)
         )
         cast_hint = 0 if is_field_comparison and numeric else self.value
         sql_op = self._sql_op(dialect)
@@ -2805,6 +2821,50 @@ def _render_json_array_count(
     return f"(SELECT COUNT(*) FROM {body})", params
 
 
+def _is_date_object(spec: ObjectTypeSpec, segments: Sequence[Union[str, int]]) -> bool:
+    try:
+        schema = walk_schema(spec, segments) if segments else {}
+    except QueryError:
+        return False
+    enum = schema.get("properties", {}).get("_class", {}).get("enum") or []
+    return "Date" in enum
+
+
+def undated_guard(ref: Any, spec: ObjectTypeSpec) -> Optional["ColumnRef"]:
+    """For a number read from inside a Gramps `Date` -- its `sortval`, or an
+    item of its `dateval` (`birth.date.dateval[2]`, the year) -- the same
+    date's `sortval`, reached the same way; `None` for anything else.
+
+    Arithmetic treats such a number as missing when that `sortval` is 0:
+    Gramps stores a date that has no value (an event entered without one,
+    or a text-only date) as `sortval` 0 with zeros in `dateval`, so without
+    this an undated birth reads as year 0 and a lifespan comes out near
+    2,000 years. Comparisons are left alone (`birth.date.sortval == 0` still
+    finds undated births)."""
+    if isinstance(ref, RelatedObject):
+        inner = undated_guard(ref.field, ref.target)
+        return None if inner is None else replace(ref, field=inner)
+    if isinstance(ref, JsonArrayPick):
+        if ref.field is None:
+            return None
+        inner = undated_guard(ref.field, ref.element_spec)
+        return None if inner is None else replace(ref, field=inner)
+    if not isinstance(ref, JsonPath):
+        return None
+    segments = ref.segments
+    if segments and segments[-1] == "sortval":
+        prefix = segments[:-1]
+    elif len(segments) >= 2 and segments[-2] == "dateval" and isinstance(segments[-1], int):
+        prefix = segments[:-2]
+    else:
+        return None
+    if any(isinstance(segment, ColumnIndex) for segment in prefix):
+        return None
+    if not _is_date_object(spec, prefix):
+        return None
+    return JsonPath((*prefix, "sortval"), ref.base_column)
+
+
 def _render_arithmetic(
     arithmetic: Arithmetic,
     spec: ObjectTypeSpec,
@@ -2814,7 +2874,8 @@ def _render_arithmetic(
     """`Arithmetic` as SQL. Each side renders as a number (PostgreSQL casts
     a JSON value to NUMERIC, as for a numeric comparison); a literal side
     is bound. A zero divisor becomes NULL (`NULLIF`), since PostgreSQL would
-    otherwise fail the whole query. `//` floors the quotient: SQLite has no
+    otherwise fail the whole query. A number from an undated date is NULL
+    too (`undated_guard`). `//` floors the quotient: SQLite has no
     guaranteed `floor()`, so it truncates and steps down for a negative
     non-whole quotient, computing that quotient once in a FROM subquery."""
     if dialect is None:
@@ -2823,7 +2884,15 @@ def _render_arithmetic(
     def side(operand: Any) -> Tuple[str, list]:
         if isinstance(operand, (int, float)) and not isinstance(operand, bool):
             return "?", [operand]
-        return _render_column(operand, spec, dialect, value=0, treeid=treeid)
+        sql, params = _render_column(operand, spec, dialect, value=0, treeid=treeid)
+        guard = undated_guard(operand, spec)
+        if guard is None:
+            return sql, params
+        if guard == operand:
+            # The date's own sortval: 0 means no date.
+            return f"NULLIF({sql}, 0)", params
+        guard_sql, guard_params = _render_column(guard, spec, dialect, value=0, treeid=treeid)
+        return f"(CASE WHEN {guard_sql} = 0 THEN NULL ELSE {sql} END)", guard_params + params
 
     left_sql, left_params = side(arithmetic.left)
     right_sql, right_params = side(arithmetic.right)

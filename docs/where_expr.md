@@ -460,8 +460,17 @@ it counts comes from its `if`.
 Family "len(children) in [0, 1]"
 ```
 
-A count goes on the left of a comparison; comparing two counts directly
-(`len(a) == len(b)`) isn't supported.
+A count can go on either side of a comparison, and be compared with
+another count, a numeric field or a calculation -- "every child is a birth
+child of both parents":
+
+```python
+Family "len([c for c in child_ref_list if c.frel.value == ChildRefType.BIRTH and c.mrel.value == ChildRefType.BIRTH]) == len(children)"
+```
+
+The same holds for a [picked entry](#one-entry-chosen-by-a-condition-0)
+and for [arithmetic](#arithmetic). Comparing a count with a text or
+True/False field is refused, since it can only be a mistake.
 
 Under the hood, `len(...)` reuses `any(...)`'s own subquery shape
 verbatim, just wrapped as `(SELECT COUNT(*) FROM ...)` instead of
@@ -974,10 +983,12 @@ ten years younger than the father.
   value, and so does dividing by zero, rather than an error. A comparison
   against no value is false, as for any missing field.
 - **A date that is there but empty** (an event with no date, or a
-  text-only one) has `sortval` 0 and year 0, which *are* values: a
-  person whose birth event has no date gets a lifespan of nearly 2,000
-  years. Guard with `birth.date.sortval > 0 and death.date.sortval > 0`
-  where it matters.
+  text-only one) is stored with `sortval` 0 and zeros in `dateval`. In
+  arithmetic, any number read from such a date -- its `sortval` or a
+  `dateval` item -- counts as missing, so a person whose birth event has no
+  date gets no lifespan rather than one of nearly 2,000 years. Only
+  arithmetic does this: `birth.date.sortval == 0` still finds undated
+  births.
 - `%` and `**` aren't supported.
 
 ## Selecting values: the same paths in `select`
