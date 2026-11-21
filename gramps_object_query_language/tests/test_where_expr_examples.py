@@ -348,6 +348,25 @@ def test_not_of_ordering_comparison_excludes_missing_value_too(db):
 # --- relationship traversal (Person -> Event) --------------------------------
 
 
+def test_indexed_collection_entry(db):
+    # parent_families[0].father.surname -- kid1's main parents are fam1,
+    # whose father (dad1) is a Smith. Nobody else has a parent family here.
+    db.execute(
+        "UPDATE person SET json_data = json_set(json_data, '$.parent_family_list', "
+        "json_array('fam1')) WHERE handle = 'kid1'"
+    )
+    try:
+        assert run(db, "Person", "parent_families[0].father.surname == 'Smith'") == [("kid1",)]
+        assert run(db, "Person", "any(f.father.surname == 'Smith' for f in parent_families)") == [
+            ("kid1",)
+        ]
+    finally:
+        db.execute(
+            "UPDATE person SET json_data = json_remove(json_data, '$.parent_family_list') "
+            "WHERE handle = 'kid1'"
+        )
+
+
 def test_birth_date_sortval(db):
     # 1968 (sortval 2439857) or later.
     result = run(db, "Person", "birth.date.sortval >= 2439857")

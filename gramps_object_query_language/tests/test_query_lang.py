@@ -2727,3 +2727,62 @@ def test_non_path_leaf_error_shows_source_not_ast_dump():
 def test_bare_path_error_suggestions_are_valid(namespace, expr):
     # Every spelling the messages above suggest must itself compile.
     compile_expr(namespace, expr)
+
+
+# --- comprehensions in select/order_by ---------------------------------------
+
+
+@pytest.mark.parametrize(
+    "spec, comprehension, kind",
+    [
+        (
+            FAMILY,
+            "len([c for c in child_ref_list if c.frel.value == ChildRefType.BIRTH "
+            "and c.mrel.value == ChildRefType.BIRTH])",
+            JsonArrayCount,
+        ),
+        (
+            PERSON,
+            "len([e for e in events if e.type.value == EventType.CENSUS])",
+            CollectionCount,
+        ),
+    ],
+)
+def test_select_and_order_by_take_the_comprehension_form(spec, comprehension, kind):
+    """A column or sort can be written as a comprehension, as a filter can.
+    (What it counts is checked against a real tree in test_evaluator.py.)"""
+    [(ref, key)] = parse_select(spec, [comprehension + " as n"])
+    assert key == "n" and isinstance(ref, kind)
+    [order] = parse_order_by(spec, ["-" + comprehension])
+    assert isinstance(order.column, kind) and order.direction == "desc"
+
+
+# --- <collection>[n].<field> ---------------------------------------------------
+
+
+def test_indexed_collection_hop_resolves_like_a_relationship():
+    [(ref, key)] = parse_select(PERSON, ["parent_families[0].father.primary_name"])
+    assert key == "parent_families[0].father.primary_name"
+    assert isinstance(ref, RelatedObject)
+    assert ref.handle_ref == JsonPath(("parent_family_list", 0))
+    assert isinstance(ref.field, RelatedObject) and ref.field.name == "father"
+    # A ref-object list reads the entry's `ref`.
+    [(children, _)] = parse_select(FAMILY, ["children[2].gramps_id"])
+    assert children.handle_ref == JsonPath(("child_ref_list", 2, "ref"))
+    # The same text in a filter resolves to the same reference.
+    where = compile_expr_for_spec(PERSON, "parent_families[0].father.primary_name.first_name == 'Ann'")
+    assert where.column.handle_ref == ref.handle_ref
+
+
+@pytest.mark.parametrize(
+    "entry, message",
+    [
+        ("parent_families[0]", "use parent_families[0].<field>"),
+        ("child_refs[0].frel", "unknown field 'child_refs'"),
+        ("backlinks[0].handle", "unknown field 'backlinks'"),
+        ("parent_families.father.surname", "unknown field 'parent_families'"),
+    ],
+)
+def test_indexed_collection_hop_rejects(entry, message):
+    with pytest.raises(QueryLangError, match=message.replace("[", r"\[").replace("]", r"\]").replace(".", r"\.")):
+        parse_select(PERSON, [entry])

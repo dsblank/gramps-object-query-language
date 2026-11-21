@@ -35,7 +35,9 @@ does today.
   table): `notes`/`citations`/`media`/`tags` wherever the type has them,
   plus `Person.families`/`parent_families`/`associations`/`events`,
   `Family.children`/`events`, `Place.enclosing_places`,
-  `Source.repositories`. `Tag` alone has no collections at all. `len(path)`
+  `Source.repositories`. `Tag` alone has no collections at all. One entry of a
+  collection can be used like a relationship, at any point in a path:
+  `parent_families[0].father.surname`. `len(path)`
   over a plain intra-record JSON array (`primary_name.surname_list`, not a
   registered `Collection`) is now supported (see Done below); there's still
   no `any(...)` (a *condition* over one, not just a count) and no way for an
@@ -61,12 +63,11 @@ does today.
   today. What's still true: those `GrampsType` classes additionally
   support arbitrary user-defined custom values with no fixed constant to
   name, which no amount of registry-wiring fixes.
-- `count(...)` answers "how many" for a registered `Collection`
-  (`count(children) > 2`, see Done below) -- there's still no `len()` for a
-  plain intra-record JSON array not backed by a `Collection`
-  (`primary_name.surname_list`), and no other aggregates. See
-  [`len()` / array-length comparisons](#len--array-length-comparisons) below
-  for a scoped-out example of what closing that part of the gap would take.
+- `len(...)` answers "how many", for a collection (`len(children) > 2`) or a
+  plain JSON array (`len(primary_name.surname_list)`), with a condition
+  written as a comprehension
+  (`len([c for c in children if c.gender == Person.MALE])`), in `where`,
+  `select` and `order_by` alike. No other aggregates (`sum`, `min`, ...).
 
 - ~~A `JsonPath` is trusted rather than checked -- an unknown path
   compiles fine and returns NULL for every row~~ -- **Done**: every path is

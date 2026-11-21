@@ -1121,6 +1121,52 @@ def resolve_collection(spec: ObjectTypeSpec, name: str) -> Union[Collection, Bac
     return collections[name]
 
 
+def _resolve_indexed_collection_hop(
+    spec: ObjectTypeSpec, segments: Sequence[Union[str, int]], base_column: str
+) -> Optional[RelatedObject]:
+    """`<collection>[<n>].<field>` -- the record the n-th entry of a
+    collection links to, read like a one-to-one relationship:
+    `parent_families[0].father.primary_name` (a person's main parents'
+    father), `citations[0].source.title`, `children[1].birth.date`.
+
+    Compiles to the same correlated subquery a `RelatedObject` always does,
+    with the handle read from that entry of the collection's own list
+    (`parent_family_list[0]`, `child_ref_list[1].ref`). An entry that isn't
+    there gives NULL, the same as a missing birth event.
+
+    Returns `None` when `segments` isn't this shape, so the caller goes on
+    to its other readings. Only an ordinary collection stored on the row
+    itself qualifies: not `backlinks` (stored on other rows), and not a
+    self-linked one such as `child_refs` (its entries are about this person,
+    not a record to hop to). Never inside an `any()`/`len()` condition
+    (`base_column` other than `json_data`), where a hop's handle would have
+    to come from the array element rather than the row.
+    """
+    if base_column != "json_data" or len(segments) < 2:
+        return None
+    head, index, *rest = segments
+    if not isinstance(head, str) or not isinstance(index, int) or isinstance(index, bool):
+        return None
+    collection = _COLLECTIONS.get(spec.table, {}).get(head)
+    if not isinstance(collection, Collection) or collection.self_link_field is not None:
+        return None
+    if not rest:
+        raise QueryError(
+            f"{head}[{index}] is a {collection.target.table} record, not a value on "
+            f"its own -- use {head}[{index}].<field>, e.g. {head}[{index}].gramps_id"
+        )
+    handle_segments: Tuple[Union[str, int], ...] = (*collection.list_path.segments, index)
+    if collection.ref_field is not None:
+        handle_segments += (collection.ref_field,)
+    field = resolve_column_path(collection.target, rest)
+    return RelatedObject(
+        name=f"{head}[{index}]",
+        target=collection.target,
+        handle_ref=JsonPath(handle_segments),
+        field=field,
+    )
+
+
 def resolve_column_path(
     spec: ObjectTypeSpec, segments: Sequence[Union[str, int]], base_column: str = "json_data"
 ) -> ColumnRef:
@@ -1174,6 +1220,9 @@ def resolve_column_path(
         target_spec, handle_ref = relationships[head]
         field = resolve_column_path(target_spec, rest, base_column)
         return RelatedObject(name=head, target=target_spec, handle_ref=handle_ref, field=field)
+    indexed = _resolve_indexed_collection_hop(spec, segments, base_column)
+    if indexed is not None:
+        return indexed
     # Not a flat column and not a relationship -- so it's a path into
     # `json_data`, checked against the type's own Gramps JSON Schema
     # before it's built (see `walk_schema`). An unknown path is a mistake,

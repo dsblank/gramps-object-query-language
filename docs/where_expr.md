@@ -263,6 +263,41 @@ subquery -- not a `JOIN` -- so sibling hops through the same table (a
 family's father and mother are both `Person` rows) and multi-level chains
 both compose correctly.
 
+### One entry of a collection: `parent_families[0].father`
+
+A [collection](#one-to-many-relationships-any) such as a person's
+`parent_families` is a list of links. Indexing it picks one entry, and the
+path then goes on into the record that entry links to, exactly as it would
+after a relationship name:
+
+```python
+Person "parent_families[0].father.surname == 'Smith'"
+```
+
+`parent_families[0]` is a person's first parent family, which Gramps treats
+as their main parents, so this matches everyone whose father's surname is
+Smith. It works with every collection stored on the record itself
+(`families`, `parent_families`, `children`, `events`, `citations`,
+`media`, `notes`, `tags`, `associations`, `enclosing_places`,
+`repositories`), at any point in a path, and chains like any other hop:
+
+| Path | Reads |
+|------|-------|
+| `parent_families[0].mother.primary_name` | a person's mother |
+| `families[0].children[0].birth.date` | a person's first child's birth date (in their first family) |
+| `father.parent_families[0].father.primary_name` | a family's paternal grandfather |
+| `citations[0].source.title` | the source of a record's first citation |
+
+As with a relationship, something has to follow the index
+(`parent_families[0].gramps_id`, not `parent_families[0]` alone). An entry
+that isn't there (a person with no parent family) gives no value, like a
+missing birth event. `backlinks` and `child_refs` can't be indexed:
+`backlinks` isn't stored on the record, and a `child_refs` entry is about
+this person, not a record to go to.
+
+To test *every* entry instead of one, use a comprehension:
+`any(f.father.surname == 'Smith' for f in parent_families)`.
+
 ### Field-vs-field comparisons
 
 The right-hand side of a comparison can be a path too, not just a literal --
@@ -1027,7 +1062,8 @@ Three details are specific to `select`:
 - **`as <key>` renames the response key.** Without it the key is the path
   text itself (`"birth.place.title"`). An alias must be a plain name.
 - **`len(...)` requires an alias.** Unlike a path, it has no text to derive
-  a name from.
+  a name from. It takes the same comprehension a filter does:
+  `len([c for c in child_ref_list if c.frel.value == ChildRefType.BIRTH and c.mrel.value == ChildRefType.BIRTH]) as birth_children`.
 - **Paths are checked, in `select` and `where` alike.** See
   [Every path is checked](#every-path-is-checked) below.
 
@@ -1177,7 +1213,9 @@ changes.
   (`father.attribute_list`, a plain array, works fine). `notes`/`children`/
   etc. are only ever reachable directly on the type being queried today,
   never one hop away -- not a design decision so much as nobody has needed
-  it yet.
+  it yet. One *entry* of one is reachable across a hop
+  (`father.parent_families[0].father.surname`, see
+  [One entry of a collection](#one-entry-of-a-collection-parent_families0father)).
 
 ## Using it from Python
 

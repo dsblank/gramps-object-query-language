@@ -1773,7 +1773,10 @@ def parse_select_entry(
 
     try:
         ref = json_column_to_ref(
-            _translate_column_or_computed(_substitute_env(node, env), spec), spec
+            _translate_column_or_computed(
+                _desugar_comprehensions(_substitute_env(node, env)), spec
+            ),
+            spec,
         )
     except (QueryLangError, QueryError) as error:
         raise QueryLangError(f"invalid select entry {entry!r}: {error}") from error
@@ -1824,7 +1827,10 @@ def parse_order_by_entry(
         raise QueryLangError(f"could not parse order_by entry {entry!r}: {error}") from error
     try:
         ref = json_column_to_ref(
-            _translate_column_or_computed(_substitute_env(node, env), spec), spec
+            _translate_column_or_computed(
+                _desugar_comprehensions(_substitute_env(node, env)), spec
+            ),
+            spec,
         )
     except (QueryLangError, QueryError) as error:
         raise QueryLangError(f"invalid order_by entry {entry!r}: {error}") from error
