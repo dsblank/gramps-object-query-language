@@ -974,10 +974,12 @@ ten years younger than the father.
   value, and so does dividing by zero, rather than an error. A comparison
   against no value is false, as for any missing field.
 - **A date that is there but empty** (an event with no date, or a
-  text-only one) has `sortval` 0 and year 0, which *are* values: a
-  person whose birth event has no date gets a lifespan of nearly 2,000
-  years. Guard with `birth.date.sortval > 0 and death.date.sortval > 0`
-  where it matters.
+  text-only one) is stored with `sortval` 0 and zeros in `dateval`. In
+  arithmetic, any number read from such a date -- its `sortval` or a
+  `dateval` item -- counts as missing, so a person whose birth event has no
+  date gets no lifespan rather than one of nearly 2,000 years. Only
+  arithmetic does this: `birth.date.sortval == 0` still finds undated
+  births.
 - `%` and `**` aren't supported.
 
 ## Selecting values: the same paths in `select`

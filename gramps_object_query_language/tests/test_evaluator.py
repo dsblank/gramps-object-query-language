@@ -2599,11 +2599,14 @@ def lifespan_db():
     db.load(dirpath)
     handles = {}
 
-    def event(trans, event_type, year, month=0, day=0):
+    def event(trans, event_type, year, month=0, day=0, text=None):
         ev = Event()
         ev.set_type(event_type)
         date = Date()
-        date.set_yr_mon_day(year, month, day)
+        if text is not None:
+            date.set_as_text(text)
+        elif year is not None:
+            date.set_yr_mon_day(year, month, day)
         ev.set_date_object(date)
         return db.add_event(ev, trans)
 
@@ -2614,6 +2617,10 @@ def lifespan_db():
             ("living", (1990, 1, 1), None),
             ("unborn", None, (1950, 1, 1)),
             ("years", (1700, 0, 0), (1790, 0, 0)),
+            # A birth event with no date at all, and one with only text: both
+            # store sortval 0 and a zero dateval. Not in _LIVES.
+            ("undated", (None,), (1950, 1, 1)),
+            ("textonly", (None, 0, 0, "abt. when grandpa was young"), (1950, 1, 1)),
         ):
             person = Person()
             person.set_primary_name(_name(key.title(), "Life"))
@@ -2655,10 +2662,10 @@ def test_arithmetic_select(lifespan_db, pg_conn, entry, expected):
     query = Query(select=["handle", ref])
     sql, params = compile_query(PERSON, query, dialect=Dialect.SQLITE)
     db.dbapi.execute(sql, params)
-    assert dict(db.dbapi.fetchall()) == want, "SQLite"
+    assert {h: v for h, v in db.dbapi.fetchall() if h in want} == want, "SQLite"
     if pg_conn is not None:
         sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
-        got = dict(_rows_on_postgresql(pg_conn, db, sql, params))
+        got = {h: v for h, v in _rows_on_postgresql(pg_conn, db, sql, params) if h in want}
         assert got == want, "PostgreSQL"
         assert all(type(v) is int for v in got.values() if v is not None)
     for handle, value in want.items():
@@ -2711,5 +2718,47 @@ def test_arithmetic_sort_pages_on_postgresql(lifespan_db, pg_conn):
         return _rows_on_postgresql(pg_conn, db, sql, params)
 
     expected = _one_query(run, PERSON, select, order_by)
-    assert len(expected) == 5
+    assert len(expected) == 7
     assert _page_through(run, PERSON, select, order_by) == expected
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "death.date.dateval[2] - birth.date.dateval[2]",
+        "(death.date.sortval - birth.date.sortval) // 365",
+        "birth.date.dateval[2] + 0",
+        "birth.date.sortval * 1",
+    ],
+)
+def test_arithmetic_treats_an_undated_date_as_missing(lifespan_db, pg_conn, entry):
+    """A birth event with no date, or a text-only one, stores sortval 0: in
+    arithmetic its numbers count as missing (no value), not as year 0."""
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+    from gramps_object_query_language.query_lang import parse_select
+
+    db, handles = lifespan_db
+    [(ref, _)] = parse_select(PERSON, [entry + " as v"])
+    query = Query(select=["handle", ref])
+    sql, params = compile_query(PERSON, query, dialect=Dialect.SQLITE)
+    db.dbapi.execute(sql, params)
+    rows = dict(db.dbapi.fetchall())
+    for key in ("undated", "textonly"):
+        assert rows[handles[key]] is None, ("SQLite", key)
+        person = db.get_person_from_handle(handles[key])
+        assert resolve_column_ref(db, person, ref, PERSON) is None, ("evaluator", key)
+    assert rows[handles["long"]] is not None
+    if pg_conn is not None:
+        sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
+        pg = dict(_rows_on_postgresql(pg_conn, db, sql, params))
+        assert pg[handles["undated"]] is None and pg[handles["textonly"]] is None
+        assert pg[handles["long"]] == rows[handles["long"]]
+
+
+def test_comparisons_still_see_an_undated_date_as_zero(lifespan_db, pg_conn):
+    """Only arithmetic changes: a filter can still find undated births."""
+    db, handles = lifespan_db
+    _assert_sql_and_evaluator_agree(
+        db, handles, PERSON, ("long", "undated", "textonly", "unborn"),
+        "birth.date.sortval == 0", {"undated", "textonly"}, pg_conn,
+    )

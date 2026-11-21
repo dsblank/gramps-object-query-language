@@ -91,6 +91,7 @@ from .query import (
     ObjectTypeSpec,
     Or,
     RelatedObject,
+    undated_guard,
 )
 
 # Real getter method name for each `ObjectTypeSpec.table`, for callers that
@@ -576,6 +577,9 @@ def _arithmetic(reader: RecordReader, data: Any, arithmetic: Arithmetic, spec: O
         value = _resolve(reader, data, operand, spec)
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return None
+        guard = undated_guard(operand, spec)
+        if guard is not None and not _resolve(reader, data, guard, spec):
+            return None  # read from a date that has none (sortval 0)
         return value
 
     left, right = side(arithmetic.left), side(arithmetic.right)
