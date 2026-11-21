@@ -1986,6 +1986,18 @@ def _coerce_bool_literal(column: ColumnRef, value: Any, spec: ObjectTypeSpec) ->
     return value
 
 
+#: What a comparison's right-hand `value` can be besides a literal: another
+#: field, or a computed value -- compared field-vs-field.
+_FIELD_VALUE_TYPES = (
+    JsonPath, RelatedObject, FlatColumnRef, Arithmetic, CollectionCount, JsonArrayCount, Length,
+    JsonArrayPick,
+)
+
+#: Computed values that are always numbers, so the other side of a
+#: comparison is read as a number too (PostgreSQL's cast).
+_NUMBER_TYPES = (Arithmetic, CollectionCount, JsonArrayCount, Length)
+
+
 class Comparison:
     """Base class for single-column comparison leaves (`Eq`, `Lt`, ...).
 
@@ -2017,7 +2029,7 @@ class Comparison:
         treeid: Optional[int] = None,
         collation: Optional[str] = None,
     ) -> Tuple[str, list]:
-        is_field_comparison = isinstance(self.value, (JsonPath, RelatedObject, FlatColumnRef, Arithmetic))
+        is_field_comparison = isinstance(self.value, _FIELD_VALUE_TYPES)
         # A field-vs-field comparison has no literal runtime value to infer
         # a numeric/boolean cast from (unlike field-vs-value) -- pick it
         # structurally instead: an *ordering* comparison between two paths
@@ -2032,8 +2044,10 @@ class Comparison:
         # still renders as TEXT on both sides via the existing type checks).
         # A computed side (`a + b`) is always a number, so the other side
         # is read as one too, for `==` as much as for `<`.
-        numeric = self.op in _ORDERING_OPS or isinstance(self.value, Arithmetic) or isinstance(
-            self.column, Arithmetic
+        numeric = (
+            self.op in _ORDERING_OPS
+            or isinstance(self.value, _NUMBER_TYPES)
+            or isinstance(self.column, _NUMBER_TYPES)
         )
         cast_hint = 0 if is_field_comparison and numeric else self.value
         sql_op = self._sql_op(dialect)

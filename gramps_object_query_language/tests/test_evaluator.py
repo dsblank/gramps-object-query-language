@@ -2762,3 +2762,32 @@ def test_comparisons_still_see_an_undated_date_as_zero(lifespan_db, pg_conn):
         db, handles, PERSON, ("long", "undated", "textonly", "unborn"),
         "birth.date.sortval == 0", {"undated", "textonly"}, pg_conn,
     )
+
+
+@pytest.mark.parametrize(
+    "spec_name, keys, where_expr, expected",
+    [
+        # Every child a birth child of both parents: the first family's one
+        # child is; the second family's is a stepchild.
+        (
+            "family", ("family", "family2"),
+            "len([c for c in child_ref_list if c.frel.value == ChildRefType.BIRTH"
+            " and c.mrel.value == ChildRefType.BIRTH]) == len(children)",
+            {"family"},
+        ),
+        ("family", ("family", "family2"), "0 < len(children)", {"family", "family2"}),
+        ("person", _PEOPLE, "len(attribute_list) > len(citation_list)", {"father"}),
+        (
+            "person", _PEOPLE,
+            "'Farmer' == [a.value for a in attribute_list if a.type.value == AttributeType.OCCUPATION][0]",
+            {"father"},
+        ),
+        ("person", _PEOPLE, "len(parent_family_list) == len(family_list) + 2", {"child"}),
+    ],
+)
+def test_computed_value_on_the_right(indexed_hop_db, pg_conn, spec_name, keys, where_expr, expected):
+    """A count, a picked entry or arithmetic works on either side of a
+    comparison, the same on SQLite, PostgreSQL and the evaluator."""
+    db, handles = indexed_hop_db
+    spec = {"family": FAMILY, "person": PERSON}[spec_name]
+    _assert_sql_and_evaluator_agree(db, handles, spec, keys, where_expr, expected, pg_conn)

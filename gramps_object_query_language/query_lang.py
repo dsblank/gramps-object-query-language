@@ -716,6 +716,18 @@ def _reads_a_column(operand: dict) -> bool:
     return False
 
 
+def _is_computed(node: ast.AST) -> bool:
+    """A value that isn't a plain path but can stand where a field does in
+    a comparison: a count (`len(...)`, or the older `count(...)`), a picked
+    list entry (`[...][0]`, read on or not), or arithmetic."""
+    return (
+        _is_count_call(node)
+        or _is_len_call(node)
+        or _pick_root(node) is not None
+        or _is_arithmetic(node)
+    )
+
+
 def _is_arithmetic(node: ast.AST) -> bool:
     return isinstance(node, ast.BinOp) or (
         isinstance(node, ast.UnaryOp)
@@ -892,62 +904,30 @@ def _translate_compare(node: ast.Compare, spec: ObjectTypeSpec) -> dict:
             )
     else:
         left = node.left
-        if (
-            _is_path_node(left)
-            or _is_count_call(left)
-            or _is_len_call(left)
-            or _pick_root(left) is not None
-            or _is_arithmetic(left)
-        ):
-            # "field OP value" / "field OP field" -- the shape this function
-            # always assumed until operand-ordering was generalized. `left`
-            # is the column (or `count(...)`/`len(...)`); `rhs` is either
-            # another field (`value_column`) or an ordinary value.
+        if _is_path_node(left) or _is_computed(left):
+            # "field OP value" / "field OP field". `left` is the column: a
+            # path, or a computed value (a count, a picked entry,
+            # arithmetic); `rhs` is a literal, or another of those --
+            # "len([...]) == len(children)" compares two counts.
             column = _translate_column_or_computed(left, spec)
-            if _is_arithmetic(rhs):
-                # "death.date.dateval[2] > birth.date.dateval[2] + 80":
-                # a computed value on the right, compared field-vs-field.
-                if isinstance(column, dict) and ("count_of" in column or "length_of" in column):
-                    raise QueryLangError(
-                        f"count(...)/len(...) only support comparison against a literal "
-                        f"value, not a field: {ast.dump(node)}"
-                    )
-                leaf = {"column": column, "op": op, "value_column": _translate_column_or_computed(rhs, spec)}
-            elif _is_path_node(rhs):
-                if isinstance(column, dict) and ("count_of" in column or "length_of" in column):
-                    # count(...)/len(...) are left-hand-side-only, against a
-                    # literal (v1 scope, see ROADMAP.md) -- field-vs-field
-                    # against either isn't supported, so reject explicitly
-                    # rather than silently building a value_column nothing
-                    # downstream can render.
-                    raise QueryLangError(
-                        f"count(...)/len(...) only support comparison against a literal "
-                        f"value, not a field: {ast.dump(node)}"
-                    )
-                # Field-vs-field: "families where mother.death.date.sortval <
-                # father.death.date.sortval" -- the right-hand side is itself
-                # a path, not a value to bind.
-                value_column = _translate_column(rhs, spec)
+            if _is_computed(rhs) or _is_path_node(rhs):
+                value_column = _translate_column_or_computed(rhs, spec)
                 leaf = {"column": column, "op": op, "value_column": value_column}
             else:
                 value = _translate_value(rhs)
                 leaf = {"column": column, "op": op, "value": value}
-        elif _is_path_node(rhs) or _is_arithmetic(rhs):
+        elif _is_path_node(rhs) or _is_computed(rhs):
             # "value OP field", e.g. "Date('Jan 1, 1968') < mother.birth.sortval"
             # -- the literal happened to be written on the left. Flip the
             # operator so the column still renders on the wire's left, the
-            # one shape query.py/evaluator.py know how to read -- count(...)/
-            # len(...) are deliberately not accepted here (see
-            # `_translate_column_or_computed`'s docstring): only a plain path
-            # qualifies as "the column" on this side, matching their
-            # existing left-hand-side-only v1 scope untouched.
+            # one shape query.py/evaluator.py know how to read.
             value = _translate_value(left)
-            column = _translate_column_or_computed(rhs, spec) if _is_arithmetic(rhs) else _translate_column(rhs, spec)
+            column = _translate_column_or_computed(rhs, spec)
             leaf = {"column": column, "op": _FLIP_OP[op], "value": value}
         else:
             raise QueryLangError(
-                "a comparison must have a field path on at least one side "
-                f"(count(...) is only supported on the left): {ast.dump(node)}"
+                "a comparison needs a field, a count (len(...)), a list entry "
+                f"([...][0]) or a calculation on at least one side: {ast.dump(node)}"
             )
     return {"not": leaf} if negate else leaf
 
@@ -1890,6 +1870,20 @@ def _check_literal_kind(column: ColumnRef, value: Any, spec: ObjectTypeSpec) -> 
     )
 
 
+def _check_number_vs_field(column: ColumnRef, value: ColumnRef, spec: ObjectTypeSpec) -> None:
+    """A count or calculation compared with a field that holds text or
+    True/False can only be a mistake, and PostgreSQL would fail on it at
+    run time; refuse it here. (Two plain fields are left as they were.)"""
+    computed = (CollectionCount, JsonArrayCount, Length, Arithmetic)
+    for number, other in ((column, value), (value, column)):
+        if isinstance(number, computed):
+            kind = _value_kind(other, spec)
+            if kind in ("string", "boolean"):
+                raise QueryLangError(
+                    f"can't compare a number with a {'text' if kind == 'string' else 'True/False'} field"
+                )
+
+
 def _condition_from_json(condition: dict, spec: ObjectTypeSpec) -> Any:
     """One `parse_expr`-shaped condition dict, translated to a `query.py`
     comparison object (`Eq`, `Lt`, `In`, `Like`, `Regex`, `Contains`, ...)."""
@@ -1914,6 +1908,7 @@ def _condition_from_json(condition: dict, spec: ObjectTypeSpec) -> Any:
         # Field-vs-field, e.g. "mother.death.date.sortval < father.death.date.sortval",
         # or (for "contains") "other_field in field".
         value = json_column_to_ref(condition["value_column"], spec)
+        _check_number_vs_field(column, value, spec)
         if isinstance(value, str):
             # A flat (same-table) column resolves to a bare str here --
             # identical in shape to an ordinary literal, which

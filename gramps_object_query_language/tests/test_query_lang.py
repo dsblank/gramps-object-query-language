@@ -527,19 +527,6 @@ def test_value_vs_value_rejected():
         parse_expr("person", "5 < 3")
 
 
-def test_count_still_left_hand_side_only_after_operand_ordering():
-    # count(...)'s v1 scope (left-hand-side only, against a literal) is
-    # deliberately untouched by operand-order support -- "value < count(...)"
-    # doesn't flip into a supported shape, it's still rejected.
-    with pytest.raises(QueryLangError):
-        parse_expr("family", "2 < count(children)")
-
-
-def test_count_vs_field_still_rejected_either_order():
-    with pytest.raises(QueryLangError):
-        parse_expr("family", "count(children) > mother.surname")
-
-
 # --- explicitly rejected: things with no wire-format equivalent yet -------------
 
 
@@ -1248,18 +1235,6 @@ def test_count_bare_call_rejected():
         parse_expr("family", "count(children)")
 
 
-def test_count_field_vs_field_rejected():
-    # v1 scope: count(...) only supports comparison against a literal, not
-    # another field.
-    with pytest.raises(QueryLangError):
-        parse_expr("family", "count(children) == mother.surname")
-
-
-def test_count_on_right_hand_side_rejected():
-    with pytest.raises(QueryLangError):
-        parse_expr("family", "1 < count(children)")
-
-
 # --- len(...) (array-length comparisons) ---------------------------------------
 
 
@@ -1326,18 +1301,6 @@ def test_len_bare_call_rejected():
     # a bare path (gender, with no "== ...") being rejected.
     with pytest.raises(QueryLangError):
         parse_expr("person", "len(attribute_list)")
-
-
-def test_len_field_vs_field_rejected():
-    # v1 scope: len(...) only supports comparison against a literal, not
-    # another field -- matching count(...)'s own restriction.
-    with pytest.raises(QueryLangError):
-        parse_expr("person", "len(attribute_list) == len(tag_list)")
-
-
-def test_len_on_right_hand_side_rejected():
-    with pytest.raises(QueryLangError):
-        parse_expr("person", "1 < len(attribute_list)")
 
 
 def test_len_on_non_array_field_rejected_at_compile_time():
@@ -2851,3 +2814,35 @@ def test_arithmetic_parses_in_select_where_and_order_by():
 def test_arithmetic_rejects(entry, message):
     with pytest.raises(QueryLangError, match=re.escape(message)):
         parse_select(PERSON, [entry + " as v"])
+
+
+# --- counts, list entries and calculations on either side of a comparison -------
+
+
+@pytest.mark.parametrize(
+    "namespace, expr",
+    [
+        ("Family", "len([c for c in child_ref_list if c.frel.value == ChildRefType.BIRTH]) == len(children)"),
+        ("Family", "2 < len(children)"),
+        ("Person", "len(attribute_list) == len(tag_list)"),
+        ("Person", "len(events) > len([c for c in citations if c.confidence >= Citation.CONF_HIGH]) + 1"),
+        ("Person", "'Farmer' == [a.value for a in attribute_list if a.type.value == AttributeType.OCCUPATION][0]"),
+        ("Person", "birth.date.dateval[2] < [n.date.dateval[2] for n in alternate_names][0]"),
+    ],
+)
+def test_computed_values_compare_on_either_side(namespace, expr):
+    parse_expr(namespace, expr)
+
+
+@pytest.mark.parametrize(
+    "expr, message",
+    [
+        ("len(children) > mother.surname", "can't compare a number with a text field"),
+        ("mother.surname == len(children)", "can't compare a number with a text field"),
+        ("len(children) == private", "can't compare a number with a True/False field"),
+        ("1 < 2", "on at least one side"),
+    ],
+)
+def test_number_vs_text_field_still_rejected(expr, message):
+    with pytest.raises(QueryLangError, match=re.escape(message)):
+        compile_expr("Family", expr)

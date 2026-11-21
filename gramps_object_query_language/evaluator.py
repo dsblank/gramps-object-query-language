@@ -92,6 +92,7 @@ from .query import (
     Or,
     RelatedObject,
     undated_guard,
+    _FIELD_VALUE_TYPES,
 )
 
 # Real getter method name for each `ObjectTypeSpec.table`, for callers that
@@ -789,7 +790,7 @@ def _evaluate_tri(reader: RecordReader, data: Any, expr: Any, spec: ObjectTypeSp
         value = _resolve(reader, data, expr.column, spec)
         if value is None:
             return None
-        if isinstance(expr.value, (JsonPath, RelatedObject, FlatColumnRef, Arithmetic)):
+        if isinstance(expr.value, _FIELD_VALUE_TYPES):
             substring = _resolve(reader, data, expr.value, spec)
             if substring is None:
                 return None
@@ -798,7 +799,7 @@ def _evaluate_tri(reader: RecordReader, data: Any, expr: Any, spec: ObjectTypeSp
         return str(substring).lower() in str(value).lower()
     if isinstance(expr, Comparison):
         left = _resolve(reader, data, expr.column, spec)
-        if isinstance(expr.value, (JsonPath, RelatedObject, FlatColumnRef, Arithmetic)):
+        if isinstance(expr.value, _FIELD_VALUE_TYPES):
             right = _resolve(reader, data, expr.value, spec)
         else:
             right = expr.value

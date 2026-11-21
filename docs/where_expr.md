@@ -460,8 +460,17 @@ it counts comes from its `if`.
 Family "len(children) in [0, 1]"
 ```
 
-A count goes on the left of a comparison; comparing two counts directly
-(`len(a) == len(b)`) isn't supported.
+A count can go on either side of a comparison, and be compared with
+another count, a numeric field or a calculation -- "every child is a birth
+child of both parents":
+
+```python
+Family "len([c for c in child_ref_list if c.frel.value == ChildRefType.BIRTH and c.mrel.value == ChildRefType.BIRTH]) == len(children)"
+```
+
+The same holds for a [picked entry](#one-entry-chosen-by-a-condition-0)
+and for [arithmetic](#arithmetic). Comparing a count with a text or
+True/False field is refused, since it can only be a mistake.
 
 Under the hood, `len(...)` reuses `any(...)`'s own subquery shape
 verbatim, just wrapped as `(SELECT COUNT(*) FROM ...)` instead of
