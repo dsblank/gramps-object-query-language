@@ -114,7 +114,7 @@ def db():
 
     # Father: John Smith, born 1940 in Chicago (sortval 2429661), died 1990
     # in Boston (sortval 2447893) -- an accident, per the death record. Has
-    # one note attached, used by the exists(notes) examples below.
+    # one note attached, used by the any(n for n in notes) examples below.
     conn.execute("INSERT INTO note VALUES ('dad1-note-1', 0)")
     person("dad1", gender=1, given_name="John", surname="Smith", note_list=["dad1-note-1"])
     event("dad1-birth", 2429661, place="chicago")
@@ -149,9 +149,9 @@ def db():
     event("grandma1-birth", 2396028, place="philadelphia")
     event("grandma1-death", 2415021, place="chicago")
 
-    # fam1 has one recorded child (kid1, Robert) -- used by the exists(children)
+    # fam1 has one recorded child (kid1, Robert) -- used by the any(c for c in children)
     # examples below. fam2 has no json_data / recorded children at all, used
-    # to prove exists(children) correctly excludes it rather than erroring.
+    # to prove any(c for c in children) correctly excludes it rather than erroring.
     conn.execute(
         "INSERT INTO family VALUES ('fam1', 'dad1', 'mom1', ?)",
         (json.dumps({"child_ref_list": [{"ref": "kid1"}]}),),
@@ -554,14 +554,14 @@ def test_parents_died_in_same_place(db):
 def test_any_children_with_condition(db):
     # fam1's one recorded child is kid1 (Robert Smith) -- fam2 has none
     # recorded at all.
-    result = run(db, "Family", "any(children, given_name == 'Steve')")
+    result = run(db, "Family", "any(c.given_name == 'Steve' for c in children)")
     assert result == []
-    result = run(db, "Family", "any(children, given_name == 'Robert')")
+    result = run(db, "Family", "any(c.given_name == 'Robert' for c in children)")
     assert result == [("fam1",)]
 
 
 def test_not_any_children_with_condition(db):
-    result = run(db, "Family", "not any(children, given_name == 'Steve')")
+    result = run(db, "Family", "not any(c.given_name == 'Steve' for c in children)")
     assert result == [("fam1",), ("fam2",)]
 
 
@@ -569,23 +569,23 @@ def test_any_children_no_condition(db):
     # "any recorded child at all" -- matches fam1 (kid1), not fam2 (no
     # json_data / no children recorded at all -- not an error, just no rows
     # for json_each to iterate).
-    result = run(db, "Family", "any(children)")
+    result = run(db, "Family", "any(c for c in children)")
     assert result == [("fam1",)]
 
 
 def test_not_any_children_no_condition(db):
-    result = run(db, "Family", "not any(children)")
+    result = run(db, "Family", "not any(c for c in children)")
     assert result == [("fam2",)]
 
 
 def test_any_notes(db):
     # dad1 has one note attached; everyone else has an empty note_list.
-    result = run(db, "Person", "any(notes)")
+    result = run(db, "Person", "any(n for n in notes)")
     assert result == [("dad1",)]
 
 
 def test_not_any_notes(db):
-    result = run(db, "Person", "not any(notes)")
+    result = run(db, "Person", "not any(n for n in notes)")
     assert result == [
         ("granddad1",),
         ("grandma1",),
@@ -604,23 +604,26 @@ def test_len_children(db):
 
 
 def test_len_children_with_condition(db):
-    result = run(db, "Family", "len(children, given_name == 'Robert') == 1")
+    result = run(db, "Family", "len([c for c in children if c.given_name == 'Robert']) == 1")
     assert result == [("fam1",)]
-    result = run(db, "Family", "len(children, given_name == 'Steve') == 1")
+    result = run(db, "Family", "len([c for c in children if c.given_name == 'Steve']) == 1")
     assert result == []
 
 
-def test_exists_is_the_older_still_supported_spelling_for_any(db):
-    # exists(...)/count(...) aren't going away -- any(...)/len(...) are the
-    # canonical spellings going forward, not a replacement that breaks the
-    # old ones.
-    result = run(db, "Family", "exists(children, given_name == 'Robert')")
-    assert result == [("fam1",)]
-    result = run(db, "Family", "count(children, given_name == 'Robert') == 1")
-    assert result == [("fam1",)]
+def test_older_spellings_still_parse(db):
+    # exists(...)/count(...) and the call forms any(rel, cond)/len(rel, cond)
+    # are no longer documented (the comprehensions are), but saved filters
+    # use them, so they keep meaning the same.
+    for expr in (
+        "exists(children, given_name == 'Robert')",
+        "any(children, given_name == 'Robert')",
+        "count(children, given_name == 'Robert') == 1",
+        "len(children, given_name == 'Robert') == 1",
+    ):
+        assert run(db, "Family", expr) == [("fam1",)], expr
 
 
-# --- comprehension sugar for any(...)/len(...) --------------------------------
+# --- the same comprehensions, more examples -------------------------------------
 
 
 def test_any_comprehension_matches_any_children_with_condition(db):
@@ -681,7 +684,7 @@ def test_len_children_gender_condition_readme_example():
         (json.dumps({"child_ref_list": [{"ref": "steve"}, {"ref": "anna"}]}),),
     )
 
-    result = run(conn, "Family", "len(children, gender == Person.MALE) > 1")
+    result = run(conn, "Family", "len([c for c in children if c.gender == Person.MALE]) > 1")
     assert result == [("two-sons",)]
 
 
@@ -741,7 +744,7 @@ def test_any_citations_confidence_doc_example():
         (json.dumps({"citation_list": ["c-low"]}),),
     )
 
-    result = run(conn, "Person", "any(citations, confidence >= Citation.CONF_HIGH)")
+    result = run(conn, "Person", "any(c.confidence >= Citation.CONF_HIGH for c in citations)")
     assert result == [("well-sourced",)]
 
 
@@ -756,7 +759,7 @@ def test_any_associations_self_reference_doc_example():
         "INSERT INTO person VALUES ('bob', 'Bob', ?)", (json.dumps({"person_ref_list": []}),)
     )
 
-    result = run(conn, "Person", "any(associations, given_name == 'Bob')")
+    result = run(conn, "Person", "any(a.given_name == 'Bob' for a in associations)")
     assert result == [("alice",)]
 
 
@@ -832,14 +835,12 @@ def test_len_relationship_chained(db):
     assert result == [("fam1",)]
 
 
-# --- Array membership: any(path, condition) -----------------------------------
+# --- Lists inside a record --------------------------------------------------------
 
 
 def test_any_of_collection_matches_children_readme_example(db):
-    # any(children, ...) on a registered collection is a direct synonym for
-    # exists(children, ...) -- fam1's one recorded child (kid1, Robert) is
-    # male.
-    result = run(db, "Family", "any(children, gender == Person.MALE)")
+    # fam1's one recorded child (kid1, Robert) is male.
+    result = run(db, "Family", "any(c.gender == Person.MALE for c in children)")
     assert result == [("fam1",)]
 
 
@@ -864,17 +865,17 @@ def test_any_of_path_alternate_names_doc_example():
     person("jo1", ["Smith"])
     person("sam1", [])
 
-    result = run(conn, "Person", "any(alternate_names, first_name == 'Doyle')")
+    result = run(conn, "Person", "any(n.first_name == 'Doyle' for n in alternate_names)")
     assert result == [("pat1",)]
 
-    # any(path) alone (no condition) -- "has any element at all," identical
-    # to len(path) > 0.
-    result = run(conn, "Person", "any(alternate_names)")
+    # No condition -- "has any element at all," identical to
+    # len(alternate_names) > 0.
+    result = run(conn, "Person", "any(n for n in alternate_names)")
     assert {row[0] for row in result} == {"pat1", "jo1"}
 
-    # len(path, condition) -- the value-producing counterpart -- how many
-    # match, not just whether any do.
-    result = run(conn, "Person", "len(alternate_names, first_name == 'Doyle') > 0")
+    # len([...]) -- the value-producing counterpart -- how many match, not
+    # just whether any do.
+    result = run(conn, "Person", "len([n for n in alternate_names if n.first_name == 'Doyle']) > 0")
     assert result == [("pat1",)]
 
 
@@ -930,7 +931,7 @@ def test_any_of_path_relationship_chained_doc_example():
     conn.execute("INSERT INTO family VALUES ('fam-smith', 'smith1', NULL, '{}')")
     conn.execute("INSERT INTO family VALUES ('fam-baker', 'baker1', NULL, '{}')")
 
-    result = run(conn, "Family", "any(father.attribute_list, value == 'Blacksmith')")
+    result = run(conn, "Family", "any(a.value == 'Blacksmith' for a in father.attribute_list)")
     assert result == [("fam-smith",)]
 
 
@@ -968,7 +969,7 @@ def test_any_of_path_rejects_list_of_scalars_doc_example():
         "INSERT INTO person VALUES ('p1', ?)", (json.dumps({"note_list": ["note-1"]}),)
     )
     with pytest.raises(QueryLangError, match="list-of-structs"):
-        run(conn, "Person", "any(note_list, format == 0)")
+        run(conn, "Person", "any(n.format == 0 for n in note_list)")
 
 
 # --- Self-linked collections: Person.child_refs --------------------------------
@@ -1009,9 +1010,8 @@ def test_child_refs_adopted_doc_example():
     )
     assert result == [("pat1",)]
 
-    # The direct call is the identical query -- comprehension sugar, not a
-    # different feature -- kept working here too since it's still shown
-    # later on the same doc page as an equivalent spelling.
+    # The older call spelling still parses (saved filters), to the same
+    # query.
     result = run(
         conn,
         "Person",
@@ -1300,14 +1300,14 @@ def _backlinks_conn():
 
 def test_backlinks_orphan_notes_readme_example():
     conn = _backlinks_conn()
-    result = run(conn, "Note", "not any(backlinks)")
+    result = run(conn, "Note", "not any(bl for bl in backlinks)")
     assert result == [("note-orphan",)]
 
 
 def test_backlinks_not_referenced_by_person_readme_example():
     conn = _backlinks_conn()
     result = run(
-        conn, "Note", "any(backlinks) and not any(backlinks, _class == 'Person')"
+        conn, "Note", "any(bl for bl in backlinks) and not any(bl._class == 'Person' for bl in backlinks)"
     )
     assert result == [("note-on-source",)]
 
