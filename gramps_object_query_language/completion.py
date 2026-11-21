@@ -81,6 +81,12 @@ _PARTIAL_OPERATOR_RE = re.compile(r"[=!<>]+$")
 _COMPARED_RE = re.compile(rf"(?<![A-Za-z0-9_.\])])({_CHAIN})\s*(?:==|!=|<=|>=|<|>)\s*$")
 _LISTED_RE = re.compile(rf"(?<![A-Za-z0-9_.\])])({_CHAIN})\s+(?:not\s+)?in\s*\[[^\[\]]*$")
 _INDEXED_RE = re.compile(rf"(?<![A-Za-z0-9_.\])])({_CHAIN})\[$")
+# After a list comprehension taken by index: `[...][0].` then a path and a
+# (possibly empty) word -- and `[...][`, its index.
+_PICKED_RE = re.compile(rf"\]\[[0-9]+\]((?:\.{_SEGMENT})*)\.({_NAME})?$")
+_PICK_INDEX_RE = re.compile(r"\]\[$")
+# A comprehension's own text: what it collects, then `for x in`.
+_COMPREHENSION_RE = re.compile(rf"\s*({_CHAIN})\s+for\s+{_NAME}\s+in\b")
 _TOKEN_RE = re.compile(
     r"""\s+"""
     r"""|(?P<string>'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*")"""
@@ -392,6 +398,44 @@ def _bindings(vocabs: Dict[str, Any], root: str, source: str) -> Dict[str, Optio
     return bindings
 
 
+def _comprehension_ending(text: str) -> Optional[str]:
+    """What a list comprehension ending at `text`'s final `]` collects
+    (`a.value` in `[a.value for a in attribute_list if ...]`), or `None`
+    if that `]` doesn't close one."""
+    depth = 0
+    for position in range(len(text) - 1, -1, -1):
+        char = text[position]
+        if char == "]":
+            depth += 1
+        elif char == "[":
+            depth -= 1
+            if depth == 0:
+                match = _COMPREHENSION_RE.match(text[position + 1 : -1])
+                return match.group(1) if match else None
+    return None
+
+
+def _picked_context(
+    vocabs: Dict[str, Any],
+    namespace: str,
+    text: str,
+    rest: str,
+    bindings: Dict[str, Optional[_Context]],
+) -> Optional[_Context]:
+    """Where `[x.f for x in rel if ...][n]<rest>` leads: what the
+    comprehension collects (`text` ends at its `]`), walked on by `rest`
+    (`.mother`)."""
+    collected = _comprehension_ending(text)
+    if collected is None:
+        return None
+    context = _walk(vocabs, namespace, _segments(collected), bindings)
+    for name, indexes in _segments(rest):
+        if context is None:
+            return None
+        context = _step_indexed(vocabs, context, name, indexes)
+    return context
+
+
 def _names_at(vocabs: Dict[str, Any], context: _Context) -> List[Tuple[str, str, Any]]:
     """`(name, kind, detail)` for everything that can follow `context.`."""
     kind, value = context
@@ -524,6 +568,22 @@ def complete_from_vocabularies(
             for name in sorted(vocab["operators"])
             if name.startswith(typed)
         ]
+    picked = _PICKED_RE.search(before)
+    if picked is not None and _comprehension_ending(before[: picked.start() + 1]) is not None:
+        # `[a for a in attribute_list if ...][0].`: the entry's own names.
+        prefix = picked.group(2) or ""
+        bindings = _bindings(vocabs, namespace, source)
+        context = _picked_context(
+            vocabs, namespace, before[: picked.start() + 1], picked.group(1), bindings
+        )
+        candidates = (
+            [] if context is None
+            else _names_at(vocabs, context) + _indexable_collections(vocabs, context)
+        )
+        return _results(candidates, prefix, cursor - len(prefix), bindings, env)
+    if _PICK_INDEX_RE.search(before) and _comprehension_ending(before[:-1]) is not None:
+        # `[a for a in attribute_list if ...][`: which matching entry.
+        return [{"name": "0", "kind": "index", "detail": "first item", "start": cursor}]
     match = _AT_CURSOR_RE.search(before)
     if match is None:
         return []
@@ -660,6 +720,17 @@ def complete_from_vocabularies(
             elif role not in ("operand", "value", "is_value", "path"):
                 candidates = []
 
+    return _results(candidates, prefix, start, bindings, env)
+
+
+def _results(
+    candidates: List[Tuple[str, str, Any]],
+    prefix: str,
+    start: int,
+    bindings: Dict[str, Optional[_Context]],
+    env: List[str],
+) -> List[Dict[str, Any]]:
+    """The candidates that complete `prefix`, as sorted result dicts."""
     seen = set()
     results = []
     for name, kind, detail in candidates:

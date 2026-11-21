@@ -19,6 +19,8 @@
 
 """Tests for the "almost Python" expression parser (`gramps_webapi.api.query_lang`)."""
 
+import re
+
 import pytest
 
 from gramps_object_query_language.query_lang import (
@@ -2786,3 +2788,34 @@ def test_indexed_collection_hop_resolves_like_a_relationship():
 def test_indexed_collection_hop_rejects(entry, message):
     with pytest.raises(QueryLangError, match=message.replace("[", r"\[").replace("]", r"\]").replace(".", r"\.")):
         parse_select(PERSON, [entry])
+
+
+# --- [x.f for x in rel if cond][n] ---------------------------------------------
+
+
+def test_picked_entry_parses_in_select_where_and_order_by():
+    entry = "[a.value for a in attribute_list if a.type.value == AttributeType.OCCUPATION][0]"
+    [(ref, key)] = parse_select(PERSON, [entry])
+    assert key == entry  # no path spelling: the entry's own text
+    where = compile_expr_for_spec(PERSON, entry + " == 'Farmer'")
+    assert where.column == ref
+    [order] = parse_order_by(PERSON, ["-" + entry])
+    assert order.column == ref and order.direction == "desc"
+    [(hop, _)] = parse_select(PERSON, ["[f for f in parent_families if f.father.surname == 'Smith'][0].mother.primary_name as m"])
+    assert isinstance(hop, RelatedObject) and hop.field.name == "mother"
+
+
+@pytest.mark.parametrize(
+    "entry, message",
+    [
+        ("[f for f in parent_families][0]", "add a field after it"),
+        ("[b for b in backlinks][0].handle", "can't take one entry of 'backlinks'"),
+        ("[a.value for a in attribute_list][-1]", "plain number"),
+        ("[len(a) for a in attribute_list][0]", "collect the loop variable or a field of it"),
+        ("[surname for a in attribute_list][0]", "collect the loop variable or a field of it"),
+        ("[a for a in gramps_id][0]", "requires a JSON array path"),
+    ],
+)
+def test_picked_entry_rejects(entry, message):
+    with pytest.raises(QueryLangError, match=re.escape(message)):
+        parse_select(PERSON, [entry + " as v"], env={"N": 0})

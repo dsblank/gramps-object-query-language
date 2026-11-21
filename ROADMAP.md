@@ -68,6 +68,10 @@ does today.
   written as a comprehension
   (`len([c for c in children if c.gender == Person.MALE])`), in `where`,
   `select` and `order_by` alike. No other aggregates (`sum`, `min`, ...).
+- A list comprehension taken by index picks one matching entry
+  (`[a.value for a in attribute_list if a.type.value == AttributeType.OCCUPATION][0]`),
+  from a JSON array or a collection (then read on like a relationship).
+  No arithmetic on values (`death.date.dateval[2] - birth.date.dateval[2]`).
 
 - ~~A `JsonPath` is trusted rather than checked -- an unknown path
   compiles fine and returns NULL for every row~~ -- **Done**: every path is

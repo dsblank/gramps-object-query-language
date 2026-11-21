@@ -298,6 +298,36 @@ this person, not a record to go to.
 To test *every* entry instead of one, use a comprehension:
 `any(f.father.surname == 'Smith' for f in parent_families)`.
 
+### One entry chosen by a condition: `[...][0]`
+
+A list comprehension taken by index picks the first (or second, ...)
+entry that matches its `if`, in the order the list stores them:
+
+```python
+Person "[a.value for a in attribute_list if a.type.value == AttributeType.OCCUPATION][0] == 'Farmer'"
+```
+
+reads "the person's first Occupation attribute is Farmer". What the
+comprehension collects is what you get: `a.value` gives the attribute's
+value; `a` gives the whole attribute, which a path after the index can then
+read (`[a for a in attribute_list if ...][0].value` means the same).
+
+Over a [collection](#one-to-many-relationships-any), the entry is a
+record, and the path goes on into it as after `parent_families[0]`:
+
+| Expression | Reads |
+|------------|-------|
+| `[f for f in parent_families if f.father.surname == 'Smith'][0].mother.primary_name` | the mother in a person's first parent family whose father is a Smith |
+| `[f.father.primary_name for f in parent_families if len(f.children) > 2][0]` | the father of a person's first parent family with more than two children |
+| `[n.type for n in alternate_names][1]` | the type of a person's second alternate name |
+
+Without an `if` it's the same as plain indexing
+(`[f for f in parent_families][1]` is `parent_families[1]`). When fewer
+entries match than the index asks for, there's no value, as for a missing
+birth event. The index is a plain number, 0 or more. `backlinks` and
+`child_refs` can't be picked from, for the same reasons they can't be
+indexed.
+
 ### Field-vs-field comparisons
 
 The right-hand side of a comparison can be a path too, not just a literal --
@@ -1062,7 +1092,9 @@ Three details are specific to `select`:
 - **`as <key>` renames the response key.** Without it the key is the path
   text itself (`"birth.place.title"`). An alias must be a plain name.
 - **`len(...)` requires an alias.** Unlike a path, it has no text to derive
-  a name from. It takes the same comprehension a filter does:
+  a name from. (Neither does a comprehension taken by index; without an
+  alias its key is the entry's own text.) `len(...)` takes the same
+  comprehension a filter does:
   `len([c for c in child_ref_list if c.frel.value == ChildRefType.BIRTH and c.mrel.value == ChildRefType.BIRTH]) as birth_children`.
 - **Paths are checked, in `select` and `where` alike.** See
   [Every path is checked](#every-path-is-checked) below.
@@ -1201,10 +1233,13 @@ changes.
 - Arbitrary function calls, lambdas, f-strings, imports -- the parser
   whitelists node *shapes*, so anything it doesn't explicitly recognize is
   rejected, not silently ignored.
-- Comprehensions, mostly -- `any(cond for x in rel)` and `len([... for x in
-  rel])` are recognized (see [Comprehension sugar](#comprehension-sugar-any-and-len)
-  above), but only in exactly that shape: every other comprehension form
-  (a bare list/set/dict comprehension not wrapped in `any(...)`/`len(...)`,
+- Comprehensions, mostly -- `any(cond for x in rel)`, `len([... for x in
+  rel])` and `[x.f for x in rel if ...][n]` are recognized (see
+  [Comprehension sugar](#comprehension-sugar-any-and-len) and
+  [One entry chosen by a condition](#one-entry-chosen-by-a-condition-0)
+  above), but only in exactly those shapes: every other comprehension form
+  (a bare list/set/dict comprehension not wrapped in `any(...)`/`len(...)`
+  or indexed,
   more than one `for` clause, a tuple-unpacking loop target, `all(...)`/
   `sum(...)`, ...) is rejected the same as any other unrecognized node.
 - A collection reached through a relationship hop -- `any(father.notes,

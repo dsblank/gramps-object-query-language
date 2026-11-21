@@ -36,6 +36,7 @@ from gramps.gen.db.utils import make_database
 from gramps.gen.dbstate import DbState
 from gramps.gen.lib import (
     Attribute,
+    AttributeType,
     ChildRef,
     ChildRefType,
     Citation,
@@ -2321,8 +2322,9 @@ def test_deferred_page_sorts_by_the_requested_collation(collation_db, pg_conn, c
 
 @pytest.fixture(scope="module")
 def indexed_hop_db():
-    """Two parents and a child whose parent_family_list names their family,
-    an orphan with no parent family, and a source with a citation, for
+    """Two parents and a child whose parent_family_list names their family
+    (then a second, step family), an orphan with no parent family, a source
+    with a citation, and attributes on the father, for
     `parent_families[0].father...`, `families[0].children[0]...` and
     `citations[0].source...`."""
     from gramps.gen.lib import Citation, Source
@@ -2343,6 +2345,15 @@ def indexed_hop_db():
         father = Person()
         father.set_primary_name(_name("Karl", "Anderson"))
         father.add_citation(handles["citation"])
+        for attr_type, value in (
+            (AttributeType.NICKNAME, "Kalle"),
+            (AttributeType.OCCUPATION, "Farmer"),
+            (AttributeType.OCCUPATION, "Miller"),
+        ):
+            attr = Attribute()
+            attr.set_type(attr_type)
+            attr.set_value(value)
+            father.add_attribute(attr)
         handles["father"] = db.add_person(father, trans)
         mother = Person()
         mother.set_primary_name(_name("Lena", "Baker"))
@@ -2362,14 +2373,33 @@ def indexed_hop_db():
         family.add_child_ref(child_ref)
         handles["family"] = db.add_family(family, trans)
 
+        # The child's second parent family: a stepfather and his wife.
+        stepfather = Person()
+        stepfather.set_primary_name(_name("Ed", "Jones"))
+        handles["stepfather"] = db.add_person(stepfather, trans)
+        stepmother = Person()
+        stepmother.set_primary_name(_name("Ann", "Lee"))
+        handles["stepmother"] = db.add_person(stepmother, trans)
+        family2 = Family()
+        family2.set_father_handle(handles["stepfather"])
+        family2.set_mother_handle(handles["stepmother"])
+        step_ref = ChildRef()
+        step_ref.set_reference_handle(handles["child"])
+        step_ref.set_father_relation(ChildRefType.STEPCHILD)
+        family2.add_child_ref(step_ref)
+        handles["family2"] = db.add_family(family2, trans)
+
         # Gramps keeps both sides of a family link; DbTxn doesn't do it for us.
-        for key, method in (
-            ("father", "add_family_handle"),
-            ("mother", "add_family_handle"),
-            ("child", "add_parent_family_handle"),
+        for key, method, family_key in (
+            ("father", "add_family_handle", "family"),
+            ("mother", "add_family_handle", "family"),
+            ("child", "add_parent_family_handle", "family"),
+            ("stepfather", "add_family_handle", "family2"),
+            ("stepmother", "add_family_handle", "family2"),
+            ("child", "add_parent_family_handle", "family2"),
         ):
             person = db.get_person_from_handle(handles[key])
-            getattr(person, method)(handles["family"])
+            getattr(person, method)(handles[family_key])
             db.commit_person(person, trans)
     yield db, handles
     db.close()
@@ -2384,7 +2414,8 @@ _PEOPLE = ("father", "mother", "child", "orphan")
     [
         ("parent_families[0].father.surname", {"child": "Anderson"}),
         ("parent_families[0].mother.primary_name.first_name", {"child": "Lena"}),
-        ("parent_families[1].father.surname", {}),
+        ("parent_families[1].father.surname", {"child": "Jones"}),
+        ("parent_families[2].father.surname", {}),
         ("parent_families[0].gramps_id", {"child": "F0000"}),
         ("families[0].children[0].given_name", {"father": "Steve", "mother": "Steve"}),
         ("citations[0].source.title", {"father": "Parish Register"}),
@@ -2460,10 +2491,10 @@ def test_birth_children_column(indexed_hop_db, pg_conn):
         query = Query(select=["handle", ref])
         sql, params = compile_query(FAMILY, query, dialect=Dialect.SQLITE)
         db.dbapi.execute(sql, params)
-        assert dict(db.dbapi.fetchall()) == {handles["family"]: 1}, "SQLite"
+        assert dict(db.dbapi.fetchall())[handles["family"]] == 1, "SQLite"
         if pg_conn is not None:
             sql, params = compile_query(FAMILY, query, dialect=Dialect.POSTGRESQL)
-            assert dict(_rows_on_postgresql(pg_conn, db, sql, params)) == {handles["family"]: 1}
+            assert dict(_rows_on_postgresql(pg_conn, db, sql, params))[handles["family"]] == 1
         assert resolve_column_ref(db, family, ref, FAMILY) == 1, "evaluator"
     finally:
         family.set_child_ref_list(family.get_child_ref_list()[:1])
@@ -2485,3 +2516,70 @@ def test_indexed_collection_hop_sorts(indexed_hop_db):
     db.dbapi.execute(sql, params)
     order = [row[0] for row in db.dbapi.fetchall()]
     assert set(order[:2]) == {handles["father"], handles["mother"]}
+
+
+# --- [x.f for x in rel if cond][n]: one entry, chosen by a condition ---------
+
+
+_OCCUPATIONS = "[a.value for a in attribute_list if a.type.value == AttributeType.OCCUPATION]"
+
+
+@pytest.mark.parametrize(
+    "entry, expected",
+    [
+        (_OCCUPATIONS + "[0]", {"father": "Farmer"}),
+        (_OCCUPATIONS + "[1]", {"father": "Miller"}),
+        (_OCCUPATIONS + "[2]", {}),
+        (
+            "[a for a in attribute_list if a.type.value == AttributeType.OCCUPATION][0].value",
+            {"father": "Farmer"},
+        ),
+        ("[a.value for a in attribute_list][0]", {"father": "Kalle"}),
+        (
+            "[f for f in parent_families if f.father.surname == 'Jones'][0]"
+            ".mother.primary_name.first_name",
+            {"child": "Ann"},
+        ),
+        ("[f for f in parent_families][1].father.surname", {"child": "Jones"}),
+        (
+            "[f.father.surname for f in parent_families if f.mother.surname == 'Baker'][0]",
+            {"child": "Anderson"},
+        ),
+        ("[f for f in parent_families if f.father.surname == 'Nobody'][0].gramps_id", {}),
+    ],
+)
+def test_picked_entry_select(indexed_hop_db, pg_conn, entry, expected):
+    """A select of a list comprehension taken by index gives that matching
+    entry's value, in stored order, NULL past the last match -- on SQLite,
+    PostgreSQL and the evaluator alike."""
+    test_indexed_collection_hop_select(indexed_hop_db, pg_conn, entry, expected)
+
+
+@pytest.mark.parametrize(
+    "where_expr, expected",
+    [
+        (_OCCUPATIONS + "[0] == 'Farmer'", {"father"}),
+        (_OCCUPATIONS + "[1] == 'Farmer'", set()),
+        ("[f for f in parent_families if f.father.surname == 'Jones'][0].mother.surname == 'Lee'", {"child"}),
+    ],
+)
+def test_picked_entry_where(indexed_hop_db, pg_conn, where_expr, expected):
+    db, handles = indexed_hop_db
+    _assert_sql_and_evaluator_agree(
+        db, handles, PERSON, _PEOPLE, where_expr, expected, pg_conn
+    )
+
+
+def test_picked_entry_sorts(indexed_hop_db):
+    """order_by takes a picked entry too: the one person with an occupation
+    sorts last ascending (NULLs first)."""
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+    from gramps_object_query_language.query_lang import parse_order_by
+
+    db, handles = indexed_hop_db
+    order_by = parse_order_by(PERSON, [_OCCUPATIONS + "[0]", "gramps_id"])
+    sql, params = compile_query(
+        PERSON, Query(select=["handle"], order_by=order_by), dialect=Dialect.SQLITE
+    )
+    db.dbapi.execute(sql, params)
+    assert [row[0] for row in db.dbapi.fetchall()][-1] == handles["father"]

@@ -367,6 +367,24 @@ def test_indexed_collection_entry(db):
         )
 
 
+def test_picked_entry_by_condition(db):
+    # [...][0] over a collection, read on into the chosen record: kid1's
+    # first parent family whose father is a Smith (fam1) -> its mother.
+    db.execute(
+        "UPDATE person SET json_data = json_set(json_data, '$.parent_family_list', "
+        "json_array('fam1')) WHERE handle = 'kid1'"
+    )
+    try:
+        assert run(
+            db, "Person", "[f for f in parent_families if f.father.surname == 'Smith'][0].mother.given_name == 'Jane'"
+        ) == [("kid1",)]
+    finally:
+        db.execute(
+            "UPDATE person SET json_data = json_remove(json_data, '$.parent_family_list') "
+            "WHERE handle = 'kid1'"
+        )
+
+
 def test_birth_date_sortval(db):
     # 1968 (sortval 2439857) or later.
     result = run(db, "Person", "birth.date.sortval >= 2439857")

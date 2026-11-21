@@ -72,6 +72,7 @@ from .query import (
     Backlinks,
     Collection,
     CollectionCount,
+    CollectionPick,
     ColumnIndex,
     ColumnRef,
     Comparison,
@@ -80,6 +81,7 @@ from .query import (
     FlatColumnRef,
     In,
     JsonArrayCount,
+    JsonArrayPick,
     JsonArrayExists,
     JsonPath,
     Length,
@@ -351,6 +353,8 @@ def get_json_path(obj: Any, path: JsonPath) -> Any:
 def _resolve_related_object(
     reader: RecordReader, data: Any, ref: RelatedObject, spec: ObjectTypeSpec
 ) -> Any:
+    if isinstance(ref.handle_ref, CollectionPick):
+        return _collection_pick(reader, data, ref.handle_ref)
     if isinstance(ref.handle_ref, JsonPath):
         handle = get_json_path(data, ref.handle_ref)
     else:
@@ -390,6 +394,8 @@ def _resolve(
         return _length_of(reader, data, ref, spec)
     if isinstance(ref, JsonArrayCount):
         return _json_array_count(reader, data, ref, spec)
+    if isinstance(ref, JsonArrayPick):
+        return _json_array_pick(reader, data, ref, spec)
     if isinstance(ref, FlatColumnRef):
         return get_flat_column(data, ref.name, spec)
     return get_flat_column(data, ref, spec)
@@ -553,6 +559,40 @@ def _json_array_count(reader: RecordReader, data: Any, count: "JsonArrayCount", 
     if count.condition is None:
         return len(items)
     return sum(1 for item in items if _matches(reader, item, count.condition, count.element_spec))
+
+
+def _collection_pick(reader: RecordReader, data: Any, pick: CollectionPick) -> Any:
+    """The `pick.index`-th related record (in list order) matching
+    `pick.condition`, or `None` -- the evaluator counterpart to `query.py`'s
+    `_render_collection_pick`. A record that doesn't read back is skipped,
+    as the SQL join finds no row for it."""
+    target = pick.collection.target
+    position = 0
+    for handle in _collection_handles(data, pick.collection):
+        related = reader.get(target.table, handle)
+        if related is None:
+            continue
+        if pick.condition is None or _matches(reader, related, pick.condition, target):
+            if position == pick.index:
+                return related
+            position += 1
+    return None
+
+
+def _json_array_pick(reader: RecordReader, data: Any, pick: "JsonArrayPick", spec: ObjectTypeSpec) -> Any:
+    """`pick.field` of the `pick.index`-th element of `pick.array` matching
+    `pick.condition` (the element itself without a field), or `None` -- the
+    evaluator counterpart to `query.py`'s `_render_json_array_pick`."""
+    items = _json_array_items(reader, data, pick.array, spec)
+    matching = [
+        item
+        for item in items
+        if pick.condition is None or _matches(reader, item, pick.condition, pick.element_spec)
+    ]
+    if pick.index >= len(matching):
+        return None
+    item = matching[pick.index]
+    return item if pick.field is None else get_json_path(item, pick.field)
 
 
 def _like_to_regex(pattern: str) -> re.Pattern:
