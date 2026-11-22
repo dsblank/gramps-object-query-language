@@ -2846,3 +2846,80 @@ def test_computed_values_compare_on_either_side(namespace, expr):
 def test_number_vs_text_field_still_rejected(expr, message):
     with pytest.raises(QueryLangError, match=re.escape(message)):
         compile_expr("Family", expr)
+
+
+# --- attribute_list['X'] ------------------------------------------------------
+
+
+def test_attribute_lookup_is_the_long_form():
+    """`attribute_list['X']` compiles to exactly what the comprehension it
+    stands for does, so every later step treats it the same."""
+    from gramps_object_query_language.query import PERSON
+    from gramps_object_query_language.query_lang import parse_expr_for_spec, parse_select_entry
+
+    short, _ = parse_select_entry(PERSON, "attribute_list['Hair color'].value")
+    long, _ = parse_select_entry(PERSON, "[a for a in attribute_list if a.type.string == 'Hair color'][0].value")
+    assert short == long
+    # A built-in name also matches its number (Gramps stores built-ins
+    # with an empty name).
+    short = parse_expr_for_spec(PERSON, "attribute_list['Nickname'].value == 'Kalle'")
+    long = parse_expr_for_spec(
+        PERSON,
+        "[a for a in attribute_list if a.type.string == 'Nickname'"
+        " or a.type.value == AttributeType.NICKNAME][0].value == 'Kalle'",
+    )
+    assert short == long
+
+
+def test_attribute_lookup_custom_is_not_a_builtin():
+    """`Custom` is every custom value's stored number, so the name 'Custom'
+    must not match by number (it would match every custom attribute)."""
+    from gramps_object_query_language.query import PERSON
+    from gramps_object_query_language.query_lang import parse_expr_for_spec
+
+    short = parse_expr_for_spec(PERSON, "attribute_list['Custom'] != None")
+    long = parse_expr_for_spec(PERSON, "[a for a in attribute_list if a.type.string == 'Custom'][0] != None")
+    assert short == long
+
+
+@pytest.mark.parametrize(
+    "entry, message",
+    [
+        ("urls['Home'].path", "only works on attribute_list"),
+        ("primary_name['x']", "only works on attribute_list"),
+    ],
+)
+def test_attribute_lookup_rejects(entry, message):
+    from gramps_object_query_language.query import PERSON
+    from gramps_object_query_language.query_lang import QueryLangError, parse_select_entry
+
+    with pytest.raises(QueryLangError, match=message):
+        parse_select_entry(PERSON, entry)
+
+
+@pytest.mark.parametrize(
+    "short, long",
+    [
+        (
+            "parent_families[0].father.attribute_list['X'].value",
+            "[a for a in parent_families[0].father.attribute_list if a.type.string == 'X'][0].value",
+        ),
+        (
+            "any(f.father.attribute_list['X'].value == 'y' for f in parent_families)",
+            "any([a for a in f.father.attribute_list if a.type.string == 'X'][0].value == 'y'"
+            " for f in parent_families)",
+        ),
+    ],
+)
+def test_attribute_lookup_has_the_long_forms_limits(short, long):
+    """The sugar is the long form, so it reaches exactly as far: a list on
+    the record or one link away, not further (TODO: lists one link away)."""
+    from gramps_object_query_language.query import PERSON
+    from gramps_object_query_language.query_lang import QueryLangError, parse_expr_for_spec
+
+    def message(expr):
+        with pytest.raises(QueryLangError) as error:
+            parse_expr_for_spec(PERSON, expr if "==" in expr else expr + " == 'y'")
+        return str(error.value).split(":")[0]
+
+    assert message(short) == message(long)

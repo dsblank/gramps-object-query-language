@@ -328,6 +328,35 @@ birth event. The index is a plain number, 0 or more. `backlinks` and
 `child_refs` can't be picked from, for the same reasons they can't be
 indexed.
 
+### An attribute by type: `attribute_list['Age']`
+
+Picking an attribute by its type is common enough to have a shorthand:
+put the type's name in the brackets instead of a number.
+
+```python
+Person "attribute_list['Occupation'].value == 'Farmer'"
+Citation "source.attribute_list['Film'].value"
+```
+
+`attribute_list['Occupation']` is the person's first Occupation attribute,
+the same as `[a for a in attribute_list if a.type.string == 'Occupation'
+or a.type.value == AttributeType.OCCUPATION][0]`, which it is turned
+into before anything else happens. So it works everywhere that does, in
+`where_expr`, `select` and `order_by`, and reaches just as far: on the
+record itself, or on a record one link away (`source.attribute_list`,
+`father.attribute_list`), inside `any(...)` too.
+
+The name is matched two ways because Gramps stores them two ways. A type
+you made up yourself ("Film", "Hair color") is stored by its name. A
+built-in type (Age, Nickname, Occupation, ...) is stored by number only,
+with an empty name, so its English name is looked up and matched by
+number. Names match exactly, so `'hair color'` doesn't find "Hair color".
+When there's no attribute of that type, there's no value, and
+`attribute_list['Film'] == None` is true.
+
+A name in brackets only works on `attribute_list`. Other lists are
+indexed by number, or by a comprehension.
+
 ### Field-vs-field comparisons
 
 The right-hand side of a comparison can be a path too, not just a literal --

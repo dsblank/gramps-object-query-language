@@ -113,7 +113,7 @@ supports today:
 from __future__ import annotations
 
 import ast
-from typing import Any, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from gramps.gen.datehandler import parser as _date_parser
 from gramps.gen.lib import (
@@ -1558,7 +1558,86 @@ def _substitute_env(node: ast.AST, env: Optional[Mapping[str, EnvValue]]) -> ast
     return ast.fix_missing_locations(_EnvSubstituter(env).visit(node))
 
 
+#: The lists `name['X']` works on: Attribute/SrcAttribute lists, whose
+#: entries carry a GrampsType `type`. Other typed lists (urls, names) could
+#: join later; each needs its own built-in name table below.
+_LOOKUP_LISTS = {"attribute_list": AttributeType}
+
+#: The loop variable the lookup sugar writes into its comprehension. Never a
+#: Gramps field, and a comprehension's own name is local to it, so it can't
+#: collide with an enclosing user comprehension's `e`/`p`.
+_LOOKUP_BOUND = "_entry"
+
+
+def _builtin_type_values(type_class: type) -> Dict[str, int]:
+    """English name -> number for a GrampsType's built-in values, minus
+    Custom (every custom value is stored as Custom, so matching its number
+    would match them all). Built-ins are stored with an empty `string` and
+    only their number, so the name has to be looked up here."""
+    custom = type_class._CUSTOM
+    return {key: value for value, _label, key in type_class._DATAMAP if value != custom}
+
+
+class _TypedListLookup(ast.NodeTransformer):
+    """`attribute_list['Age']` -> `[_entry for _entry in attribute_list if
+    _entry.type.string == 'Age' or _entry.type.value == AttributeType.AGE][0]`:
+    the first entry of that type, written as the long form so every later
+    step (picks, any(), links, the Python evaluator) handles it unchanged.
+
+    Runs before `_ComprehensionDesugarer`. A plain string index on a list
+    has no other meaning in this language, so the sugar can't shadow
+    anything. Custom types match on their stored name; a built-in name
+    (Age, Nickname, ...) also matches its number, since Gramps stores
+    built-ins with an empty name."""
+
+    def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
+        self.generic_visit(node)
+        key = node.slice
+        if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+            return node
+        list_name = (
+            node.value.id if isinstance(node.value, ast.Name)
+            else node.value.attr if isinstance(node.value, ast.Attribute)
+            else None
+        )
+        type_class = _LOOKUP_LISTS.get(list_name or "")
+        if type_class is None:
+            lists = ", ".join(sorted(_LOOKUP_LISTS))
+            raise QueryLangError(
+                f"a name in [...] picks an entry by type, which only works on {lists}: "
+                f"{ast.unparse(node)}"
+            )
+
+        def field(*names: str) -> ast.expr:
+            expr: ast.expr = ast.Name(id=_LOOKUP_BOUND, ctx=ast.Load())
+            for name in names:
+                expr = ast.Attribute(value=expr, attr=name, ctx=ast.Load())
+            return expr
+
+        def equals(left: ast.expr, value: Any) -> ast.Compare:
+            return ast.Compare(left=left, ops=[ast.Eq()], comparators=[ast.Constant(value=value)])
+
+        condition: ast.expr = equals(field("type", "string"), key.value)
+        builtin = _builtin_type_values(type_class).get(key.value)
+        if builtin is not None:
+            condition = ast.BoolOp(op=ast.Or(), values=[condition, equals(field("type", "value"), builtin)])
+        comp = ast.ListComp(
+            elt=ast.Name(id=_LOOKUP_BOUND, ctx=ast.Load()),
+            generators=[
+                ast.comprehension(
+                    target=ast.Name(id=_LOOKUP_BOUND, ctx=ast.Store()),
+                    iter=node.value,
+                    ifs=[condition],
+                    is_async=0,
+                )
+            ],
+        )
+        lookup = ast.Subscript(value=comp, slice=ast.Constant(value=0), ctx=ast.Load())
+        return ast.copy_location(lookup, node)
+
+
 def _desugar_comprehensions(node: ast.AST) -> ast.AST:
+    node = ast.fix_missing_locations(_TypedListLookup().visit(node))
     rewritten = _ComprehensionDesugarer().visit(node)
     return ast.fix_missing_locations(rewritten)
 
