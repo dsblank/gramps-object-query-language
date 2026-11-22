@@ -65,15 +65,18 @@ from .query_lang import resolve_namespace
 from .vocabulary import vocabularies
 
 _NAME = r"[A-Za-z_][A-Za-z0-9_]*"
-_SEGMENT = rf"{_NAME}(?:\[[0-9]+\])*"
+# One `[...]` after a name: a number (`[0]`), or a quoted type name
+# (`attribute_list['Age']`, the first entry of that type).
+_INDEX = r"""\[(?:[0-9]+|'[^'\\]*'|"[^"\\]*")\]"""
+_SEGMENT = rf"{_NAME}(?:{_INDEX})*"
 _CHAIN = rf"{_SEGMENT}(?:\.{_SEGMENT})*"
 # The dotted path ending at the cursor: `chain.` then a (possibly empty)
 # word, or just a word. The lookbehind keeps a chain from starting partway
 # through a name, number or `x[0]`/`f()` -- `1.5` or `f().x` don't
 # complete.
 _AT_CURSOR_RE = re.compile(rf"(?<![A-Za-z0-9_.\])])(?:({_CHAIN})\.)?({_NAME})?$")
-_SEGMENT_RE = re.compile(rf"({_NAME})((?:\[[0-9]+\])*)")
-_INDEX_RE = re.compile(r"\[([0-9]+)\]")
+_SEGMENT_RE = re.compile(rf"({_NAME})((?:{_INDEX})*)")
+_INDEX_RE = re.compile(_INDEX)
 _BINDING_RE = re.compile(rf"\bfor\s+({_NAME})\s+in\s+({_CHAIN})")
 _PARTIAL_OPERATOR_RE = re.compile(r"[=!<>]+$")
 # The path a value is being written for: `path ==` (any comparison) or

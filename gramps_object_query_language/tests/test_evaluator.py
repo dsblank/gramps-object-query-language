@@ -2327,7 +2327,7 @@ def indexed_hop_db():
     with a citation, and attributes on the father, for
     `parent_families[0].father...`, `families[0].children[0]...` and
     `citations[0].source...`."""
-    from gramps.gen.lib import Citation, Source
+    from gramps.gen.lib import Citation, Source, SrcAttribute
 
     dbman = CLIDbManager(DbState())
     dirpath, db_name = dbman.create_new_db_cli("_test_evaluator_indexed_hop", dbid="sqlite")
@@ -2337,6 +2337,10 @@ def indexed_hop_db():
     with DbTxn("setup", db) as trans:
         source = Source()
         source.set_title("Parish Register")
+        film = SrcAttribute()
+        film.set_type("Film")
+        film.set_value("FHL 123")
+        source.add_attribute(film)
         handles["source"] = db.add_source(source, trans)
         citation = Citation()
         citation.set_reference_handle(handles["source"])
@@ -2349,6 +2353,8 @@ def indexed_hop_db():
             (AttributeType.NICKNAME, "Kalle"),
             (AttributeType.OCCUPATION, "Farmer"),
             (AttributeType.OCCUPATION, "Miller"),
+            # A custom type: stored by name, unlike the built-ins above.
+            ("Hair color", "Brown"),
         ):
             attr = Attribute()
             attr.set_type(attr_type)
@@ -2568,6 +2574,62 @@ def test_picked_entry_where(indexed_hop_db, pg_conn, where_expr, expected):
     _assert_sql_and_evaluator_agree(
         db, handles, PERSON, _PEOPLE, where_expr, expected, pg_conn
     )
+
+
+# --- attribute_list['X']: the first attribute of a type ----------------------
+
+
+@pytest.mark.parametrize(
+    "entry, expected",
+    [
+        # Built-ins are stored with an empty name, so these match by number.
+        ("attribute_list['Occupation'].value", {"father": "Farmer"}),
+        ("attribute_list['Nickname'].value", {"father": "Kalle"}),
+        # A custom type matches by its stored name.
+        ("attribute_list['Hair color'].value", {"father": "Brown"}),
+        ("attribute_list['Caste'].value", {}),
+        ("attribute_list['hair color'].value", {}),
+    ],
+)
+def test_attribute_lookup_select(indexed_hop_db, pg_conn, entry, expected):
+    test_indexed_collection_hop_select(indexed_hop_db, pg_conn, entry, expected)
+
+
+@pytest.mark.parametrize(
+    "where_expr, expected",
+    [
+        ("attribute_list['Occupation'].value == 'Farmer'", {"father"}),
+        ("attribute_list['Occupation'].value == 'Miller'", set()),
+        ("attribute_list['Hair color'] != None", {"father"}),
+        ("attribute_list['Hair color'] == None", {"mother", "child", "orphan"}),
+        ("any(e.attribute_list['Occupation'].value == 'Farmer' for e in events)", set()),
+    ],
+)
+def test_attribute_lookup_where(indexed_hop_db, pg_conn, where_expr, expected):
+    db, handles = indexed_hop_db
+    _assert_sql_and_evaluator_agree(
+        db, handles, PERSON, _PEOPLE, where_expr, expected, pg_conn
+    )
+
+
+def test_attribute_lookup_through_link(indexed_hop_db, pg_conn):
+    """One link away: a Citation reads its Source's attribute by type, the
+    citation-template case."""
+    from gramps_object_query_language.query import CITATION, Dialect, Query, compile_query
+    from gramps_object_query_language.query_lang import parse_select
+
+    db, handles = indexed_hop_db
+    [(ref, _)] = parse_select(CITATION, ["source.attribute_list['Film'].value as v"])
+    query = Query(select=["handle", ref])
+    want = {handles["citation"]: "FHL 123"}
+    sql, params = compile_query(CITATION, query, dialect=Dialect.SQLITE)
+    db.dbapi.execute(sql, params)
+    assert dict(db.dbapi.fetchall()) == want, "SQLite"
+    if pg_conn is not None:
+        sql, params = compile_query(CITATION, query, dialect=Dialect.POSTGRESQL)
+        assert dict(_rows_on_postgresql(pg_conn, db, sql, params)) == want, "PostgreSQL"
+    citation = db.get_citation_from_handle(handles["citation"])
+    assert resolve_column_ref(db, citation, ref, CITATION) == "FHL 123", "evaluator"
 
 
 def test_picked_entry_sorts(indexed_hop_db):

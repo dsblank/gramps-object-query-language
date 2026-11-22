@@ -356,6 +356,20 @@ own. The comprehension works the same over either kind of list. Without a
 condition, `any(n for n in alternate_names)` just asks "is there at least
 one at all," identical to `len(alternate_names) > 0`.
 
+### Goal: Find people whose occupation is recorded as Farmer
+
+```
+Person "attribute_list['Occupation'].value == 'Farmer'"
+```
+
+A name in the brackets picks a person's first attribute of that type.
+Built-in types like Occupation, Age or Nickname and types you made up
+yourself ("Hair color") both work, spelled exactly as they appear in
+Gramps. It works one link away too: in the Citation view,
+`source.attribute_list['Film'].value` reads the cited source's "Film"
+attribute. See
+[An attribute by type](docs/where_expr.md#an-attribute-by-type-attribute_listage).
+
 ### Goal: Find people who were adopted
 
 ```
