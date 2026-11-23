@@ -439,6 +439,29 @@ Family "len([c for c in children if c.gender == Person.MALE]) > 1"
 A list comprehension with an `if` (the same kind of condition `any(...)`
 takes) counts only the children who match it -- here, only the sons.
 
+### Goal: Find people with more than one father
+
+```
+Person "len(distinct([f.father for f in parent_families])) > 1"
+```
+
+`[f.father for f in parent_families]` is the list of fathers of the
+person's parent families (a family with no father recorded leaves no
+entry), and `distinct(...)` counts each different father once -- a man
+recorded as father in two of the families is one father, not two. As a
+column, `len(distinct([f.father for f in parent_families])) - 1 as
+other_fathers` shows how many fathers someone has besides one.
+
+### Goal: Find people whose events happened in more than one place
+
+```
+Person "len(distinct([e.place for e in events])) > 1"
+```
+
+The same works for any field: `e.place` compares the places themselves,
+`e.place.title` their titles, `n.first_name for n in alternate_names`
+the names.
+
 ### Goal: Find people with a well-sourced record
 
 ```

@@ -42,6 +42,7 @@ from gramps.gen.lib import (
     Citation,
     Date,
     Event,
+    EventRef,
     EventType,
     Family,
     Name,
@@ -2853,3 +2854,181 @@ def test_computed_value_on_the_right(indexed_hop_db, pg_conn, spec_name, keys, w
     db, handles = indexed_hop_db
     spec = {"family": FAMILY, "person": PERSON}[spec_name]
     _assert_sql_and_evaluator_agree(db, handles, spec, keys, where_expr, expected, pg_conn)
+
+
+# --- counting a field: len([f.father for f in ...]), len(distinct([...])) ---
+
+
+@pytest.fixture(scope="module")
+def distinct_db():
+    """People whose parent families, events and alternate names repeat
+    values, for counting fields and distinct values:
+
+    - `two_fathers`: child of (Adam, Mary) and (Bill, Mary).
+    - `same_father`: child of (Adam, Mary) and (Adam, Nora) -- one father
+      recorded in two families.
+    - `no_father`: child of (nobody, Mary).
+    - `orphan`: no parent families, events, or alternate names.
+    - `traveler`: events in Chicago, Chicago, Boston and nowhere; alternate
+      first names Bob, Bob, Rob and an empty one.
+    """
+    dbman = CLIDbManager(DbState())
+    dirpath, db_name = dbman.create_new_db_cli("_test_evaluator_distinct", dbid="sqlite")
+    db = make_database("sqlite")
+    db.load(dirpath)
+    handles = {}
+    with DbTxn("setup", db) as trans:
+        for key, first in (("adam", "Adam"), ("bill", "Bill"), ("mary", "Mary"), ("nora", "Nora")):
+            parent = Person()
+            parent.set_primary_name(_name(first, "Parent"))
+            handles[key] = db.add_person(parent, trans)
+        for key in ("two_fathers", "same_father", "no_father", "orphan", "traveler"):
+            person = Person()
+            person.set_primary_name(_name(key, "Child"))
+            handles[key] = db.add_person(person, trans)
+
+        def add_family(child_key, father_key, mother_key):
+            family = Family()
+            if father_key:
+                family.set_father_handle(handles[father_key])
+            family.set_mother_handle(handles[mother_key])
+            child_ref = ChildRef()
+            child_ref.set_reference_handle(handles[child_key])
+            family.add_child_ref(child_ref)
+            family_handle = db.add_family(family, trans)
+            child = db.get_person_from_handle(handles[child_key])
+            child.add_parent_family_handle(family_handle)
+            db.commit_person(child, trans)
+
+        add_family("two_fathers", "adam", "mary")
+        add_family("two_fathers", "bill", "mary")
+        add_family("same_father", "adam", "mary")
+        add_family("same_father", "adam", "nora")
+        add_family("no_father", None, "mary")
+
+        places = {}
+        for title in ("Chicago", "Boston"):
+            place = Place()
+            place.set_title(title)
+            places[title] = db.add_place(place, trans)
+        traveler = db.get_person_from_handle(handles["traveler"])
+        for title in ("Chicago", "Chicago", "Boston", None):
+            event = Event()
+            event.set_type(EventType.RESIDENCE)
+            if title:
+                event.set_place_handle(places[title])
+            ref = EventRef()
+            ref.set_reference_handle(db.add_event(event, trans))
+            traveler.add_event_ref(ref)
+        for first in ("Bob", "Bob", "Rob", ""):
+            traveler.add_alternate_name(_name(first, "Child"))
+        db.commit_person(traveler, trans)
+    yield db, handles
+    db.close()
+    dbman.remove_database(db_name)
+
+
+_DISTINCT_PEOPLE = ("two_fathers", "same_father", "no_father", "orphan", "traveler")
+
+
+@pytest.mark.parametrize(
+    "expr, expected",
+    [
+        (
+            "len(distinct([f.father for f in parent_families]))",
+            {"two_fathers": 2, "same_father": 1, "no_father": 0, "orphan": 0, "traveler": 0},
+        ),
+        (
+            "len(distinct([f.mother for f in parent_families]))",
+            {"two_fathers": 1, "same_father": 2, "no_father": 1, "orphan": 0, "traveler": 0},
+        ),
+        # A list of fathers leaves out the families with no father.
+        (
+            "len([f.father for f in parent_families])",
+            {"two_fathers": 2, "same_father": 2, "no_father": 0, "orphan": 0, "traveler": 0},
+        ),
+        (
+            "len([f for f in parent_families])",
+            {"two_fathers": 2, "same_father": 2, "no_father": 1, "orphan": 0, "traveler": 0},
+        ),
+        # How many times a father repeats across someone's parent families.
+        (
+            "len([f.father for f in parent_families])"
+            " - len(distinct([f.father for f in parent_families]))",
+            {"two_fathers": 0, "same_father": 1, "no_father": 0, "orphan": 0, "traveler": 0},
+        ),
+        (
+            "len(distinct([f.father.primary_name.first_name for f in parent_families]))",
+            {"two_fathers": 2, "same_father": 1, "no_father": 0, "orphan": 0, "traveler": 0},
+        ),
+        (
+            "len(distinct([f.father for f in parent_families if f.mother.primary_name.first_name == 'Mary']))",
+            {"two_fathers": 2, "same_father": 1, "no_father": 0, "orphan": 0, "traveler": 0},
+        ),
+        (
+            "len(distinct([e.place for e in events]))",
+            {"two_fathers": 0, "same_father": 0, "no_father": 0, "orphan": 0, "traveler": 2},
+        ),
+        (
+            "len([e.place for e in events])",
+            {"two_fathers": 0, "same_father": 0, "no_father": 0, "orphan": 0, "traveler": 3},
+        ),
+        (
+            "len(distinct([e.place.title for e in events]))",
+            {"two_fathers": 0, "same_father": 0, "no_father": 0, "orphan": 0, "traveler": 2},
+        ),
+        # A self-linked collection: this person's own child reference in
+        # each parent family.
+        (
+            "len(distinct([c.frel.value for c in child_refs]))",
+            {"two_fathers": 1, "same_father": 1, "no_father": 1, "orphan": 0, "traveler": 0},
+        ),
+        # A list inside the record; the empty first name isn't counted.
+        (
+            "len(distinct([n.first_name for n in alternate_names]))",
+            {"two_fathers": 0, "same_father": 0, "no_father": 0, "orphan": 0, "traveler": 2},
+        ),
+        (
+            "len([n.first_name for n in alternate_names])",
+            {"two_fathers": 0, "same_father": 0, "no_father": 0, "orphan": 0, "traveler": 3},
+        ),
+        (
+            "len(distinct([n.first_name for n in alternate_names if n.first_name != 'Rob']))",
+            {"two_fathers": 0, "same_father": 0, "no_father": 0, "orphan": 0, "traveler": 1},
+        ),
+    ],
+)
+def test_counting_a_field_and_distinct_values(distinct_db, pg_conn, expr, expected):
+    """A counted field and a distinct count give the same numbers on SQLite,
+    PostgreSQL and the evaluator."""
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+    from gramps_object_query_language.query_lang import parse_select
+
+    db, handles = distinct_db
+    [(ref, _key)] = parse_select(PERSON, [f"{expr} as n"])
+    query = Query(select=["handle", ref])
+    want = {handles[key]: value for key, value in expected.items()}
+    sql, params = compile_query(PERSON, query, dialect=Dialect.SQLITE)
+    db.dbapi.execute(sql, params)
+    got = {handle: value for handle, value in db.dbapi.fetchall() if handle in want}
+    assert got == want, "SQLite"
+    if pg_conn is not None:
+        sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
+        rows = _rows_on_postgresql(pg_conn, db, sql, params)
+        assert {handle: value for handle, value in rows if handle in want} == want, "PostgreSQL"
+    for key, value in expected.items():
+        person = db.get_person_from_handle(handles[key])
+        assert resolve_column_ref(db, person, ref, PERSON) == value, f"evaluator on {key}"
+
+
+def test_distinct_count_as_a_filter(distinct_db, pg_conn):
+    db, handles = distinct_db
+    _assert_sql_and_evaluator_agree(
+        db, handles, PERSON, _DISTINCT_PEOPLE,
+        "len(distinct([f.father for f in parent_families])) > 1", {"two_fathers"}, pg_conn,
+    )
+    _assert_sql_and_evaluator_agree(
+        db, handles, PERSON, _DISTINCT_PEOPLE,
+        "len([f.father for f in parent_families]) > len(distinct([f.father for f in parent_families]))",
+        {"same_father"}, pg_conn,
+    )

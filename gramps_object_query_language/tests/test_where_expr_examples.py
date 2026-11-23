@@ -688,6 +688,50 @@ def test_len_children_gender_condition_readme_example():
     assert result == [("two-sons",)]
 
 
+def test_distinct_places_doc_example(db):
+    # Events in more than one place: John (Chicago, Boston) and both
+    # grandparents (Philadelphia, Chicago). Jane was born and died in
+    # Chicago -- two events, one place.
+    assert run(db, "Person", "len(distinct([e.place for e in events])) > 1") == [
+        ("dad1",),
+        ("granddad1",),
+        ("grandma1",),
+    ]
+
+
+def test_distinct_fathers_doc_examples():
+    # Parent families: `two` has two different fathers, `twice` the same
+    # father in two families, `none` one family with no father recorded.
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE person (handle TEXT, json_data TEXT)")
+    conn.execute(
+        "CREATE TABLE family (handle TEXT, father_handle TEXT, mother_handle TEXT, json_data TEXT)"
+    )
+    for handle, families in (("two", ["f1", "f2"]), ("twice", ["f3", "f4"]), ("none", ["f5"])):
+        conn.execute(
+            "INSERT INTO person VALUES (?, ?)",
+            (handle, json.dumps({"parent_family_list": families})),
+        )
+    for family, father in (("f1", "adam"), ("f2", "bill"), ("f3", "adam"), ("f4", "adam"), ("f5", None)):
+        conn.execute("INSERT INTO family VALUES (?, ?, 'mary', '{}')", (family, father))
+
+    assert run(conn, "Person", "len(distinct([f.father for f in parent_families])) > 1") == [
+        ("two",)
+    ]
+    assert run(
+        conn,
+        "Person",
+        "len([f.father for f in parent_families]) > len(distinct([f.father for f in parent_families]))",
+    ) == [("twice",)]
+    spec = resolve_namespace("Person")
+    select = [ref for ref, _ in parse_select(spec, [
+        "handle",
+        "len(distinct([f.father for f in parent_families])) - 1 as other_fathers",
+    ])]
+    sql, params = compile_query(spec, Query(select=select), dialect=Dialect.SQLITE)
+    assert conn.execute(sql, params).fetchall() == [("none", -1), ("twice", 0), ("two", 1)]
+
+
 # --- Collections registered on other types, and self-reference ---------------
 
 
