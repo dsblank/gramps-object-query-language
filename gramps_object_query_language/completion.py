@@ -131,9 +131,9 @@ _VALUE_FUNCTIONS = ("Date",)
 _NON_OPERAND_WORDS = {"and", "or", "not", "in", "is", "for", "if"}
 # What each argument of a whitelisted function call is (see
 # `query_lang.py`): `Date('Jan 1, 1968')`, `like(path, 'pattern')`,
-# `exists(collection, condition)`, `len([... for x in collection])` or
-# `len(path)`; `any(...)` takes a condition or comprehension. A function
-# not listed here takes conditions.
+# `exists(collection, condition)`, `len([... for x in collection])`,
+# `len(distinct([...]))` or `len(path)`; `any(...)` takes a condition or
+# comprehension. A function not listed here takes conditions.
 _ARGUMENT_ROLES = {
     "Date": ("string",),
     "like": ("path", "string"),
@@ -141,6 +141,7 @@ _ARGUMENT_ROLES = {
     "exists": ("collection", "operand"),
     "count": ("collection", "operand"),
     "len": ("iterable",),
+    "distinct": ("iterable",),
     "any": ("operand", "operand"),
 }
 # Roles whose argument is complete after one operand: only `,`/`)` follows.
@@ -664,8 +665,14 @@ def complete_from_vocabularies(
                 if kind in ("relationship", "variable") or _is_array(detail)
             ]
             candidates = iterables + collections
-            if before[:start].rstrip().endswith("len("):
+            opened = before[:start].rstrip()
+            if opened.endswith("distinct("):
+                # `distinct(...)` only takes a list of fields: `[f.father for ...]`.
+                candidates = [("[", "punctuation", "list")]
+            elif opened.endswith("len("):
                 candidates.append(("[", "punctuation", "list"))
+                # Only counted so far, so offered only inside `len(`.
+                candidates.append(("distinct", "function", None))
         elif expected == "index":
             candidates = []
             indexed = _INDEXED_RE.search(before[:start])

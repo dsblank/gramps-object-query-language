@@ -1459,11 +1459,13 @@ def test_len_call_not_wrapping_listcomp_is_the_unified_form():
 
 
 def test_len_listcomp_computed_elt_rejected():
-    # elt must be trivial (the loop var or a literal) -- len(...) has no
-    # way to fold a computed projection into a condition, so it's rejected
-    # rather than silently ignored.
+    # elt must be the loop variable, a literal, or a field of the loop
+    # variable (`len([c.gramps_id for c in children])` counts the children
+    # that have one) -- anything computed is rejected rather than ignored.
     with pytest.raises(QueryLangError):
-        parse_expr("family", "len([c.a for c in children]) > 0")
+        parse_expr("family", "len([c.a + 1 for c in children]) > 0")
+    with pytest.raises(QueryLangError):
+        parse_expr("family", "len([x.a for c in children]) > 0")
 
 
 def test_bare_comprehension_not_wrapped_in_any_or_len_rejected():

@@ -182,6 +182,7 @@ from .query import (
     SelectRef,
     default_ref_key,
     ref_value_type,
+    relationship_link,
     relationship_target,
     resolve_any_path,
     resolve_collection,
@@ -649,6 +650,41 @@ def _translate_pick(call: ast.Call, rest: List[Union[str, int]], spec: ObjectTyp
     return {"pick": payload}
 
 
+def _translate_projected_count(call: ast.Call, spec: ObjectTypeSpec) -> dict:
+    """`len([x.f for x in rel if cond])` / `len(distinct([...]))`, after
+    desugaring to `_count(rel, cond, f, distinct)`: `count_of` (a
+    collection) or `length_of_matching` (a list in the record) with the
+    field to count as `project`. Resolved in `json_column_to_ref`."""
+    source, condition, projection, distinct = call.args
+    payload: dict = {"project": _translate_path(projection), "distinct": distinct.value}  # type: ignore[attr-defined]
+    has_condition = not (isinstance(condition, ast.Constant) and condition.value is None)
+    collection = _try_resolve_bare_collection(source, spec)
+    if collection is not None:
+        if isinstance(collection, Backlinks):
+            raise QueryLangError(
+                f"can't count a field of {source.id!r} -- count the entries "  # type: ignore[attr-defined]
+                f"themselves, e.g. len([b for b in {source.id}])"  # type: ignore[attr-defined]
+            )
+        payload["relationship"] = source.id  # type: ignore[attr-defined]
+        if has_condition:
+            payload["where"] = _translate_top_level(condition, _collection_condition_spec(collection))
+        return {"count_of": payload}
+    if _collection_reached_via_relationship_hop(source, spec):
+        raise QueryLangError(
+            f"len(...) can't count a collection reached through a relationship "
+            f"hop yet: {ast.dump(source)}"
+        )
+    segments = _translate_path(source)
+    try:
+        _, element_spec = resolve_any_path(spec, segments)
+    except QueryError as error:
+        raise QueryLangError(str(error)) from error
+    payload["path"] = list(segments)
+    if has_condition:
+        payload["where"] = _translate_top_level(condition, element_spec)
+    return {"length_of_matching": payload}
+
+
 _ARITHMETIC_AST_OPS = {
     ast.Add: "+",
     ast.Sub: "-",
@@ -723,6 +759,8 @@ def _is_computed(node: ast.AST) -> bool:
     return (
         _is_count_call(node)
         or _is_len_call(node)
+        or _is_internal_call(node, _COUNT)
+        or _is_internal_call(node, _DISTINCT)
         or _pick_root(node) is not None
         or _is_arithmetic(node)
     )
@@ -754,6 +792,13 @@ def _translate_column_or_computed(node: ast.AST, spec: ObjectTypeSpec) -> Union[
     picked = _pick_root(node)
     if picked is not None:
         return _translate_pick(*picked, spec)
+    if _is_internal_call(node, _COUNT):
+        return _translate_projected_count(node, spec)  # type: ignore[arg-type]
+    if _is_internal_call(node, _DISTINCT):
+        raise QueryLangError(
+            "distinct([...]) can only be counted so far -- wrap it in len(...), "
+            "e.g. len(distinct([f.father for f in parent_families]))"
+        )
     if _is_count_call(node):
         return _translate_count_call(node, spec)
     if _is_len_call(node):
@@ -1368,6 +1413,76 @@ def _len_condition(comp: ast.ListComp, bound_name: str) -> Union[ast.expr, None]
     return _and_together(ifs) if ifs else None
 
 
+def _len_ifs(comp: ast.ListComp, bound_name: str) -> ast.expr:
+    """A projected `len([x.f for x in rel if ...])`'s `if` clauses, loop
+    variable stripped and ANDed (a `None` constant when there are none)."""
+    stripper = _BoundNameStripper(bound_name)
+    ifs = [stripper.visit(if_node) for if_node in comp.generators[0].ifs]
+    return _and_together(ifs) if ifs else ast.Constant(value=None)
+
+
+def _count_projection(elt: ast.expr, bound_name: str) -> Optional[ast.expr]:
+    """What `len([...])`/`distinct([...])` collects from each entry: `None`
+    for the entry itself (`[f for f in ...]`, or a plain literal, the
+    traditional `len([1 for ...])`), else the path after the loop variable
+    (`f.father` -> `father`)."""
+    if (isinstance(elt, ast.Name) and elt.id == bound_name) or isinstance(elt, ast.Constant):
+        return None
+    root = elt
+    while isinstance(root, ast.Attribute):
+        root = root.value
+    if not (isinstance(root, ast.Name) and root.id == bound_name and root is not elt):
+        raise QueryLangError(
+            f"a list to count must collect the loop variable or a field of it "
+            f"(e.g. '[f.father for f in parent_families]'): {ast.dump(elt)}"
+        )
+    return _BoundNameStripper(bound_name).visit(elt)
+
+
+#: Internal call names `_ComprehensionDesugarer` rewrites into: a counted
+#: list of fields (`_count(rel, cond or None, field, distinct)`, from
+#: `len([x.f for x in rel if c])` or `len(distinct([...]))`), and a
+#: `distinct([...])` not (yet) inside `len(...)`.
+_COUNT = "_count"
+_DISTINCT = "_distinct"
+
+
+def _is_internal_call(node: ast.AST, name: str) -> bool:
+    return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == name
+
+
+def _projected_count_call(
+    iter_node: ast.expr, condition: ast.expr, projection: ast.expr, distinct: bool
+) -> ast.Call:
+    return ast.Call(
+        func=ast.Name(id=_COUNT, ctx=ast.Load()),
+        args=[iter_node, condition, projection, ast.Constant(value=distinct)],
+        keywords=[],
+    )
+
+
+def _distinct_call(node: ast.Call) -> ast.Call:
+    """`distinct([x.f for x in rel if c])` -> `_distinct(rel, c or None,
+    f)`, for an enclosing `len(...)` to turn into a distinct count."""
+    if len(node.args) != 1 or node.keywords or not isinstance(node.args[0], ast.ListComp):
+        raise QueryLangError(
+            "distinct(...) takes one list, e.g. distinct([f.father for f in parent_families])"
+        )
+    comp = node.args[0]
+    generator = _comprehension_generator(comp, node)
+    projection = _count_projection(comp.elt, generator.target.id)
+    if projection is None:
+        raise QueryLangError(
+            "distinct([...]) needs a field to compare, e.g. "
+            "distinct([f.father for f in parent_families])"
+        )
+    return ast.Call(
+        func=ast.Name(id=_DISTINCT, ctx=ast.Load()),
+        args=[generator.iter, _len_ifs(comp, generator.target.id), projection],
+        keywords=[],
+    )
+
+
 def _make_call(name: str, iter_node: ast.expr, condition: Union[ast.expr, None]) -> ast.Call:
     args = [iter_node] if condition is None else [iter_node, condition]
     return ast.Call(func=ast.Name(id=name, ctx=ast.Load()), args=args, keywords=[])
@@ -1430,9 +1545,21 @@ class _ComprehensionDesugarer(ast.NodeTransformer):
             generator = _comprehension_generator(comp, node)
             condition = _any_condition(comp, generator.target.id)
             return ast.copy_location(_make_call("any", generator.iter, condition), node)
+        if name == "distinct":
+            return ast.copy_location(_distinct_call(node), node)
+        if name == "len" and len(node.args) == 1 and _is_internal_call(node.args[0], _DISTINCT):
+            inner = node.args[0]
+            return ast.copy_location(_projected_count_call(*inner.args, distinct=True), node)  # type: ignore[attr-defined]
         if name == "len" and len(node.args) == 1 and isinstance(node.args[0], ast.ListComp):
             comp = node.args[0]
             generator = _comprehension_generator(comp, node)
+            projection = _count_projection(comp.elt, generator.target.id)
+            if projection is not None:
+                condition = _len_ifs(comp, generator.target.id)
+                return ast.copy_location(
+                    _projected_count_call(generator.iter, condition, projection, distinct=False),
+                    node,
+                )
             condition = _len_condition(comp, generator.target.id)
             return ast.copy_location(_make_call("len", generator.iter, condition), node)
         # `any(...)`/`len(...)` on anything other than a real comprehension
@@ -1789,6 +1916,26 @@ def _arithmetic_from_json(payload: dict, spec: ObjectTypeSpec) -> Arithmetic:
     return Arithmetic(op, left, right, integral)
 
 
+def _resolve_projection(spec: ObjectTypeSpec, field: Sequence[Union[str, int]]) -> ColumnRef:
+    """The field a projected count (`len([f.father for f in ...])`) reads
+    from each entry, resolved against the entry's spec. A bare relationship
+    (`father`) means the record it links to, compared by handle; anything
+    else must hold a single value -- counting "different birth dates" as
+    whole date objects would compare more than a genealogist means."""
+    field = tuple(field)
+    ref: Optional[ColumnRef] = None
+    if len(field) == 1 and isinstance(field[0], str) and not spec.element_base_column:
+        ref = relationship_link(spec, field[0])
+    if ref is None:
+        ref = resolve_column_path(spec, field, spec.element_base_column or "json_data")
+    if _value_kind(ref, spec) is None:
+        raise QueryError(
+            f"can't count {'.'.join(map(str, field))!r} -- it isn't a single value; "
+            f"pick a field of it, e.g. a name, title, or date's sortval"
+        )
+    return ref
+
+
 def _pick_from_json(payload: dict, spec: ObjectTypeSpec) -> ColumnRef:
     """`{"pick": ...}` (see `_translate_pick`) as a `RelatedObject` whose
     handle is a `CollectionPick`, or a `JsonArrayPick`."""
@@ -1872,7 +2019,12 @@ def json_column_to_ref(column: Union[str, dict], spec: ObjectTypeSpec) -> Column
             condition = _backlink_condition_from_json(payload["where"])
         else:
             condition = where_list_to_ast(payload["where"], _collection_condition_spec(collection))
-        return CollectionCount(collection, condition)
+        if "project" not in payload:
+            return CollectionCount(collection, condition)
+        if isinstance(collection, Backlinks):
+            raise QueryError(f"can't count a field of {payload['relationship']!r}")
+        projection = _resolve_projection(_collection_condition_spec(collection), payload["project"])
+        return CollectionCount(collection, condition, projection, bool(payload.get("distinct")))
     if "length_of" in column:
         inner = column["length_of"]
         segments = (inner,) if isinstance(inner, str) else tuple(inner["json_path"])
@@ -1884,8 +2036,13 @@ def json_column_to_ref(column: Union[str, dict], spec: ObjectTypeSpec) -> Column
     if "length_of_matching" in column:
         payload = column["length_of_matching"]
         array_ref, element_spec = resolve_any_path(spec, payload["path"])
-        condition = where_list_to_ast(payload["where"], element_spec)
-        return JsonArrayCount(array_ref, element_spec, condition)
+        condition = where_list_to_ast(payload["where"], element_spec) if "where" in payload else None
+        if "project" not in payload:
+            return JsonArrayCount(array_ref, element_spec, condition)
+        projection = _resolve_projection(element_spec, payload["project"])
+        return JsonArrayCount(
+            array_ref, element_spec, condition, projection, bool(payload.get("distinct"))
+        )
     return resolve_column_path(spec, column["json_path"], base_column)
 
 

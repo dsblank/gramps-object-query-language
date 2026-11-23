@@ -620,6 +620,20 @@ def relationship_target(spec: ObjectTypeSpec, name: str) -> Optional[ObjectTypeS
     return None if hop is None else hop[0]
 
 
+def relationship_link(spec: ObjectTypeSpec, name: str) -> Optional["ColumnRef"]:
+    """The field on `spec`'s own row that holds relationship `name`'s
+    handle (`father` -> `father_handle`), or `None` if `name` isn't a
+    relationship there -- what `[f.father for f in ...]` counts: two
+    families have the same father when they hold the same handle."""
+    hop = _RELATIONSHIPS.get(spec.table, {}).get(name)
+    if hop is None:
+        return None
+    link = hop[1]
+    if isinstance(link, str):
+        return resolve_column_path(spec, (link,))
+    return link
+
+
 @dataclass(frozen=True)
 class Collection:
     """A one-to-many relationship -- a list of handles (or handle-bearing ref
@@ -687,6 +701,12 @@ class CollectionCount:
 
     collection: "Union[Collection, Backlinks]"
     condition: Optional[Any] = None
+    #: `len([f.father for f in parent_families])`: count only the rows where
+    #: this field (resolved against the related row) has a value, and with
+    #: `distinct`, each value once -- `len(distinct([...]))`. See
+    #: `_count_expression`.
+    projection: Optional["ColumnRef"] = None
+    distinct: bool = False
 
 
 @dataclass(frozen=True)
@@ -753,9 +773,18 @@ class JsonArrayCount:
     array: "ColumnRef"
     element_spec: ObjectTypeSpec
     condition: Optional[Any] = None
+    #: Same as `CollectionCount.projection`/`distinct`, for a list inside
+    #: the record (`len(distinct([n.surname for n in alternate_names]))`).
+    projection: Optional["ColumnRef"] = None
+    distinct: bool = False
 
     def __repr__(self) -> str:
-        return f"JsonArrayCount({self.array!r}, {self.condition!r})"
+        if self.projection is None:
+            return f"JsonArrayCount({self.array!r}, {self.condition!r})"
+        return (
+            f"JsonArrayCount({self.array!r}, {self.condition!r}, "
+            f"{self.projection!r}, distinct={self.distinct!r})"
+        )
 
 
 #: The arithmetic operators an expression may use, Python's spelling.
@@ -2535,7 +2564,7 @@ def _collection_subquery_body(
     depth = outer_spec.collection_depth
     target = collection.target
     target_table = target.table
-    target_alias = f"{target_table}__target{depth or ''}"
+    target_alias = _collection_target_alias(collection, outer_spec)
 
     if dialect == Dialect.SQLITE:
         source, handle_expr, source_params = _collection_source_sqlite(collection, outer_table)
@@ -2619,6 +2648,37 @@ def _backlinks_subquery_body(
     return body, params
 
 
+def _collection_target_alias(collection: Collection, outer_spec: ObjectTypeSpec) -> str:
+    """The alias `_collection_subquery_body` gives `collection`'s target
+    row (see its docstring for the depth suffix)."""
+    depth = outer_spec.collection_depth
+    return f"{collection.target.table}__target{depth or ''}"
+
+
+def _count_expression(
+    projection: Optional["ColumnRef"],
+    distinct: bool,
+    row_spec: ObjectTypeSpec,
+    dialect: Dialect,
+    treeid: Optional[int],
+) -> Tuple[str, list]:
+    """What a count subquery selects: `COUNT(*)`, or for a projected count
+    (`len([f.father for f in ...])`) `COUNT([DISTINCT ]NULLIF(<field>,
+    ''))`. `COUNT(x)` skips NULLs on its own, and `NULLIF` makes an empty
+    string count as missing too -- "the fathers of these families" leaves
+    out the families with no father, whether that's stored as null or "".
+    PostgreSQL compares as text so a number or True/False field can't make
+    `NULLIF(..., '')` fail; `row_spec` is the spec the projection resolves
+    against, already carrying the subquery row's alias."""
+    if projection is None:
+        return "COUNT(*)", []
+    sql, params = _render_column(projection, row_spec, dialect, None, treeid)
+    if dialect == Dialect.POSTGRESQL:
+        sql = f"CAST({sql} AS TEXT)"
+    keyword = "DISTINCT " if distinct else ""
+    return f"COUNT({keyword}NULLIF({sql}, ''))", params
+
+
 def _render_collection_count(
     count: "CollectionCount",
     outer_spec: ObjectTypeSpec,
@@ -2627,9 +2687,13 @@ def _render_collection_count(
 ) -> Tuple[str, list]:
     """`(SELECT COUNT(*) FROM <body>)` -- `CollectionCount`'s rendering,
     dispatched from `_render_column` the same way `RelatedObject`/`JsonPath`
-    dispatch to their own renderers.
+    dispatch to their own renderers. A projected count selects
+    `_count_expression` instead of `COUNT(*)`, its field read from the same
+    aliased row the condition is.
     """
     if isinstance(count.collection, Backlinks):
+        if count.projection is not None:
+            raise QueryError("can't count a field of backlinks")
         body, params = _backlinks_subquery_body(_sql_table(outer_spec), count.condition, treeid)
         return f"(SELECT COUNT(*) FROM {body})", params
     if dialect is None:
@@ -2637,10 +2701,18 @@ def _render_collection_count(
             f"a dialect is required to compile count({count.collection.name!r}, ...), "
             "but none was given"
         )
+    row_spec = replace(
+        count.collection.target,
+        sql_alias=_collection_target_alias(count.collection, outer_spec),
+        collection_depth=outer_spec.collection_depth + 1,
+    )
+    select, select_params = _count_expression(
+        count.projection, count.distinct, row_spec, dialect, treeid
+    )
     body, params = _collection_subquery_body(
         count.collection, outer_spec, count.condition, dialect, treeid
     )
-    return f"(SELECT COUNT(*) FROM {body})", params
+    return f"(SELECT {select} FROM {body})", select_params + params
 
 
 def _resolve_array_location(
@@ -2815,10 +2887,13 @@ def _render_json_array_count(
             "a dialect is required to compile len(..., condition) over a JSON "
             "array, but none was given"
         )
+    select, select_params = _count_expression(
+        count.projection, count.distinct, count.element_spec, dialect, treeid
+    )
     body, params = _json_array_subquery_body(
         count.array, count.condition, count.element_spec, outer_spec, dialect, treeid
     )
-    return f"(SELECT COUNT(*) FROM {body})", params
+    return f"(SELECT {select} FROM {body})", select_params + params
 
 
 def _is_date_object(spec: ObjectTypeSpec, segments: Sequence[Union[str, int]]) -> bool:

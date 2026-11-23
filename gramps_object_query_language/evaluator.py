@@ -59,6 +59,7 @@ p99 latency -- see `object_query.py`'s dispatch.
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from collections import OrderedDict
@@ -495,11 +496,36 @@ def _collection_count(reader: RecordReader, data: Any, count: CollectionCount) -
     """
     if isinstance(count.collection, Backlinks):
         return sum(1 for _ in _backlink_handles(reader, data, count.condition))
-    return sum(
-        1
+    rows = [
+        (row, row_spec)
         for row, row_spec in _collection_rows(reader, data, count.collection)
         if count.condition is None or _matches(reader, row, count.condition, row_spec)
+    ]
+    if count.projection is None:
+        return len(rows)
+    return _count_values(
+        [_resolve(reader, row, count.projection, row_spec) for row, row_spec in rows],
+        count.distinct,
     )
+
+
+def _count_values(values: list, distinct: bool) -> int:
+    """A projected count (`len([f.father for f in ...])`, with `distinct`
+    `len(distinct([...]))`) -- the counterpart to query.py's
+    `_count_expression`: a missing value (None, or "" -- SQL's
+    `NULLIF(x, '')`) isn't counted, and `distinct` counts each value once."""
+    present = [value for value in values if value is not None and value != ""]
+    if not distinct:
+        return len(present)
+    return len({_distinct_key(value) for value in present})
+
+
+def _distinct_key(value: Any) -> Any:
+    """`value` made hashable for `distinct`, the way the SQL compares it
+    (a list or object as its JSON text)."""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, sort_keys=True)
+    return value
 
 
 def _collection_rows(
@@ -562,9 +588,14 @@ def _json_array_count(reader: RecordReader, data: Any, count: "JsonArrayCount", 
     `_collection_count` evaluates a related row against `collection.target`.
     """
     items = _json_array_items(reader, data, count.array, spec)
-    if count.condition is None:
+    if count.condition is not None:
+        items = [item for item in items if _matches(reader, item, count.condition, count.element_spec)]
+    if count.projection is None:
         return len(items)
-    return sum(1 for item in items if _matches(reader, item, count.condition, count.element_spec))
+    return _count_values(
+        [_resolve(reader, item, count.projection, count.element_spec) for item in items],
+        count.distinct,
+    )
 
 
 def _arithmetic(reader: RecordReader, data: Any, arithmetic: Arithmetic, spec: ObjectTypeSpec) -> Any:

@@ -507,6 +507,43 @@ verbatim, just wrapped as `(SELECT COUNT(*) FROM ...)` instead of
 at all) is `0`, not `NULL`, the same way `COUNT(*)` over zero matching rows
 always is in SQL.
 
+### Counting a field, and different values: `distinct([...])`
+
+The list can also collect a field of each entry. `len(...)` then counts
+the entries where that field is filled in, and `distinct(...)` around the
+list counts each different value once:
+
+```python
+Person "len(distinct([e.place for e in events])) > 1"
+```
+
+"People whose events happened in more than one place." A relationship on
+its own (`e.place`, `f.father`) means the record it points to, so two
+events at the same place count once; a field further along
+(`e.place.title`) compares that text instead.
+
+A list of fields leaves out the entries where the field is empty:
+`[f.father for f in parent_families]` is "the fathers of these families,"
+so a family with no father recorded isn't in it. That makes the two
+counts comparable -- "more than one father," and "a father recorded in
+more than one of this person's parent families" (often a duplicate family):
+
+```python
+Person "len(distinct([f.father for f in parent_families])) > 1"
+Person "len([f.father for f in parent_families]) > len(distinct([f.father for f in parent_families]))"
+```
+
+As a [column](#selecting-values-the-same-paths-in-select),
+`len(distinct([f.father for f in parent_families])) - 1 as other_fathers`
+shows how many fathers a person has besides one (`-1` when no father is
+recorded at all).
+
+`distinct([...])` needs a field to compare (`[f.father for f in ...]`, not
+`[f for f in ...]`), the field must hold one value (a date's `sortval`,
+not the whole date), and so far it can only be counted -- it always sits
+inside `len(...)`. In SQL it is `COUNT(DISTINCT ...)` in place of
+`COUNT(*)`.
+
 ## Array length: `len(path)`
 
 The collections above are lists of handles reaching into another table
@@ -647,7 +684,11 @@ Python itself:
   `x` (`any(x for x in rel)`) has none. An `if` on the generator adds to
   it (`any(x for x in rel if x.a == 1)` is `any(x.a == 1 for x in rel)`).
 - `len([x for x in <list> if <condition>])` -- counts by the `if`; what it
-  collects must be `x` itself or a plain literal (`[1 for x in ...]`).
+  collects is `x` itself, a plain literal (`[1 for x in ...]`), or a field
+  of `x` (`[x.f for x in ...]`: only the entries where it's filled in).
+- `len(distinct([x.f for x in <list> if <condition>]))` -- how many
+  different values of the field, see
+  [Counting a field](#counting-a-field-and-different-values-distinct).
 - `[x.<path> for x in <list> if <condition>][n]` -- one matching entry,
   see [One entry chosen by a condition](#one-entry-chosen-by-a-condition-0).
 - Only one `for` clause, and the loop variable is a plain name (no
@@ -1195,8 +1236,8 @@ changes.
   [Comprehension rules](#comprehension-rules) and
   [One entry chosen by a condition](#one-entry-chosen-by-a-condition-0)
   above), but only in exactly those shapes: every other comprehension form
-  (a bare list/set/dict comprehension not wrapped in `any(...)`/`len(...)`
-  or indexed,
+  (a bare list/set/dict comprehension not wrapped in `any(...)`/`len(...)`/
+  `distinct(...)` or indexed,
   more than one `for` clause, a tuple-unpacking loop target, `all(...)`/
   `sum(...)`, ...) is rejected the same as any other unrecognized node.
 - A collection reached through a relationship hop -- `any(n for n in
