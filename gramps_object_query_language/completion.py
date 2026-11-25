@@ -46,8 +46,11 @@ rarely parses -- it only looks at the dotted path ending at the cursor:
   (`primary_name.surname_list[0].` -> a Surname's fields). A comprehension
   variable starts from what it iterates over (`e.` in `any(... for e in
   events)` -> an Event's names).
-- Inside a string literal, or after anything the walk can't follow:
-  nothing.
+- A Gramps type compared with a value (`type ==`, `type in [`): `"`, and
+  inside that string the type's names, matched ignoring case
+  (`type == "cen` -> `Census"`).
+- Inside any other string literal, or after anything the walk can't
+  follow: nothing.
 
 All the logic runs over `vocabulary.vocabularies()`'s plain JSON data
 (`complete_from_vocabularies`), so a client without Python can load that
@@ -272,21 +275,22 @@ def _expected(text: str) -> Tuple[str, bool]:
     return "nothing", comprehension
 
 
-def _in_string(text: str) -> bool:
-    """Whether `text` ends inside an unterminated `'...'`/`"..."` literal."""
-    quote = None
+def _string_start(text: str) -> Optional[int]:
+    """Where the unterminated `'...'`/`"..."` literal `text` ends inside
+    begins (the offset of its opening quote), or `None`."""
+    start = None
     escaped = False
-    for char in text:
-        if quote is None:
+    for position, char in enumerate(text):
+        if start is None:
             if char in "'\"":
-                quote = char
+                start = position
         elif escaped:
             escaped = False
         elif char == "\\":
             escaped = True
-        elif char == quote:
-            quote = None
-    return quote is not None
+        elif char == text[start]:
+            start = None
+    return start
 
 
 def _segments(chain: str) -> List[Tuple[str, int]]:
@@ -542,9 +546,12 @@ def complete_from_vocabularies(
     `column`, `field`, `relationship`, `collection`, `keyword`,
     `function`, `operator`, `constant_class`, `constant`, `env`,
     `variable`, `punctuation` (`"` to start a string, `[` to start a
-    list), `index` (`0` inside a list field's `[`); `detail` is a field's JSON type, a relationship's or
+    list), `index` (`0` inside a list field's `[`), `type_name` (a Gramps
+    type's name inside the string it's compared with, `type == "Cen` ->
+    `Census"`, closing quote included unless already there); `detail` is a
+    field's JSON type, a relationship's or
     collection's target namespace, `"text"`/`"list"` for punctuation,
-    `"first item"` for an index, or `None`.
+    `"first item"` for an index, the type class for a type name, or `None`.
 
     A name typed out in full that can go on comes back with what
     continues it -- `primary_name.date` gives `date.`, `dateval` gives
@@ -553,9 +560,11 @@ def complete_from_vocabularies(
     the user guessing at the next character.
     """
     before = source[:cursor]
-    if _in_string(before):
-        return []
     vocab = vocabs[namespace]
+    opened = _string_start(before)
+    if opened is not None:
+        # Inside a string: only a type's name (`type == "Cen`), else nothing.
+        return _type_name_results(vocabs, namespace, source, cursor, opened)
     env = list(env)
     # `Env` is offered only where the caller will supply values for it.
     env_names = [(vocab["env"], "env", None)] if env else []
@@ -615,7 +624,11 @@ def complete_from_vocabularies(
             else None
         )
         compared_type = None if compared is None else compared.get("type")
-        if compared is not None and compared.get("constants"):
+        if compared is not None and compared.get("type_names") and not prefix:
+            # A Gramps type (`type ==`, `type in [`) is compared with its
+            # name: a string, whose names come once it's opened.
+            candidates = [('"', "punctuation", "text")] + env_names
+        elif compared is not None and compared.get("constants"):
             # The field compared with holds one class's constants
             # (`type.value ==` -> `EventType.`): offer just that class.
             candidates = [(compared["constants"]["class"] + ".", "constant_class", None)] + env_names
@@ -737,6 +750,33 @@ def complete_from_vocabularies(
                 candidates = []
 
     return _results(candidates, prefix, start, bindings, env)
+
+
+def _type_name_results(
+    vocabs: Dict[str, Any], namespace: str, source: str, cursor: int, opened: int
+) -> List[Dict[str, Any]]:
+    """Inside the string opened at `opened`: the names of the Gramps type
+    it's compared with (`type == "Cen` -> `Census"`), matched ignoring case
+    the way GOQL matches them, each closing the string unless the quote is
+    already there. Nothing when the string isn't a type's value."""
+    before = source[:cursor]
+    if _expected(before[:opened])[0] not in ("value", "literal"):
+        return []
+    bindings = _bindings(vocabs, namespace, source)
+    compared = _compared_field(vocabs, namespace, before[:opened], bindings)
+    class_name = None if compared is None else compared.get("type_names")
+    if class_name is None:
+        return []
+    quote = source[opened]
+    closing = "" if source[cursor : cursor + 1] == quote else quote
+    typed = before[opened + 1 :].casefold()
+    results = [
+        {"name": name + closing, "kind": "type_name", "detail": class_name, "start": opened + 1}
+        for name in vocabs[namespace]["type_names"][class_name]
+        if name.casefold().startswith(typed)
+    ]
+    results.sort(key=lambda item: (item["name"].lower(), item["name"]))
+    return results
 
 
 def _results(

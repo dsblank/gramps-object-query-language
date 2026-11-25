@@ -2143,6 +2143,18 @@ def _gramps_type_at(column: ColumnRef, spec: ObjectTypeSpec) -> Optional[type]:
     return cls
 
 
+def type_names(cls: type) -> List[str]:
+    """The English names of Gramps type class `cls`'s built-in types, in
+    value order -- what `type == '...'` accepts besides a custom name, and
+    what completion offers there. "Custom" itself is left out: it names no
+    type of its own."""
+    return [
+        name
+        for name, value in sorted(cls._E2IMAP.items(), key=lambda item: item[1])
+        if name and value != cls._CUSTOM
+    ]
+
+
 def _type_name_value(cls: type, name: str) -> Optional[int]:
     """The built-in value `name` names on Gramps type class `cls` -- its
     English name (the one Gramps writes to XML, the same in every language)

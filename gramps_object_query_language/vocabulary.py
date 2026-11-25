@@ -48,7 +48,9 @@ from .query import (
     _RELATIONSHIPS,
     _schema_properties,
 )
-from .query_lang import ENV_NAME, _CONSTANTS, _NAMES, resolve_namespace
+from gramps.gen.lib.grampstype import GrampsType
+
+from .query_lang import ENV_NAME, _CONSTANT_CLASSES, _CONSTANTS, _NAMES, resolve_namespace, type_names
 
 
 def _value_constants(owner: Any, field: str) -> Any:
@@ -74,7 +76,7 @@ OPERATORS = ("==", "!=", "<", "<=", ">", ">=")
 
 #: Bumped whenever the shape of `vocabulary()`'s result changes, so a client
 #: holding a saved copy can tell it needs regenerating.
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
 
 #: Fields whose integer value is one of a class's `ClassName.CONST`
 #: constants, keyed by `(owning class, field)` -- the owning class being the
@@ -127,10 +129,23 @@ def _field_tree(schema: Dict[str, Any]) -> Dict[str, Any]:
     return fields
 
 
+#: The Gramps type classes (`EventType`, `FamilyRelType`, ...): an object
+#: field holding one can be compared with a name, `type == 'Census'`.
+_TYPE_CLASSES = {
+    name: cls
+    for name, cls in _CONSTANT_CLASSES.items()
+    if isinstance(cls, type) and issubclass(cls, GrampsType)
+}
+
+
 def _field_node(schema: Dict[str, Any]) -> Dict[str, Any]:
     node: Dict[str, Any] = {"type": schema.get("type")}
     if schema.get("properties"):
         node["fields"] = _field_tree(schema)
+        owner = (_schema_properties(schema).get("_class", {}).get("enum") or [None])[0]
+        if owner in _TYPE_CLASSES:
+            # `type == 'Census'`: the names are in `vocabulary()["type_names"]`.
+            node["type_names"] = owner
     items = schema.get("items")
     if isinstance(items, dict):
         node["items"] = _field_node(items)
@@ -165,6 +180,9 @@ def vocabulary(namespace: str) -> Dict[str, Any]:
       lists usable in `any`/`exists`/`count`/`len`.
     - `keywords`, `functions`, `operators`: the fixed grammar tokens.
     - `constants`: `{ClassName: [CONST, ...]}` for `ClassName.CONST` values.
+    - `type_names`: `{ClassName: [name, ...]}`, each Gramps type class's
+      built-in type names (English), which a field whose node carries
+      `"type_names": ClassName` can be compared with (`type == 'Census'`).
     - `env`: the name callers' `Env.NAME` values are written under.
 
     Raises `QueryLangError` for an unknown namespace.
@@ -195,6 +213,7 @@ def vocabulary(namespace: str) -> Dict[str, Any]:
         "functions": list(FUNCTIONS),
         "operators": list(OPERATORS),
         "constants": {name: sorted(values) for name, values in sorted(_CONSTANTS.items())},
+        "type_names": {name: type_names(cls) for name, cls in sorted(_TYPE_CLASSES.items())},
         "env": ENV_NAME,
     }
 
