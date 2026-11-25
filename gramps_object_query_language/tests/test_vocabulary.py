@@ -167,3 +167,47 @@ def test_column_types_match_the_spec(namespace):
             assert column_type == "boolean"
         else:
             assert column_type == "integer"
+
+
+def _type_name_fields(fields, prefix=()):
+    """`(path, class name)` for every field holding a Gramps type object."""
+    for name, node in fields.items():
+        path = prefix + (name,)
+        if "type_names" in node:
+            yield path, node["type_names"]
+        while "items" in node:
+            path = path + (0,)
+            node = node["items"]
+        yield from _type_name_fields(node.get("fields", {}), path)
+
+
+@pytest.mark.parametrize("namespace", NAMESPACES)
+def test_type_names_compile_to_their_built_in_value(namespace):
+    """Every name completion offers for a type field is one GOQL reads as
+    that built-in type -- `value == <its number>`, never a custom type."""
+    from gramps_object_query_language.query import Eq
+    from gramps_object_query_language.query_lang import _CONSTANT_CLASSES, compile_expr
+
+    vocab = vocabulary(namespace)
+    found = list(_type_name_fields(vocab["fields"]))
+    assert found or namespace == "Tag"  # a tag has no typed fields
+    for path, class_name in found:
+        cls = _CONSTANT_CLASSES[class_name]
+        text = "".join(f"[{p}]" if isinstance(p, int) else f".{p}" for p in path).lstrip(".")
+        names = vocab["type_names"][class_name]
+        assert names, class_name
+        for name in names:
+            _spec, where = compile_expr(namespace, f"{text} == {name!r}")
+            assert isinstance(where, Eq), (path, name)
+            assert where.value == cls._E2IMAP[name] != cls._CUSTOM, (path, name)
+
+
+def test_type_names_mark_the_known_fields():
+    event = vocabulary("Event")
+    assert event["fields"]["type"]["type_names"] == "EventType"
+    assert "Census" in event["type_names"]["EventType"]
+    assert "Custom" not in event["type_names"]["EventType"]
+    family = vocabulary("Family")["fields"]
+    assert family["type"]["type_names"] == "FamilyRelType"
+    assert family["child_ref_list"]["items"]["fields"]["frel"]["type_names"] == "ChildRefType"
+    assert "type_names" not in family["type"]["fields"]["value"]
