@@ -870,7 +870,44 @@ Person "primary_name.type.value == NameType.BIRTH"
 These cover Gramps' built-in, fixed values for each type -- not a
 tree's own custom type values (e.g. a `PlaceType` of "Ranch" someone typed
 in), which have no fixed constant to name; only `.CUSTOM` identifies "this
-is a custom one," not which.
+is a custom one," not which. For those, and as a shorter way to write the
+built-in ones, compare the type itself with its name:
+
+### Type names
+
+A Gramps type object (anything stored as `{"_class": "EventType", "value":
+..., "string": ...}`) can be compared with `==`, `!=`, `in` and `not in`
+against names (or plain numbers), and the comparison is rewritten into the
+fields it is stored as before the query runs:
+
+```python
+Event "type == 'Census'"                  # type.value == EventType.CENSUS
+Event "type in ['Birth', 'Baptism']"      # type.value in [12, 15]
+Event "type == 'Tax list'"                # type.value == EventType.CUSTOM and type.string == 'Tax list'
+Family "type == 'Handfasting'"            # type.value == FamilyRelType.CUSTOM (4) and type.string == ...
+Family "any(c.frel == 'Adopted' for c in child_ref_list)"
+Person "birth.type == 'Birth'"
+Person "any(r.role == 'Primary' for r in event_ref_list)"
+```
+
+A name is looked up on the type's own class, in this order:
+
+1. Gramps' English name for a built-in type (the one Gramps writes to its
+   XML files, the same in every language), ignoring case;
+2. the built-in type's name in the language Gramps is running in, ignoring
+   case;
+3. otherwise it is a custom type's name: `value` is that class's `CUSTOM`
+   number and `string` is exactly the name. The `CUSTOM` number is read off
+   the class, since it isn't the same for all of them (`FamilyRelType` uses
+   4, `ChildRefType` 7, most others 0). `StyledTextTagType` has no custom
+   types, so an unknown name there is an error.
+
+A custom type can't share a built-in type's name: Gramps itself turns
+"Census" typed into a type into the built-in Census. `type is None` and
+the fields themselves (`type.value`, `type.string`) are left as written.
+The same rewrite applies to a `where` JSON body passed to
+`where_list_to_ast`, so `{"column": "type", "op": "eq", "value": "Census"}`
+works there too.
 
 ## Values passed in: `Env`
 

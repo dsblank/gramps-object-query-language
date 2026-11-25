@@ -137,6 +137,7 @@ from gramps.gen.lib import (
     StyledTextTagType,
     UrlType,
 )
+from gramps.gen.lib.grampstype import GrampsType
 
 from .query import (
     CITATION,
@@ -189,6 +190,8 @@ from .query import (
     resolve_column_path,
     resolve_length_path,
     resolve_ref_string,
+    _schema_properties,
+    walk_schema,
 )
 
 # Namespace -> ObjectTypeSpec. Both the lowercase form and the actual Gramps
@@ -225,9 +228,10 @@ _NAMESPACES: dict[str, ObjectTypeSpec] = {
 # doesn't care which; that distinction is entirely in how the *path* side of
 # the comparison resolves (`resolve_column_path`).
 #
-# Deliberately still not covering arbitrary user-defined custom type values
-# (a `PlaceType` of "Ranch", say) -- those have no fixed constant to name in
-# the first place, only ever a per-tree string paired with `.CUSTOM`.
+# User-defined custom type values (a `PlaceType` of "Ranch", say) have no
+# fixed constant to name -- only a per-tree string paired with `.CUSTOM` --
+# so they're reached by comparing the type itself with a name instead
+# (`type == 'Ranch'`), see `_type_name_condition`.
 _CONSTANT_CLASSES: dict[str, type] = {
     "Person": Person,
     "Citation": Citation,
@@ -2120,11 +2124,104 @@ def _check_number_vs_field(column: ColumnRef, value: ColumnRef, spec: ObjectType
                 )
 
 
+def _gramps_type_at(column: ColumnRef, spec: ObjectTypeSpec) -> Optional[type]:
+    """The Gramps type class (`EventType`, `FamilyRelType`, ...) whose
+    `{"_class", "value", "string"}` object `column` lands on, or `None` when
+    it lands on anything else."""
+    while isinstance(column, RelatedObject):
+        spec, column = column.target, column.field
+    if not isinstance(column, JsonPath):
+        return None
+    try:
+        schema = walk_schema(spec, column.segments)
+    except QueryError:
+        return None
+    class_name = (_schema_properties(schema).get("_class", {}).get("enum") or [None])[0]
+    cls = _CONSTANT_CLASSES.get(class_name)
+    if cls is None or not issubclass(cls, GrampsType):
+        return None
+    return cls
+
+
+def _type_name_value(cls: type, name: str) -> Optional[int]:
+    """The built-in value `name` names on Gramps type class `cls` -- its
+    English name (the one Gramps writes to XML, the same in every language)
+    first, then its name in the Gramps locale in use, both ignoring case --
+    or `None` when it names no built-in type (so is a custom type's name)."""
+    folded = name.casefold()
+    for names in (cls._E2IMAP, cls._S2IMAP):
+        for known, value in names.items():
+            if known.casefold() == folded and value != cls._CUSTOM:
+                return value
+    return None
+
+
+def _type_name_condition(condition: dict, cls: type) -> Optional[dict]:
+    """`type == "Census"` (or `!=`, `in [...]`, or a plain number) against a
+    whole Gramps type object, rewritten as a test of the fields it's stored
+    as: `type.value == EventType.CENSUS` for a built-in name, `type.value ==
+    EventType.CUSTOM and type.string == "Tax list"` for any other name (a
+    custom type). Which number means "custom" differs between classes
+    (`FamilyRelType.CUSTOM` is 4, `ChildRefType.CUSTOM` is 7), so it is read
+    off `cls`. `None` when the condition isn't one of those shapes, so it is
+    left as written."""
+    op = condition["op"]
+    column = condition["column"]
+    if op not in ("eq", "ne", "in") or "value_column" in condition:
+        return None
+    if isinstance(column, str):
+        def field(name: str) -> Union[str, dict]:
+            return f"{column}.{name}"
+    elif set(column) == {"json_path"}:
+        def field(name: str) -> Union[str, dict]:
+            return {"json_path": [*column["json_path"], name]}
+    else:
+        return None
+    values = condition["value"] if op == "in" else [condition["value"]]
+    if any(value is None for value in values):
+        return None
+    numbers: List[int] = []
+    custom: List[str] = []
+    for value in values:
+        if isinstance(value, int) and not isinstance(value, bool):
+            numbers.append(value)
+        elif isinstance(value, str):
+            number = _type_name_value(cls, value)
+            if number is not None:
+                numbers.append(number)
+            elif cls._CUSTOM < 0:
+                raise QueryError(f"{value!r} is not a {cls.__name__} name")
+            else:
+                custom.append(value)
+        else:
+            raise QueryError(f"cannot compare a {cls.__name__} with {value!r} ({type(value).__name__})")
+    parts: List[dict] = []
+    if numbers:
+        if len(numbers) == 1:
+            parts.append({"column": field("value"), "op": "eq", "value": numbers[0]})
+        else:
+            parts.append({"column": field("value"), "op": "in", "value": numbers})
+    if custom:
+        string_test = (
+            {"column": field("string"), "op": "eq", "value": custom[0]}
+            if len(custom) == 1
+            else {"column": field("string"), "op": "in", "value": custom}
+        )
+        parts.append({"and": [{"column": field("value"), "op": "eq", "value": cls._CUSTOM}, string_test]})
+    node = parts[0] if len(parts) == 1 else {"or": parts}
+    return {"not": node} if op == "ne" else node
+
+
 def _condition_from_json(condition: dict, spec: ObjectTypeSpec) -> Any:
     """One `parse_expr`-shaped condition dict, translated to a `query.py`
     comparison object (`Eq`, `Lt`, `In`, `Like`, `Regex`, `Contains`, ...)."""
     column = json_column_to_ref(condition["column"], spec)
     op = condition["op"]
+    type_cls = _gramps_type_at(column, spec)
+    if type_cls is not None:
+        rewritten = _type_name_condition(condition, type_cls)
+        if rewritten is not None:
+            return _node_from_json(rewritten, spec)
     if op in _OP_CLASSES and "value_column" not in condition:
         _check_literal_kind(column, condition["value"], spec)
     if op == "in":

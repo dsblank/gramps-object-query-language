@@ -2925,3 +2925,72 @@ def test_attribute_lookup_has_the_long_forms_limits(short, long):
         return str(error.value).split(":")[0]
 
     assert message(short) == message(long)
+
+
+def test_type_name_compiles_to_value():
+    from gramps.gen.lib import EventType
+
+    from gramps_object_query_language.query import EVENT, Eq, JsonPath
+    from gramps_object_query_language.query_lang import compile_expr_for_spec
+
+    assert compile_expr_for_spec(EVENT, "type == 'Census'") == Eq(
+        JsonPath(("type", "value")), EventType.CENSUS
+    )
+    # the same as writing the constant
+    assert compile_expr_for_spec(EVENT, "type == 'Census'") == compile_expr_for_spec(
+        EVENT, "type.value == EventType.CENSUS"
+    )
+
+
+def test_type_name_custom_uses_each_class_custom_number():
+    from gramps.gen.lib import ChildRefType, FamilyRelType
+
+    from gramps_object_query_language.query import FAMILY, And, Eq, JsonArrayExists, JsonPath
+    from gramps_object_query_language.query_lang import compile_expr_for_spec
+
+    assert FamilyRelType.CUSTOM == 4 and ChildRefType.CUSTOM == 7
+    where = compile_expr_for_spec(FAMILY, "type == 'Handfasting'")
+    assert isinstance(where, And) and list(where.exprs) == [
+        Eq(JsonPath(("type", "value")), FamilyRelType.CUSTOM),
+        Eq(JsonPath(("type", "string")), "Handfasting"),
+    ]
+    where = compile_expr_for_spec(FAMILY, "any(c.frel == 'Foster care' for c in child_ref_list)")
+    assert isinstance(where, JsonArrayExists)
+    assert where.condition.exprs[0].value == ChildRefType.CUSTOM
+
+
+def test_type_name_from_where_json():
+    """A raw `where` body (what gramps-web-api passes to
+    `where_list_to_ast`) gets the same rewrite, plain-string column too."""
+    from gramps.gen.lib import EventType
+
+    from gramps_object_query_language.query import EVENT, Eq, In, JsonPath
+    from gramps_object_query_language.query_lang import where_list_to_ast
+
+    assert where_list_to_ast(
+        [{"column": {"json_path": ["type"]}, "op": "eq", "value": "Census"}], EVENT
+    ) == Eq(JsonPath(("type", "value")), EventType.CENSUS)
+    assert where_list_to_ast(
+        [{"column": "type", "op": "in", "value": ["Birth", "Death"]}], EVENT
+    ) == In(JsonPath(("type", "value")), [EventType.BIRTH, EventType.DEATH])
+
+
+def test_type_name_errors():
+    from gramps_object_query_language.query import EVENT, QueryError
+    from gramps_object_query_language.query_lang import compile_expr_for_spec
+
+    with pytest.raises(QueryError, match="cannot compare a EventType with 1.5"):
+        compile_expr_for_spec(EVENT, "type == 1.5")
+    with pytest.raises(QueryError, match="cannot compare a EventType with True"):
+        compile_expr_for_spec(EVENT, "type in ['Birth', True]")
+
+
+def test_type_name_leaves_other_shapes_alone():
+    from gramps_object_query_language.query import EVENT, Eq, JsonPath
+    from gramps_object_query_language.query_lang import compile_expr_for_spec
+
+    # `is None` still tests the whole object; the fields themselves unchanged
+    assert compile_expr_for_spec(EVENT, "type is None") == Eq(JsonPath(("type",)), None)
+    assert compile_expr_for_spec(EVENT, "type.string == 'Tax list'") == Eq(
+        JsonPath(("type", "string")), "Tax list"
+    )

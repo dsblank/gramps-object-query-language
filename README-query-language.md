@@ -688,6 +688,22 @@ with `len(backlinks)` (which works exactly like `len(...)` above),
 `len(backlinks) > 1` is another way to ask "is this note shared by more
 than one record."
 
+### Goal: Find every census, and every event of a type you made up yourself
+
+```
+Event "type == 'Census'"
+Event "type in ['Census', 'Tax list']"
+Person "any(e.type == 'Burial' for e in events)"
+```
+
+A type -- an event's type, a family's relationship type, a child's
+relationship to its parents, and so on -- can be compared with its name.
+Gramps' own types match by their English name or by their name in the
+language Gramps is running in, ignoring case (`'census'` works too). Any
+other name means a custom type someone typed in, like "Tax list", and
+matches only that exact text. `type == 'Census'` is the same query as
+`type.value == EventType.CENSUS`, and runs just as fast.
+
 ## Things GOQL can't do (yet)
 
 - Anything beyond the patterns shown above -- this is a small, fixed set of

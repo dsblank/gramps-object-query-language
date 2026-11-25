@@ -3032,3 +3032,126 @@ def test_distinct_count_as_a_filter(distinct_db, pg_conn):
         "len([f.father for f in parent_families]) > len(distinct([f.father for f in parent_families]))",
         {"same_father"}, pg_conn,
     )
+
+
+# --- a Gramps type compared with its name ------------------------------------
+
+
+@pytest.fixture(scope="module")
+def type_names_db():
+    """Events, families and people whose types are built-in or custom, for
+    `type == "Census"`-style comparisons. `FamilyRelType.CUSTOM` (4) and
+    `ChildRefType.CUSTOM` (7) aren't 0 like most classes' -- the custom
+    cases here would miss if that number were hardcoded."""
+    from gramps.gen.lib import FamilyRelType
+
+    dbman = CLIDbManager(DbState())
+    dirpath, db_name = dbman.create_new_db_cli("_test_evaluator_type_names", dbid="sqlite")
+    db = make_database("sqlite")
+    db.load(dirpath)
+    handles = {}
+    with DbTxn("setup", db) as trans:
+        for key, event_type in (
+            ("e_census", EventType.CENSUS),
+            ("e_birth", EventType.BIRTH),
+            ("e_baptism", EventType.BAPTISM),
+            ("e_tax", (EventType.CUSTOM, "Tax list")),
+            ("e_muster", (EventType.CUSTOM, "Muster roll")),
+        ):
+            event = Event()
+            event.set_type(event_type)
+            event.set_gramps_id(key)
+            handles[key] = db.add_event(event, trans)
+
+        child = Person()
+        child.set_primary_name(_name("Kid", "Smith"))
+        birth_ref = _event_ref(handles["e_birth"])
+        child.add_event_ref(birth_ref)
+        child.set_birth_ref(birth_ref)
+        handles["p_kid"] = db.add_person(child, trans)
+        other = Person()
+        other.set_primary_name(_name("Other", "Smith"))
+        other.add_event_ref(_event_ref(handles["e_census"]))
+        handles["p_other"] = db.add_person(other, trans)
+
+        for key, rel_type, frel in (
+            ("f_married", FamilyRelType.MARRIED, ChildRefType.BIRTH),
+            ("f_handfast", (FamilyRelType.CUSTOM, "Handfasting"), ChildRefType.ADOPTED),
+            ("f_foster", FamilyRelType.UNKNOWN, (ChildRefType.CUSTOM, "Kinship care")),
+        ):
+            family = Family()
+            family.set_relationship(FamilyRelType(rel_type))
+            ref = ChildRef()
+            ref.set_reference_handle(handles["p_kid"])
+            ref.set_father_relation(ChildRefType(frel))
+            family.add_child_ref(ref)
+            handles[key] = db.add_family(family, trans)
+    yield db, handles
+    db.close()
+    dbman.remove_database(db_name)
+
+
+_TYPE_NAME_EVENTS = ("e_census", "e_birth", "e_baptism", "e_tax", "e_muster")
+
+
+@pytest.mark.parametrize(
+    "where_expr, expected",
+    [
+        ("type == 'Census'", {"e_census"}),
+        ("type == 'census'", {"e_census"}),
+        ("'Census' == type", {"e_census"}),
+        ("type is 'Census'", {"e_census"}),
+        ("type == 21", {"e_census"}),
+        ("type != 'Census'", {"e_birth", "e_baptism", "e_tax", "e_muster"}),
+        ("type is not 'Census'", {"e_birth", "e_baptism", "e_tax", "e_muster"}),
+        ("type in ['Birth', 'Baptism']", {"e_birth", "e_baptism"}),
+        ("type not in ['Birth', 'Baptism']", {"e_census", "e_tax", "e_muster"}),
+        # custom names: value == EventType.CUSTOM and string == the name
+        ("type == 'Tax list'", {"e_tax"}),
+        ("type != 'Tax list'", {"e_census", "e_birth", "e_baptism", "e_muster"}),
+        ("type in ['Tax list', 'Muster roll']", {"e_tax", "e_muster"}),
+        ("type in ['Census', 'Tax list']", {"e_census", "e_tax"}),
+        ("type not in ['Census', 'Tax list']", {"e_birth", "e_baptism", "e_muster"}),
+        ("type == 'No such type'", set()),
+        ("type == 'Census' or type == 'Tax list'", {"e_census", "e_tax"}),
+    ],
+)
+def test_type_name_events(type_names_db, pg_conn, where_expr, expected):
+    db, handles = type_names_db
+    _assert_sql_and_evaluator_agree(
+        db, handles, EVENT, _TYPE_NAME_EVENTS, where_expr, expected, pg_conn
+    )
+
+
+@pytest.mark.parametrize(
+    "where_expr, expected",
+    [
+        ("type == 'Married'", {"f_married"}),
+        ("type == 'Handfasting'", {"f_handfast"}),
+        ("type in ['Married', 'Handfasting']", {"f_married", "f_handfast"}),
+        ("any(c.frel == 'Adopted' for c in child_ref_list)", {"f_handfast"}),
+        ("any(c.frel == 'Kinship care' for c in child_ref_list)", {"f_foster"}),
+        ("any(c.frel in ['Birth', 'Kinship care'] for c in child_ref_list)", {"f_married", "f_foster"}),
+    ],
+)
+def test_type_name_families(type_names_db, pg_conn, where_expr, expected):
+    db, handles = type_names_db
+    _assert_sql_and_evaluator_agree(
+        db, handles, FAMILY, ("f_married", "f_handfast", "f_foster"), where_expr, expected, pg_conn
+    )
+
+
+@pytest.mark.parametrize(
+    "where_expr, expected",
+    [
+        ("birth.type == 'Birth'", {"p_kid"}),
+        ("any(r.role == 'Primary' for r in event_ref_list)", {"p_kid", "p_other"}),
+        ("any(e.type == 'Census' for e in events)", {"p_other"}),
+        ("primary_name.type == 'Birth Name'", {"p_kid", "p_other"}),
+    ],
+)
+def test_type_name_people(type_names_db, pg_conn, where_expr, expected):
+    db, handles = type_names_db
+    _assert_sql_and_evaluator_agree(
+        db, handles, PERSON, ("p_kid", "p_other"), where_expr, expected, pg_conn
+    )
