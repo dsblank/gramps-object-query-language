@@ -76,7 +76,7 @@ OPERATORS = ("==", "!=", "<", "<=", ">", ">=")
 
 #: Bumped whenever the shape of `vocabulary()`'s result changes, so a client
 #: holding a saved copy can tell it needs regenerating.
-FORMAT_VERSION = 4
+FORMAT_VERSION = 5
 
 #: Fields whose integer value is one of a class's `ClassName.CONST`
 #: constants, keyed by `(owning class, field)` -- the owning class being the
@@ -162,6 +162,25 @@ def _collection_target(collection: Any) -> Any:
     return _namespace_name(collection.target)
 
 
+def _links(spec: ObjectTypeSpec) -> Dict[str, Any]:
+    """`{name: {"entry": node, "referrers": [namespace, ...]}}` for the
+    self-linked collections on `spec` (`child_refs`, `event_refs`): what a
+    loop variable over one is -- an entry with these fields (a ChildRef,
+    an EventRef), plus `referrer`, the record holding it, of one of these
+    types."""
+    links: Dict[str, Any] = {}
+    for name, collection in sorted(_COLLECTIONS.get(spec.table, {}).items()):
+        if not isinstance(collection, Collection) or not collection.self_link_field:
+            continue
+        referrers = collection.referrers or (collection.target,)
+        schema = _schema_properties(collection.target.cls.get_schema())[collection.self_link_field]
+        links[name] = {
+            "entry": _field_node(schema["items"]),
+            "referrers": [_namespace_name(referrer) for referrer in referrers],
+        }
+    return links
+
+
 def vocabulary(namespace: str) -> Dict[str, Any]:
     """Everything a `where_expr` on `namespace` can name, as JSON-ready data.
 
@@ -178,6 +197,11 @@ def vocabulary(namespace: str) -> Dict[str, Any]:
       usable as a path segment (`birth.date.sortval`).
     - `collections`: `{name: target namespace or None}` for one-to-many
       lists usable in `any`/`exists`/`count`/`len`.
+    - `links`: for the collections whose entries are links rather than
+      records (`child_refs`, `event_refs`; `None` in `collections`),
+      `{name: {"entry": node, "referrers": [namespace, ...]}}`: a loop
+      variable over one has the entry node's fields, plus `referrer`, the
+      record holding the entry, of one of those namespaces.
     - `keywords`, `functions`, `operators`: the fixed grammar tokens.
     - `constants`: `{ClassName: [CONST, ...]}` for `ClassName.CONST` values.
     - `type_names`: `{ClassName: [name, ...]}`, each Gramps type class's
@@ -209,6 +233,7 @@ def vocabulary(namespace: str) -> Dict[str, Any]:
             name: _collection_target(collection)
             for name, collection in sorted(_COLLECTIONS.get(spec.table, {}).items())
         },
+        "links": _links(spec),
         "keywords": list(KEYWORDS),
         "functions": list(FUNCTIONS),
         "operators": list(OPERATORS),

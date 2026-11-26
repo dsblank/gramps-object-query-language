@@ -3355,6 +3355,9 @@ _EVENTS = ("death", "census", "marriage", "double", "orphan")
         ("event_refs['Primary'].referrer.birth.date.sortval < date.sortval", {"death", "census", "double"}),
         ("any(e for e in event_refs if e.referrer.primary_name.first_name < 'b')", {"death", "census"}),
         ("any(e for e in event_refs if e.referrer.gramps_id < 'i0002')", {"death", "census", "marriage"}),
+        # One entry of the referrer's own collections.
+        ("any(r.referrer.children[0].gramps_id == 'I0003' for r in event_refs)", {"marriage"}),
+        ("any(r.referrer.families[0].gramps_id == 'F0001' for r in event_refs['Primary'])", {"death", "census", "double"}),
     ],
 )
 def test_event_refs_where(event_refs_db, pg_conn, where_expr, expected):

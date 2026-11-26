@@ -1578,9 +1578,12 @@ it" rule).
 
   2. **Roles: `event_refs` on Event, following `child_refs`.** *Done*,
      people and families both, with the shared field named `referrer`
-     (see `docs/where_expr.md`'s "Who an event belongs to"). Still open:
-     "Primary person, else Family" (an either/or), and offering
-     `referrer`/EventRef fields in completion after `for r in event_refs`.
+     (see `docs/where_expr.md`'s "Who an event belongs to"). Completion
+     offers the entry's fields and `referrer` after `for r in event_refs`
+     (vocabulary `links`, format 5). "Primary person, else Family" needs no
+     either/or: checked on two real trees, the rule is expressible today
+     (a Primary entry whose `referrer.gender` exists, or a Family entry
+     whose `referrer.complete` does).
      The original design: `child_refs`
      (on Person) is already a reverse collection whose entries are the
      *links* pointing here (`frel`/`mrel`), not records. `event_refs` is
