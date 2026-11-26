@@ -422,6 +422,11 @@ def test_count_across_several_for_clauses(db):
         db.execute("UPDATE family SET json_data = ? WHERE handle = 'fam1'", (json.dumps(
             {"child_ref_list": [{"ref": "kid1"}, {"ref": "other1"}, {"ref": "mom1"}]}),))
         assert run(db, "Person", expr) == [("kid1",), ("mom1",), ("other1",)]
+        assert run(db, "Person", "len(siblings) > 1") == [("kid1",), ("mom1",), ("other1",)]
+        assert run(db, "Person", "any(s.given_name == 'Jane' for s in siblings)") == [
+            ("kid1",),
+            ("other1",),
+        ]
     finally:
         db.execute("UPDATE family SET json_data = ? WHERE handle = 'fam1'",
                    (json.dumps({"child_ref_list": [{"ref": "kid1"}]}),))
