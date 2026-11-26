@@ -875,3 +875,54 @@ def test_reader_cache_drops_least_recently_used():
         assert reader.get("place", handle) == handle
     # "a" stays cached (used again before "c" arrived); "b" is read twice
     assert reader.reads == ["a", "b", "c", "b"]
+
+
+# --- a public person whose primary name is private ---------------------------
+
+
+@pytest.fixture(scope="module")
+def private_name_handles():
+    """`masked`: a public person whose primary name ("Secret Hidden") is
+    private -- a separate privacy flag from the person's own. The stored
+    `given_name`/`surname` columns hold the real name regardless, so a
+    proxied query must never read them. `family` has `masked` as father."""
+    dbman = CLIDbManager(DbState())
+    dirpath, db_name = dbman.create_new_db_cli("_test_private_name", dbid="sqlite")
+    db = make_database("sqlite")
+    db.load(dirpath)
+    handles = {}
+    with DbTxn("setup", db) as trans:
+        person = Person()
+        name = _name("Secret", "Hidden")
+        name.set_privacy(True)
+        person.set_primary_name(name)
+        handles["masked"] = db.add_person(person, trans)
+        family = Family()
+        family.set_father_handle(handles["masked"])
+        handles["family"] = db.add_family(family, trans)
+    yield db, handles
+    db.close()
+    dbman.remove_database(db_name)
+
+
+def test_private_primary_name_never_read_through_proxy(private_name_handles):
+    db, handles = private_name_handles
+    db.dbapi.execute("SELECT given_name, surname FROM person WHERE handle = ?", [handles["masked"]])
+    assert db.dbapi.fetchone() == ("Secret", "Hidden")  # the stored columns do hold it
+    proxy = PrivateProxyDb(db)
+    father_surname = resolve_column_path(FAMILY, ["father", "surname"])
+    father_given = resolve_column_path(FAMILY, ["father", "given_name"])
+    for reader in (None, RawDataReader(proxy)):
+        for where in (
+            Eq("given_name", "Secret"),
+            Eq("surname", "Hidden"),
+            Eq(resolve_column_path(PERSON, ["primary_name", "first_name"]), "Secret"),
+        ):
+            assert run_query(proxy, PERSON, where, reader=reader) == []
+        for where in (Eq(father_surname, "Hidden"), Eq(father_given, "Secret")):
+            assert run_query(proxy, FAMILY, where, reader=reader) == []
+        rows = run_query(proxy, PERSON, None, select=["handle", "given_name", "surname"], reader=reader)
+        assert handles["masked"] in str(rows)  # the person is still there
+        assert "Secret" not in str(rows) and "Hidden" not in str(rows)
+        rows = run_query(proxy, FAMILY, None, select=["handle", father_surname, father_given], reader=reader)
+        assert "Secret" not in str(rows) and "Hidden" not in str(rows)
