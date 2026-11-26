@@ -1558,13 +1558,13 @@ def _comprehension_generator(comp: Union[ast.GeneratorExp, ast.ListComp], call: 
     (the original `any(...)`/`len(...)` call, more useful to a caller than
     the comprehension fragment alone).
 
-    Restricted on purpose to exactly what `exists(...)`/`count(...)` already
-    support written by hand: one loop variable, bound to a plain name (not a
-    tuple-unpack), iterating either a bare collection name (`children`) or
-    exactly one attribute off an *enclosing* comprehension's own loop
-    variable (`c.events`, matching how `exists(children, exists(events,
-    ...))` nests today) -- never a longer chain, so this sugar can't
-    silently become more expressive than the call syntax it stands in for.
+    One loop variable, bound to a plain name (not a tuple-unpack), going
+    over a path -- whatever `any(path, ...)`/`len(path)` take written by
+    hand: a collection (`children`), a list on the record or reached
+    through relationships, objects and indexes
+    (`father.primary_name.surname_list`, `children[0].attribute_list`), or
+    a list off an enclosing comprehension's loop variable
+    (`c.primary_name.surname_list`). The call form checks the path.
     """
     if len(comp.generators) != 1:
         raise QueryLangError(
@@ -1579,15 +1579,11 @@ def _comprehension_generator(comp: Union[ast.GeneratorExp, ast.ListComp], call: 
             f"comprehension's loop variable must be a plain name: {_show(call)}"
         )
     iter_node = generator.iter
-    is_bare_name = isinstance(iter_node, ast.Name)
-    is_one_attr_off_a_name = isinstance(iter_node, ast.Attribute) and isinstance(
-        iter_node.value, ast.Name
-    )
-    if not (is_bare_name or is_one_attr_off_a_name):
+    if not _is_path_node(iter_node):
         raise QueryLangError(
-            f"for ... in {_show(iter_node)}: a loop can go over a collection (events), a list "
-            f"on the record (attribute_list), or a list one step away (father.attribute_list, "
-            f"or e.attribute_list in a loop over e) -- not further yet"
+            f"for ... in {_show(iter_node)}: a loop goes over a collection (events) or a list "
+            f"(attribute_list, father.primary_name.surname_list, or e.attribute_list in a loop "
+            f"over e)"
         )
     return generator
 
@@ -1856,17 +1852,20 @@ def _pick_projection(elt: ast.expr, bound_name: str) -> Optional[ast.expr]:
 def _nest_any_generators(comp: ast.GeneratorExp, call: ast.Call) -> ast.Call:
     """`any(E for f in A if p for c in f.B if q)` -> `any(any(E for c in
     f.B if q) for f in A if p)`: one nested `any(...)` per `for`, each `if`
-    staying with its own `for`. Each `for` after the first goes over one
-    list of the loop variable just before it (`f.B`); the first `for` and
+    staying with its own `for`. Each `for` after the first goes over a
+    list of the loop variable just before it (`f.B`, `f.father.B`); the first `for` and
     everything else are checked as usual once the nested form is desugared.
     """
     generators = comp.generators
     for outer, inner in zip(generators, generators[1:]):
+        root = inner.iter
+        while isinstance(root, (ast.Attribute, ast.Subscript)):
+            root = root.value
         if not (
             isinstance(outer.target, ast.Name)
-            and isinstance(inner.iter, ast.Attribute)
-            and isinstance(inner.iter.value, ast.Name)
-            and inner.iter.value.id == outer.target.id
+            and isinstance(inner.iter, (ast.Attribute, ast.Subscript))
+            and isinstance(root, ast.Name)
+            and root.id == outer.target.id
         ):
             raise QueryLangError(
                 f"{_show(call)}: each 'for' after the first goes over a list of the loop "
