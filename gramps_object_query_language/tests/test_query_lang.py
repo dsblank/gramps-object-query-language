@@ -3250,3 +3250,54 @@ def test_outer_loop_variable_in_own_condition_still_allowed():
         "person", "exists(parent_families, private == True and exists(children, gender == 1))"
     )
     assert sugar == plain
+
+
+@pytest.mark.parametrize(
+    "multi, nested",
+    [
+        (
+            "any(c.gender == 1 for f in parent_families for c in f.children)",
+            "any(any(c.gender == 1 for c in f.children) for f in parent_families)",
+        ),
+        (
+            "any(c for f in parent_families for c in f.children if c.gender == 1)",
+            "any(any(c for c in f.children if c.gender == 1) for f in parent_families)",
+        ),
+        (
+            "any(c.gender == 1 for f in parent_families if f.private == True for c in f.children)",
+            "any(any(c.gender == 1 for c in f.children) for f in parent_families if f.private == True)",
+        ),
+        (
+            "any(c for f in parent_families if f.private == True for c in f.children if c.gender == 1)",
+            "any(any(c.gender == 1 for c in f.children) and f.private == True for f in parent_families)",
+        ),
+        (
+            "any(e.type.value == 12 for f in parent_families for c in f.children for e in c.events)",
+            "any(any(any(e.type.value == 12 for e in c.events) for c in f.children) for f in parent_families)",
+        ),
+        (
+            "any(a.value == 'x' for f in parent_families for a in f.attribute_list)",
+            "any(any(a.value == 'x' for a in f.attribute_list) for f in parent_families)",
+        ),
+        (
+            "any(c.gender == 1 for c in parent_families for c in c.children)",
+            "any(any(c.gender == 1 for c in c.children) for c in parent_families)",
+        ),
+    ],
+)
+def test_any_multiple_for_matches_nested_any(multi, nested):
+    assert parse_expr("person", multi) == parse_expr("person", nested)
+
+
+@pytest.mark.parametrize(
+    "expr, message",
+    [
+        ("any(c.gender == 1 for f in parent_families for c in children)", "loop variable just before it"),
+        ("any(c.gender == 1 for f in parent_families for c in f.father.events)", "loop variable just before it"),
+        ("any(c.gender == 1 for f in parent_families for c in f.children if f.private == True)", "inner loop's condition"),
+        ("len([c for f in parent_families for c in f.children]) > 1", "one 'for'"),
+    ],
+)
+def test_any_multiple_for_rejected(expr, message):
+    with pytest.raises(QueryLangError, match=message):
+        parse_expr("person", expr)

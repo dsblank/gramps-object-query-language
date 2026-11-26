@@ -385,6 +385,27 @@ def test_picked_entry_by_condition(db):
         )
 
 
+def test_any_with_several_for_clauses(db):
+    # Grandparents of a Robert: granddad1/grandma1 -> fam2 -> dad1 -> fam1 -> kid1.
+    db.execute("UPDATE family SET json_data = ? WHERE handle = 'fam2'",
+               (json.dumps({"child_ref_list": [{"ref": "dad1"}]}),))
+    for handle, family in (("granddad1", "fam2"), ("grandma1", "fam2"), ("dad1", "fam1"), ("mom1", "fam1")):
+        db.execute(
+            "UPDATE person SET json_data = json_set(json_data, '$.family_list', json_array(?)) "
+            "WHERE handle = ?",
+            (family, handle),
+        )
+    try:
+        assert run(
+            db,
+            "Person",
+            "any(c.given_name == 'Robert' for f in families for k in f.children "
+            "for g in k.families for c in g.children)",
+        ) == [("granddad1",), ("grandma1",)]
+    finally:
+        db.execute("UPDATE family SET json_data = NULL WHERE handle = 'fam2'")
+        db.execute("UPDATE person SET json_data = json_remove(json_data, '$.family_list')")
+
 def test_arithmetic(db):
     # Whole years from the fixture's sortvals: dad1 (1940-1990, 50),
     # granddad1 (55), grandma1 (52) and other1 (1900-1980, 80) lived more

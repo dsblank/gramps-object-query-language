@@ -1740,6 +1740,32 @@ def _pick_projection(elt: ast.expr, bound_name: str) -> Optional[ast.expr]:
     return _BoundNameStripper(bound_name).visit(elt)
 
 
+def _nest_any_generators(comp: ast.GeneratorExp, call: ast.Call) -> ast.Call:
+    """`any(E for f in A if p for c in f.B if q)` -> `any(any(E for c in
+    f.B if q) for f in A if p)`: one nested `any(...)` per `for`, each `if`
+    staying with its own `for`. Each `for` after the first goes over one
+    list of the loop variable just before it (`f.B`); the first `for` and
+    everything else are checked as usual once the nested form is desugared.
+    """
+    generators = comp.generators
+    for outer, inner in zip(generators, generators[1:]):
+        if not (
+            isinstance(outer.target, ast.Name)
+            and isinstance(inner.iter, ast.Attribute)
+            and isinstance(inner.iter.value, ast.Name)
+            and inner.iter.value.id == outer.target.id
+        ):
+            raise QueryLangError(
+                f"{_show(call)}: each 'for' after the first goes over a list of the loop "
+                f"variable just before it, e.g. any(... for f in parent_families for c in f.children)"
+            )
+    nested: ast.expr = ast.GeneratorExp(elt=comp.elt, generators=[generators[-1]])
+    for generator in reversed(generators[:-1]):
+        inner_call = ast.Call(func=ast.Name(id="any", ctx=ast.Load()), args=[nested], keywords=[])
+        nested = ast.GeneratorExp(elt=inner_call, generators=[generator])
+    return ast.Call(func=ast.Name(id="any", ctx=ast.Load()), args=[nested], keywords=[])
+
+
 class _ComprehensionDesugarer(ast.NodeTransformer):
     """Rewrites `any(cond for x in rel [if ...])` into `any(rel, cond)`,
     and `len([... for x in rel if ...])` into `len(rel, ...)`, run once
@@ -1771,6 +1797,8 @@ class _ComprehensionDesugarer(ast.NodeTransformer):
         name = node.func.id
         if name == "any" and len(node.args) == 1 and isinstance(node.args[0], ast.GeneratorExp):
             comp = node.args[0]
+            if len(comp.generators) > 1:
+                return self.visit(ast.copy_location(_nest_any_generators(comp, node), node))
             generator = _comprehension_generator(comp, node)
             condition = _any_condition(comp, generator.target.id)
             return ast.copy_location(_make_call("any", generator.iter, condition), node)
