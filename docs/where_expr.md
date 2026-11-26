@@ -815,6 +815,12 @@ Python itself:
   two of the same families is reached twice; `len(distinct([c.handle
   for ...]))` counts them once.
 - The loop variable is a plain name (no tuple-unpacking).
+- A loop can go over a list comprehension that collects its own loop
+  variable: `any(x.given_name == 'Ann' for x in [c for c in children if
+  c.gender == Person.FEMALE])` is read as the single comprehension `any(c.given_name
+  == 'Ann' for c in children if c.gender == Person.FEMALE)`, `for`s and `if`s
+  included. Collecting anything else (`[c.father for c in ...]`, `[1 for
+  ...]`) is an error.
 - `<list>` is a collection name, a list inside the record (optionally
   across a relationship, `father.attribute_list`), or -- inside another
   comprehension -- exactly one attribute off the enclosing loop variable:

@@ -433,6 +433,14 @@ def test_count_across_several_for_clauses(db):
         db.execute("UPDATE person SET json_data = json_remove(json_data, '$.parent_family_list')")
 
 
+def test_loop_over_a_list_comprehension(db):
+    # kid1 (Robert, male) is fam1's only child.
+    expr = "any(s.given_name == 'Robert' for s in [c for c in children if c.gender == Person.MALE])"
+    assert run(db, "Family", expr) == [("fam1",)]
+    expr = "any(s.given_name == 'Robert' for s in [c for c in children if c.gender == Person.FEMALE])"
+    assert run(db, "Family", expr) == []
+
+
 def test_arithmetic(db):
     # Whole years from the fixture's sortvals: dad1 (1940-1990, 50),
     # granddad1 (55), grandma1 (52) and other1 (1900-1980, 80) lived more
