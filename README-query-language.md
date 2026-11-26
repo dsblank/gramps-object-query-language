@@ -495,6 +495,16 @@ recorded as father in two of the families is one father, not two. As a
 column, `len(distinct([f.father for f in parent_families])) - 1 as
 other_fathers` shows how many fathers someone has besides one.
 
+### Goal: Find people with a grandchild named Robert
+
+```
+Person "any(c.given_name == 'Robert' for f in families for k in f.children for g in k.families for c in g.children)"
+```
+
+Several `for`s in one `any(...)` walk from list to list: each one goes
+over a list of the loop variable just before it -- the person's families,
+each family's children, each child's own families, and their children.
+
 ### Goal: Find people whose events happened in more than one place
 
 ```
