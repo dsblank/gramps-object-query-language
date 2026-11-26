@@ -357,6 +357,15 @@ def _indexable_collections(vocabs: Dict[str, Any], context: _Context) -> List[Tu
     ]
 
 
+def _indexed_steps(vocabs: Dict[str, Any], context: _Context) -> List[Tuple[str, str, Any]]:
+    """`_indexable_collections`, offered with their `[`: past a hop
+    (`parent_families[0].children`) a collection is only valid indexed --
+    `parent_families[0].children[0].gender`, never
+    `len(parent_families[0].children)` -- so completing the bare name
+    would invite something GOQL rejects."""
+    return [(name + "[", kind, target) for name, kind, target in _indexable_collections(vocabs, context)]
+
+
 def _walk(
     vocabs: Dict[str, Any],
     root: str,
@@ -595,7 +604,7 @@ def complete_from_vocabularies(
         )
         candidates = (
             [] if context is None
-            else _names_at(vocabs, context) + _indexable_collections(vocabs, context)
+            else _names_at(vocabs, context) + _indexed_steps(vocabs, context)
         )
         return _results(candidates, prefix, cursor - len(prefix), bindings, env)
     if _PICK_INDEX_RE.search(before) and _comprehension_ending(before[:-1]) is not None:
@@ -739,7 +748,7 @@ def complete_from_vocabularies(
             candidates = [] if context is None else _names_at(vocabs, context)
             if context is not None and role in ("operand", "value", "is_value", "number"):
                 # `father.families[0]...`: one entry of a collection, across a hop.
-                candidates += _indexable_collections(vocabs, context)
+                candidates += _indexed_steps(vocabs, context)
             if role == "iterable":
                 candidates = [
                     (name, kind, detail)
