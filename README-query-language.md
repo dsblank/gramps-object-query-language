@@ -368,7 +368,18 @@ yourself ("Hair color") both work, spelled exactly as they appear in
 Gramps. It works one link away too: in the Citation view,
 `source.attribute_list['Film'].value` reads the cited source's "Film"
 attribute. See
-[An attribute by type](docs/where_expr.md#an-attribute-by-type-attribute_listage).
+[Entries by type](docs/where_expr.md#entries-by-type-attribute_listage).
+
+### Goal: Find people who had more than one occupation, one of them Miller
+
+```
+Person "len(attribute_list['Occupation']) > 1 and any(a.value == 'Miller' for a in attribute_list['Occupation'])"
+```
+
+Counted, looped over or tested with `any(...)`, `attribute_list['Occupation']`
+is every Occupation attribute, not just the first. Web links work the same
+way by their type: `urls['E-mail'].path` is a person's first e-mail
+address, and `len(urls['E-mail'])` how many they have.
 
 ### Goal: Find people who were adopted
 

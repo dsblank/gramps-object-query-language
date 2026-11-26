@@ -1381,6 +1381,27 @@
       ]
     },
     {
+      "namespace": "Person",
+      "source": "any(a. for a in attribute_list['Occupation'])",
+      "cursor": 6,
+      "expect": [
+        "citation_list",
+        "note_list",
+        "private",
+        "type",
+        "value"
+      ],
+      "start": 6
+    },
+    {
+      "namespace": "Person",
+      "source": "len([u for u in urls[\"E-mail\"] if u.pa",
+      "expect": [
+        "path"
+      ],
+      "start": 36
+    },
+    {
       "namespace": "Event",
       "source": "type == ",
       "expect": [

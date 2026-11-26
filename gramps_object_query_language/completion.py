@@ -69,7 +69,7 @@ from .vocabulary import vocabularies
 
 _NAME = r"[A-Za-z_][A-Za-z0-9_]*"
 # One `[...]` after a name: a number (`[0]`), or a quoted type name
-# (`attribute_list['Age']`, the first entry of that type).
+# (`attribute_list['Age']`, the entries of that type; read on, the first).
 _INDEX = r"""\[(?:[0-9]+|'[^'\\]*'|"[^"\\]*")\]"""
 _SEGMENT = rf"{_NAME}(?:{_INDEX})*"
 _CHAIN = rf"{_SEGMENT}(?:\.{_SEGMENT})*"
@@ -80,6 +80,7 @@ _CHAIN = rf"{_SEGMENT}(?:\.{_SEGMENT})*"
 _AT_CURSOR_RE = re.compile(rf"(?<![A-Za-z0-9_.\])])(?:({_CHAIN})\.)?({_NAME})?$")
 _SEGMENT_RE = re.compile(rf"({_NAME})((?:{_INDEX})*)")
 _INDEX_RE = re.compile(_INDEX)
+_TYPE_INDEX_AT_END_RE = re.compile(r"""\[(?:'[^'\\]*'|"[^"\\]*")\]$""")
 _BINDING_RE = re.compile(rf"\bfor\s+({_NAME})\s+in\s+({_CHAIN})")
 _PARTIAL_OPERATOR_RE = re.compile(r"[=!<>]+$")
 # The path a value is being written for: `path ==` (any comparison) or
@@ -413,8 +414,11 @@ def _bindings(vocabs: Dict[str, Any], root: str, source: str) -> Dict[str, Optio
     variable, but with nothing to offer after its dot."""
     bindings: Dict[str, Optional[_Context]] = {}
     for match in _BINDING_RE.finditer(source):
+        # `for a in attribute_list['Age']` loops over the list's entries of
+        # that type, so `a` is an entry, as with `for a in attribute_list`.
+        iterated = _TYPE_INDEX_AT_END_RE.sub("", match.group(2))
         bindings[match.group(1)] = _walk(
-            vocabs, root, _segments(match.group(2)), bindings, iterating=True
+            vocabs, root, _segments(iterated), bindings, iterating=True
         )
     return bindings
 

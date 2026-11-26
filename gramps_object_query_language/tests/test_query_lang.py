@@ -2887,8 +2887,10 @@ def test_attribute_lookup_custom_is_not_a_builtin():
 @pytest.mark.parametrize(
     "entry, message",
     [
-        ("urls['Home'].path", "only works on attribute_list"),
-        ("primary_name['x']", "only works on attribute_list"),
+        ("primary_name['x']", "only works on attribute_list, urls"),
+        ("alternate_names['Birth Name'].surname", "only works on attribute_list, urls"),
+        ("len(event_ref_list['Primary'])", "only works on attribute_list, urls"),
+        ("any(e for e in alternate_names['x'])", "only works on attribute_list, urls"),
     ],
 )
 def test_attribute_lookup_rejects(entry, message):
@@ -2897,6 +2899,96 @@ def test_attribute_lookup_rejects(entry, message):
 
     with pytest.raises(QueryLangError, match=message):
         parse_select_entry(PERSON, entry)
+
+
+_OCCUPATION = "a.type.string == 'Occupation' or a.type.value == AttributeType.OCCUPATION"
+
+
+@pytest.mark.parametrize(
+    "short, long",
+    [
+        # Looped over: the entries of that type.
+        (
+            "any(a.value == 'Farmer' for a in attribute_list['Occupation'])",
+            f"any(a.value == 'Farmer' for a in attribute_list if {_OCCUPATION})",
+        ),
+        (
+            "any(a for a in attribute_list['Occupation'] if a.value == 'Farmer')",
+            f"any(a for a in attribute_list if ({_OCCUPATION}) and a.value == 'Farmer')",
+        ),
+        (
+            "len([a for a in attribute_list['Occupation'] if a.private == True]) > 1",
+            f"len([a for a in attribute_list if ({_OCCUPATION}) and a.private == True]) > 1",
+        ),
+        (
+            "len([a.value for a in attribute_list['Occupation']]) > 1",
+            f"len([a.value for a in attribute_list if {_OCCUPATION}]) > 1",
+        ),
+        (
+            "len(distinct([a.value for a in attribute_list['Occupation']])) > 1",
+            f"len(distinct([a.value for a in attribute_list if {_OCCUPATION}])) > 1",
+        ),
+        (
+            "[a.value for a in attribute_list['Occupation']][1] == 'Miller'",
+            f"[a.value for a in attribute_list if {_OCCUPATION}][1] == 'Miller'",
+        ),
+        (
+            "any(any(a.value == 'x' for a in e.attribute_list['Occupation']) for e in events)",
+            f"any(any(a.value == 'x' for a in e.attribute_list if {_OCCUPATION}) for e in events)",
+        ),
+        # Counted or tested whole, one argument and two.
+        (
+            "len(attribute_list['Occupation']) > 1",
+            f"len([a for a in attribute_list if {_OCCUPATION}]) > 1",
+        ),
+        (
+            "any(attribute_list['Occupation'])",
+            f"any(a for a in attribute_list if {_OCCUPATION})",
+        ),
+        (
+            "len(attribute_list['Occupation'], value == 'Farmer') > 0",
+            f"len([a for a in attribute_list if ({_OCCUPATION}) and a.value == 'Farmer']) > 0",
+        ),
+        (
+            "any(attribute_list['Occupation'], value == 'Farmer')",
+            f"any(a for a in attribute_list if ({_OCCUPATION}) and a.value == 'Farmer')",
+        ),
+        # urls: by type too.
+        (
+            "urls['Web Home'].path == 'x'",
+            "[u for u in urls if u.type.string == 'Web Home' or u.type.value == UrlType.WEB_HOME][0].path == 'x'",
+        ),
+        (
+            "len(urls['Blog']) > 0",
+            "len([u for u in urls if u.type.string == 'Blog']) > 0",
+        ),
+        (
+            'any(u.path == "x" for u in urls["E-mail"])',
+            "any(u.path == 'x' for u in urls if u.type.string == 'E-mail' or u.type.value == UrlType.EMAIL)",
+        ),
+    ],
+)
+def test_entries_of_a_type_are_the_long_form(short, long):
+    """`list['Kind']` looped over, counted or tested is the entries of that
+    kind: each spelling compiles to its long form."""
+    from gramps_object_query_language.query import PERSON
+    from gramps_object_query_language.query_lang import parse_expr_for_spec
+
+    assert parse_expr_for_spec(PERSON, short) == parse_expr_for_spec(PERSON, long)
+
+
+def test_entries_of_a_type_on_other_records():
+    """`urls` on Place and Repository, `attribute_list` on Source."""
+    from gramps_object_query_language.query import PLACE, REPOSITORY, SOURCE
+    from gramps_object_query_language.query_lang import parse_expr_for_spec
+
+    for spec in (PLACE, REPOSITORY):
+        assert parse_expr_for_spec(spec, "len(urls['Web Home']) > 0") == parse_expr_for_spec(
+            spec, "len([u for u in urls if u.type.string == 'Web Home' or u.type.value == UrlType.WEB_HOME]) > 0"
+        )
+    assert parse_expr_for_spec(SOURCE, "any(attribute_list['Film'])") == parse_expr_for_spec(
+        SOURCE, "any(a for a in attribute_list if a.type.string == 'Film')"
+    )
 
 
 @pytest.mark.parametrize(

@@ -1550,7 +1550,12 @@ it" rule).
   **Design (settled in discussion, not built).** Goal: add as few new names
   as possible; reuse patterns GOQL already has. Two steps:
 
-  1. **Generalize the type-in-brackets rule -- no new names.** Today
+  1. **Generalize the type-in-brackets rule -- no new names.**
+     *Typed lists done* (`attribute_list`, `urls`: looped over, `len()`,
+     `any()`, one- and two-argument forms -- see `docs/where_expr.md`'s
+     "Entries by type"). *`backlinks['Person']` not built yet* -- it needs
+     a join through `reference` into the referrer's table, a new kind of
+     collection rather than a rewrite. Before:
      `attribute_list['Occupation']` means the *first* Occupation attribute
      (desugared to `[...][0]`). Restate it as: `list['Kind']` is *the
      entries of that kind*; a path read straight off it reads the first

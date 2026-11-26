@@ -53,6 +53,8 @@ from gramps.gen.lib import (
     PlaceName,
     Source,
     Surname,
+    Url,
+    UrlType,
 )
 from gramps.gen.proxy import PrivateProxyDb
 
@@ -2364,6 +2366,16 @@ def indexed_hop_db():
         handles["father"] = db.add_person(father, trans)
         mother = Person()
         mother.set_primary_name(_name("Lena", "Baker"))
+        for url_type, path in (
+            (UrlType.WEB_HOME, "https://lena.example"),
+            (UrlType.EMAIL, "lena@example.org"),
+            (UrlType.EMAIL, "baker@example.org"),
+            ("Blog", "https://lena.example/blog"),
+        ):
+            url = Url()
+            url.set_type(url_type)
+            url.set_path(path)
+            mother.add_url(url)
         handles["mother"] = db.add_person(mother, trans)
         child = Person()
         child.set_primary_name(_name("Steve", "Anderson"))
@@ -2611,6 +2623,59 @@ def test_attribute_lookup_where(indexed_hop_db, pg_conn, where_expr, expected):
     _assert_sql_and_evaluator_agree(
         db, handles, PERSON, _PEOPLE, where_expr, expected, pg_conn
     )
+
+
+@pytest.mark.parametrize(
+    "where_expr, expected",
+    [
+        # All the entries of a type, not just the first: the father has
+        # two occupations, Farmer then Miller.
+        ("len(attribute_list['Occupation']) == 2", {"father"}),
+        ("len(attribute_list['Occupation'], value == 'Miller') == 1", {"father"}),
+        ("len([a for a in attribute_list['Occupation'] if a.value == 'Miller']) == 1", {"father"}),
+        ("len(attribute_list['Hair color']) == 1", {"father"}),
+        ("len(attribute_list['Caste']) == 0", {"father", "mother", "child", "orphan"}),
+        ("any(attribute_list['Occupation'])", {"father"}),
+        ("any(attribute_list['Nickname'])", {"father"}),
+        ("any(attribute_list['Caste'])", set()),
+        ("any(attribute_list['Occupation'], value == 'Miller')", {"father"}),
+        ("any(attribute_list['Nickname'], value == 'Miller')", set()),
+        ("any(a.value == 'Miller' for a in attribute_list['Occupation'])", {"father"}),
+        ("any(a for a in attribute_list['Occupation'] if a.value == 'Miller')", {"father"}),
+        ("any(a.value == 'Miller' for a in attribute_list['Nickname'])", set()),
+        ("[a.value for a in attribute_list['Occupation']][1] == 'Miller'", {"father"}),
+        ("[a for a in attribute_list['Occupation'] if a.value != 'Farmer'][0].value == 'Miller'", {"father"}),
+        ("len(distinct([a.value for a in attribute_list['Occupation']])) == 2", {"father"}),
+        # urls: built-in types by number, a custom one by name.
+        ("urls['Web Home'].path == 'https://lena.example'", {"mother"}),
+        ("urls['E-mail'].path == 'lena@example.org'", {"mother"}),
+        ("urls['Blog'].path == 'https://lena.example/blog'", {"mother"}),
+        ("urls['Blog'] == None", {"father", "child", "orphan"}),
+        ("len(urls['E-mail']) == 2", {"mother"}),
+        ("any(u.path == 'baker@example.org' for u in urls['E-mail'])", {"mother"}),
+        ("any(u.path == 'baker@example.org' for u in urls['Web Home'])", set()),
+        ("any(urls['Web Search'])", set()),
+    ],
+)
+def test_entries_of_a_type_where(indexed_hop_db, pg_conn, where_expr, expected):
+    """`list['Kind']` is every entry of that kind, looped over, counted or
+    tested; read straight off, it is the first."""
+    db, handles = indexed_hop_db
+    _assert_sql_and_evaluator_agree(
+        db, handles, PERSON, _PEOPLE, where_expr, expected, pg_conn
+    )
+
+
+@pytest.mark.parametrize(
+    "entry, expected",
+    [
+        ("len(attribute_list['Occupation'])", {"father": 2, "mother": 0, "child": 0, "orphan": 0}),
+        ("urls['E-mail'].path", {"mother": "lena@example.org"}),
+        ("[u.path for u in urls['E-mail']][1]", {"mother": "baker@example.org"}),
+    ],
+)
+def test_entries_of_a_type_select(indexed_hop_db, pg_conn, entry, expected):
+    test_indexed_collection_hop_select(indexed_hop_db, pg_conn, entry, expected)
 
 
 def test_attribute_lookup_through_link(indexed_hop_db, pg_conn):

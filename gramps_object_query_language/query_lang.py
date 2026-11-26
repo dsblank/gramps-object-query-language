@@ -1689,10 +1689,9 @@ def _substitute_env(node: ast.AST, env: Optional[Mapping[str, EnvValue]]) -> ast
     return ast.fix_missing_locations(_EnvSubstituter(env).visit(node))
 
 
-#: The lists `name['X']` works on: Attribute/SrcAttribute lists, whose
-#: entries carry a GrampsType `type`. Other typed lists (urls, names) could
-#: join later; each needs its own built-in name table below.
-_LOOKUP_LISTS = {"attribute_list": AttributeType}
+#: The lists `name['X']` works on, with the GrampsType their entries'
+#: `type` holds: attributes (Attribute/SrcAttribute) and web links (Url).
+_LOOKUP_LISTS = {"attribute_list": AttributeType, "urls": UrlType}
 
 #: The loop variable the lookup sugar writes into its comprehension. Never a
 #: Gramps field, and a comprehension's own name is local to it, so it can't
@@ -1709,62 +1708,129 @@ def _builtin_type_values(type_class: type) -> Dict[str, int]:
     return {key: value for value, _label, key in type_class._DATAMAP if value != custom}
 
 
-class _TypedListLookup(ast.NodeTransformer):
-    """`attribute_list['Age']` -> `[_entry for _entry in attribute_list if
-    _entry.type.string == 'Age' or _entry.type.value == AttributeType.AGE][0]`:
-    the first entry of that type, written as the long form so every later
-    step (picks, any(), links, the Python evaluator) handles it unchanged.
+def _type_lookup(node: ast.AST) -> Optional[Tuple[ast.expr, str, type]]:
+    """`(list, name, type_class)` when `node` is `list['Name']`, else
+    `None`. A string index on any other list is an error: it has no other
+    meaning in this language."""
+    if not isinstance(node, ast.Subscript):
+        return None
+    key = node.slice
+    if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+        return None
+    list_name = (
+        node.value.id if isinstance(node.value, ast.Name)
+        else node.value.attr if isinstance(node.value, ast.Attribute)
+        else None
+    )
+    type_class = _LOOKUP_LISTS.get(list_name or "")
+    if type_class is None:
+        lists = ", ".join(sorted(_LOOKUP_LISTS))
+        raise QueryLangError(
+            f"a name in [...] picks entries by type, which only works on {lists}: "
+            f"{ast.unparse(node)}"
+        )
+    return node.value, key.value, type_class
 
-    Runs before `_ComprehensionDesugarer`. A plain string index on a list
-    has no other meaning in this language, so the sugar can't shadow
-    anything. Custom types match on their stored name; a built-in name
-    (Age, Nickname, ...) also matches its number, since Gramps stores
-    built-ins with an empty name."""
+
+def _type_condition(bound_name: Optional[str], name: str, type_class: type) -> ast.expr:
+    """`x.type.string == 'Name'`, `or x.type.value == <number>` for a
+    built-in name; with no `bound_name`, the fields are bare (`type.string`),
+    as in `any(list, condition)`."""
+
+    def field(*names: str) -> ast.expr:
+        expr: Optional[ast.expr] = None if bound_name is None else ast.Name(id=bound_name, ctx=ast.Load())
+        for attr in names:
+            expr = ast.Name(id=attr, ctx=ast.Load()) if expr is None else ast.Attribute(value=expr, attr=attr, ctx=ast.Load())
+        assert expr is not None
+        return expr
+
+    def equals(left: ast.expr, value: Any) -> ast.Compare:
+        return ast.Compare(left=left, ops=[ast.Eq()], comparators=[ast.Constant(value=value)])
+
+    condition: ast.expr = equals(field("type", "string"), name)
+    builtin = _builtin_type_values(type_class).get(name)
+    if builtin is not None:
+        condition = ast.BoolOp(op=ast.Or(), values=[condition, equals(field("type", "value"), builtin)])
+    return condition
+
+
+def _entries_of_type(list_node: ast.expr, name: str, type_class: type) -> ast.ListComp:
+    """`[_entry for _entry in list if <_entry is of that type>]`."""
+    return ast.ListComp(
+        elt=ast.Name(id=_LOOKUP_BOUND, ctx=ast.Load()),
+        generators=[
+            ast.comprehension(
+                target=ast.Name(id=_LOOKUP_BOUND, ctx=ast.Store()),
+                iter=list_node,
+                ifs=[_type_condition(_LOOKUP_BOUND, name, type_class)],
+                is_async=0,
+            )
+        ],
+    )
+
+
+class _TypedListLookup(ast.NodeTransformer):
+    """`list['Kind']` is the entries of that kind, written as the long form
+    so every later step (picks, any(), len(), links, the Python evaluator)
+    handles it unchanged:
+
+    - Looped over, `for a in attribute_list['Age'] if c` becomes `for a in
+      attribute_list if <a is an Age> and c`.
+    - Counted or tested whole, `len(attribute_list['Age'])` and
+      `any(attribute_list['Age'])` count or test the matching entries, and
+      so do the two-argument forms `len(list['Age'], c)`/`any(list['Age'], c)`.
+    - Anywhere else -- a path after it, a comparison, a select entry -- it
+      reads the first such entry: `[_entry for _entry in attribute_list if
+      <_entry is an Age>][0]`.
+
+    Runs before `_ComprehensionDesugarer`. Custom types match on their
+    stored name; a built-in name (Age, Nickname, ...) also matches its
+    number, since Gramps stores built-ins with an empty name."""
+
+    def _loop_over(self, comp: ast.AST) -> ast.AST:
+        for generator in comp.generators:  # type: ignore[attr-defined]
+            lookup = _type_lookup(generator.iter)
+            if lookup is not None and isinstance(generator.target, ast.Name):
+                list_node, name, type_class = lookup
+                generator.iter = list_node
+                generator.ifs.insert(0, _type_condition(generator.target.id, name, type_class))
+        self.generic_visit(comp)
+        return comp
+
+    visit_ListComp = _loop_over
+    visit_GeneratorExp = _loop_over
+
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        lookup = _type_lookup(node.args[0]) if node.args else None
+        if (
+            lookup is None
+            or not isinstance(node.func, ast.Name)
+            or node.func.id not in ("len", "any")
+            or len(node.args) > 2
+            or node.keywords
+        ):
+            self.generic_visit(node)
+            return node
+        list_node, name, type_class = lookup
+        list_node = self.visit(list_node)
+        if len(node.args) == 2:
+            condition = _and_together([_type_condition(None, name, type_class), self.visit(node.args[1])])
+            node.args = [list_node, condition]
+            return node
+        comp = _entries_of_type(list_node, name, type_class)
+        if node.func.id == "any":
+            node.args = [ast.GeneratorExp(elt=comp.elt, generators=comp.generators)]
+        else:
+            node.args = [comp]
+        return node
 
     def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
         self.generic_visit(node)
-        key = node.slice
-        if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+        lookup = _type_lookup(node)
+        if lookup is None:
             return node
-        list_name = (
-            node.value.id if isinstance(node.value, ast.Name)
-            else node.value.attr if isinstance(node.value, ast.Attribute)
-            else None
-        )
-        type_class = _LOOKUP_LISTS.get(list_name or "")
-        if type_class is None:
-            lists = ", ".join(sorted(_LOOKUP_LISTS))
-            raise QueryLangError(
-                f"a name in [...] picks an entry by type, which only works on {lists}: "
-                f"{ast.unparse(node)}"
-            )
-
-        def field(*names: str) -> ast.expr:
-            expr: ast.expr = ast.Name(id=_LOOKUP_BOUND, ctx=ast.Load())
-            for name in names:
-                expr = ast.Attribute(value=expr, attr=name, ctx=ast.Load())
-            return expr
-
-        def equals(left: ast.expr, value: Any) -> ast.Compare:
-            return ast.Compare(left=left, ops=[ast.Eq()], comparators=[ast.Constant(value=value)])
-
-        condition: ast.expr = equals(field("type", "string"), key.value)
-        builtin = _builtin_type_values(type_class).get(key.value)
-        if builtin is not None:
-            condition = ast.BoolOp(op=ast.Or(), values=[condition, equals(field("type", "value"), builtin)])
-        comp = ast.ListComp(
-            elt=ast.Name(id=_LOOKUP_BOUND, ctx=ast.Load()),
-            generators=[
-                ast.comprehension(
-                    target=ast.Name(id=_LOOKUP_BOUND, ctx=ast.Store()),
-                    iter=node.value,
-                    ifs=[condition],
-                    is_async=0,
-                )
-            ],
-        )
-        lookup = ast.Subscript(value=comp, slice=ast.Constant(value=0), ctx=ast.Load())
-        return ast.copy_location(lookup, node)
+        first = ast.Subscript(value=_entries_of_type(*lookup), slice=ast.Constant(value=0), ctx=ast.Load())
+        return ast.copy_location(first, node)
 
 
 def _desugar_comprehensions(node: ast.AST) -> ast.AST:
