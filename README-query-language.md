@@ -524,6 +524,16 @@ leaves out the person (someone with no parent family comes out as -1):
 Person "len(distinct([c.handle for f in parent_families for c in f.children])) - 1 > 2"
 ```
 
+### Goal: Find families with a son named Robert
+
+```
+Family "any(s.given_name == 'Robert' for s in [c for c in children if c.gender == Person.MALE])"
+```
+
+A loop can go over a list comprehension -- here, the family's sons. It
+means the same as one comprehension with both conditions:
+`any(c.given_name == 'Robert' for c in children if c.gender == Person.MALE)`.
+
 ### Goal: Find people whose events happened in more than one place
 
 ```

@@ -3341,3 +3341,95 @@ def test_siblings_only_on_person():
 
     with pytest.raises(Exception, match="siblings"):
         compile_expr("Family", "len(siblings) > 0")
+
+
+@pytest.mark.parametrize(
+    "namespace, nested, flat",
+    [
+        (
+            "family",
+            "any(x.gender == 1 for x in [y for y in children])",
+            "any(y.gender == 1 for y in children)",
+        ),
+        (
+            "family",
+            "any(x.gender == 1 for x in [y for y in children if y.private == False])",
+            "any(y.gender == 1 for y in children if y.private == False)",
+        ),
+        (
+            "family",
+            "any(x for x in [y for y in children if y.gender == 1] if x.private == False)",
+            "any(y for y in children if y.gender == 1 if y.private == False)",
+        ),
+        (
+            "family",
+            "len([x for x in [y for y in children if y.gender == 1]]) > 1",
+            "len([y for y in children if y.gender == 1]) > 1",
+        ),
+        (
+            "family",
+            "len([x.surname for x in [y for y in children if y.gender == 1]]) > 1",
+            "len([y.surname for y in children if y.gender == 1]) > 1",
+        ),
+        (
+            "family",
+            "len(distinct([x.surname for x in [y for y in children if y.gender == 1]])) > 1",
+            "len(distinct([y.surname for y in children if y.gender == 1])) > 1",
+        ),
+        (
+            "family",
+            "[x for x in [y for y in children if y.gender == 1]][0].surname == 'Smith'",
+            "[y for y in children if y.gender == 1][0].surname == 'Smith'",
+        ),
+        (
+            "family",
+            "any(x.gender == 1 for x in [y for y in [z for z in children if z.private == False]])",
+            "any(z.gender == 1 for z in children if z.private == False)",
+        ),
+        (
+            "family",
+            "any(x.gender == 1 for x in [x for x in children])",
+            "any(x.gender == 1 for x in children)",
+        ),
+        (
+            "person",
+            "len([x for x in [c for f in parent_families for c in f.children]]) > 1",
+            "len([c for f in parent_families for c in f.children]) > 1",
+        ),
+        (
+            "person",
+            "any(c.gender == 1 for f in parent_families for c in [k for k in f.children if k.private == False])",
+            "any(c.gender == 1 for f in parent_families for c in f.children if c.private == False)",
+        ),
+        (
+            "person",
+            "any(any(x.gender == 1 for x in [y for y in f.children]) for f in parent_families)",
+            "any(any(y.gender == 1 for y in f.children) for f in parent_families)",
+        ),
+        (
+            "person",
+            "any(c for f in parent_families for c in [f for f in f.children])",
+            "any(c for f in parent_families for c in f.children)",
+        ),
+    ],
+)
+def test_loop_over_a_list_comprehension_matches_flat_form(namespace, nested, flat):
+    assert parse_expr(namespace, nested) == parse_expr(namespace, flat)
+
+
+@pytest.mark.parametrize(
+    "expr, message",
+    [
+        ("any(x.surname == 'A' for x in [y.father for y in parent_families])", "collect its own loop variable"),
+        ("any(x for x in [1 for y in parent_families])", "collect its own loop variable"),
+        ("any(x for x in [f for f in parent_families for c in f.children])", "collect its own loop variable"),
+        ("any(x for x in [y for y in children if y.handle == x.handle])", "different loop variable names"),
+        (
+            "any(c for f in parent_families for c in [k for f in parent_families for k in f.children])",
+            "different loop variable names",
+        ),
+    ],
+)
+def test_loop_over_a_list_comprehension_rejected(expr, message):
+    with pytest.raises(QueryLangError, match=message):
+        parse_expr("person", expr)

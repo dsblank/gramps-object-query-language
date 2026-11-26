@@ -113,6 +113,7 @@ supports today:
 from __future__ import annotations
 
 import ast
+import copy
 import re
 import contextlib
 import contextvars
@@ -2284,8 +2285,75 @@ class _TypedListLookup(ast.NodeTransformer):
         return ast.copy_location(first, node)
 
 
+class _RenameName(ast.NodeTransformer):
+    def __init__(self, old: str, new: str):
+        self.old, self.new = old, new
+
+    def visit_Name(self, node: ast.Name) -> ast.AST:
+        if node.id == self.old:
+            return ast.copy_location(ast.Name(id=self.new, ctx=node.ctx), node)
+        return node
+
+
+class _ComprehensionFlattener(ast.NodeTransformer):
+    """`[x for x in [y for y in S if p] if q]` -> `[x for x in S if p if q]`:
+    a loop over a list comprehension becomes that comprehension's own
+    `for`s, its loop variable renamed to the outer one. Bottom-up, so a
+    comprehension inside the inner one is flattened first. The inner one
+    must collect its own (last) loop variable -- the flat form has nothing
+    else to loop over."""
+
+    def _flatten(self, node: Union[ast.GeneratorExp, ast.ListComp]) -> ast.AST:
+        self.generic_visit(node)
+        generators: List[ast.comprehension] = []
+        for generator in node.generators:
+            inner = generator.iter
+            if not isinstance(inner, ast.ListComp):
+                generators.append(generator)
+                continue
+            last = inner.generators[-1].target
+            if not (
+                isinstance(generator.target, ast.Name)
+                and isinstance(last, ast.Name)
+                and isinstance(inner.elt, ast.Name)
+                and inner.elt.id == last.id
+            ):
+                raise QueryLangError(
+                    f"for ... in {_show(inner)}: a list looped over must collect its own "
+                    f"loop variable, e.g. [c for c in children if ...] -- or write the "
+                    f"loops as one comprehension with several 'for's"
+                )
+            outer_name = generator.target.id
+            inner_names = {g.target.id for g in inner.generators if isinstance(g.target, ast.Name)}
+            taken = {
+                g.target.id for g in node.generators if isinstance(g.target, ast.Name)
+            } - {outer_name}
+            if (
+                outer_name != last.id
+                and any(isinstance(n, ast.Name) and n.id == outer_name for n in ast.walk(inner))
+            ) or (inner_names - {last.id}) & (taken | {outer_name}):
+                raise QueryLangError(
+                    f"for {outer_name} in {_show(inner)}: use different loop variable "
+                    f"names inside and outside the inner list"
+                )
+            renamer = _RenameName(last.id, outer_name)
+            # The first `for`'s list is read in the enclosing scope, as in
+            # Python (`[f for f in f.children]` loops over the outer f's).
+            first_iter = copy.deepcopy(inner.generators[0].iter)
+            flat = [renamer.visit(g) for g in inner.generators]
+            flat[0].iter = first_iter
+            flat[-1].ifs = flat[-1].ifs + generator.ifs
+            generators.extend(flat)
+        node.generators = generators
+        return node
+
+    visit_GeneratorExp = _flatten
+    visit_ListComp = _flatten
+
+
 def _desugar_comprehensions(node: ast.AST) -> ast.AST:
     node = ast.fix_missing_locations(_TypedListLookup().visit(node))
+    node = _ComprehensionFlattener().visit(node)
     rewritten = _ComprehensionDesugarer().visit(node)
     return ast.fix_missing_locations(rewritten)
 
