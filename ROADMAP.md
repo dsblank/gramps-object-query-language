@@ -1501,6 +1501,52 @@ and `select`; reject at parse time if nothing follows the call with a
 `.path` (mirrors `exists`'s own "relationship name needs something after
 it" rule).
 
+### Follow-ups from `event_refs` / `backlinks['Person']` (2026-11-26)
+
+Left after #30-#34 (typed lists, `event_refs`/`referrer`, link-loop
+completion, `backlinks['Person']`, error messages). The gramps-connect
+side (Events list Main Participants / Age columns, Anniversaries "Only
+living" on the server) is in gramps-connect's `TODO.md`.
+
+- **`referrer._class`, and a Main Participants recipe.** Gramps' Main
+  Participants is "a Primary person, else a family with the Family role".
+  Today that's written by telling the two kinds apart through a field only
+  one has (checked on two real trees, matching Gramps on every event):
+
+  ```
+  [r.referrer.handle for r in event_refs
+     if (r.role.value == EventRoleType.PRIMARY and r.referrer.gender != None)
+     or (r.role.value == EventRoleType.FAMILY and r.referrer.complete != None)][0]
+  ```
+
+  Let `r.referrer._class == 'Person'` say it directly. `_class` is stored on
+  every record and is already the name plain `backlinks` conditions use,
+  so it adds no new word: resolve `_class` per referrer type in
+  `_resolve_referrer` (SQL: the branch's constant class name; evaluator:
+  `referrer_spec`), with parity tests. Then add the rule to
+  README-query-language.md as a recipe. gramps-connect's Main Participants
+  column would use it, so it comes first.
+- **Built-in source attribute names.** `attribute_list['...']` looks a
+  built-in name up in `AttributeType` on every record; Sources and
+  Citations store `SrcAttributeType`, so a built-in source attribute name
+  doesn't match by number. Custom names (what citation templates use, e.g.
+  "Film") work. The fix (`_LOOKUP_LISTS` choosing the type class by the
+  record) makes such queries find entries where they found none -- a bug
+  fix, but a change in what they match, so call it out.
+- **Random parity coverage.** `tests/random_queries.py` doesn't generate
+  `event_refs` (with `referrer`, role brackets, picks) or
+  `backlinks['Person']` yet; `random_tree.py` would need referrers in
+  several roles and records pointing at one another. The hand-written
+  parity tests cover both; random queries find the combinations those miss.
+- **`Date(...)` inside arithmetic.** `(Date('today') - birth.date.sortval)
+  // 365 < 110` is rejected: an arithmetic side must be a field or a
+  number, and `Date(...)` is neither, so a "born more than N years ago"
+  rule has to pass its cutoff in (`birth.date.sortval > Env.BORN_AFTER`).
+  Treat `Date(...)` as the number it already is (its sortval) on an
+  arithmetic side. Its message is also unhelpful today -- "expected a field
+  here, such as surname or birth.date.sortval -- got: Date('today')" --
+  missed by #34's corpus.
+
 ### Other gaps (not yet scoped to this level of detail)
 
 - **`exists(...)`/`count(...)` condition referencing the *outer* row** (e.g.
