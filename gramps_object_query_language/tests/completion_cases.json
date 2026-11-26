@@ -1462,6 +1462,19 @@
       ]
     },
     {
+      "namespace": "Event",
+      "source": "any(r for r in event_refs['Primary'] if r.",
+      "expect": [
+        "attribute_list",
+        "citation_list",
+        "note_list",
+        "private",
+        "ref",
+        "referrer",
+        "role"
+      ]
+    },
+    {
       "namespace": "Person",
       "source": "any(c for c in child_refs if c.",
       "expect": [
