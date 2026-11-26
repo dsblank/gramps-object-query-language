@@ -44,6 +44,16 @@ does today.
   `exists(...)`/`count(...)` condition to reference the *outer* row (e.g. "a
   child with the same surname as the father") -- both still flagged as
   follow-ups, not solved here.
+- A collection past a hop can only be indexed:
+  `parent_families[0].children[0].gender` works, but
+  `len(parent_families[0].children)`, `any(...)` over it, or a
+  comprehension's `for c in parent_families[0].children` are rejected
+  (counting works through the stored list instead:
+  `len(parent_families[0].child_ref_list)`). Allowing them needs the
+  collection subquery to correlate to the hop's `<table>__hop<n>` alias,
+  plus the Python evaluator, completion (which now offers these only as
+  `children[`) and its ports. Asked for on the Gramps Discourse (a
+  Siblings column).
 
 **Values and functions**
 - Three whitelisted function-call forms exist: `like(field, 'pattern')`,
