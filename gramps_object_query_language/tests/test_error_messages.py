@@ -21,7 +21,7 @@ from gramps_object_query_language.query_lang import (
 #: Text that means a message leaked internals.
 _LEAKS = (
     "Name(", "Attribute(", "Call(", "Constant(", "Compare(", "Subscript(", "ListComp(",
-    "_pick(", "_count(", "_distinct(", "_entry", "je.value", "link.value",
+    "_pick(", "_count(", "_distinct(", "_chain(", "_entry", "je.value", "link.value",
     "JsonPath(", "RelatedObject(", "Collection(", "ctx=Load",
 )
 
@@ -66,6 +66,10 @@ CASES = [
     ("Person", "any()", "any() takes a list or collection and, optionally, a condition: any(events), any(events, type == 'Census'), any(e for e in events if ...)"),
     ("Person", "len(1, 2, 3) > 0", None),
     ("Person", "len(events)", "len(events) is a number, not a condition"),
+    ("Person", "len([c for f in parent_families for c in f.children])", "len([c for f in parent_families for c in f.children]) is a number, not a condition"),
+    ("Person", "len(distinct([c.handle for f in parent_families for c in f.children]))", "len(distinct([c.handle for f in parent_families for c in f.children])) is a number, not a condition"),
+    ("Person", "not len([c for f in parent_families if f.private == True for c in f.children])", "len([c for f in parent_families if f.private == True for c in f.children]) is a number, not a condition"),
+    ("Person", "distinct([c.handle for f in parent_families for c in f.children])", "expected a condition"),
     ("Person", "any(surname)", "surname isn't a list, so it can't be counted or tested with any(...)"),
     ("Person", "any(note_list, x == 1)", "note_list holds plain values, with no fields for a condition to test"),
     ("Person", "exists(father.events)", None),

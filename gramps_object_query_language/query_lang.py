@@ -1312,7 +1312,7 @@ def _bare_path_leaf_message(node: ast.AST, spec: ObjectTypeSpec) -> str:
 
 #: The functions an expression can call, as a user writes them.
 _FUNCTION_NAMES = ("any", "len", "like", "regex", "Date", "distinct", "exists", "count")
-_INTERNAL_CALLS = {"_pick", "_count", "_distinct"}  # see _PICK, _COUNT, _DISTINCT
+_INTERNAL_CALLS = {"_pick", "_count", "_distinct", "_chain", "_distinct_chain"}  # see _PICK, _COUNT, _DISTINCT, _CHAIN
 #: Python functions people reach for, and what to write instead.
 _INSTEAD_OF = {
     "all": "not any(x for x in <list> if not <condition>)",
@@ -1379,7 +1379,7 @@ def _translate_comparison_like_node(node: ast.AST, spec: ObjectTypeSpec) -> dict
     if (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
-        and node.func.id in ("len", "count", _COUNT)
+        and node.func.id in ("len", "count", _COUNT, _CHAIN)
     ):
         raise QueryLangError(
             f"{_show(node)} is a number, not a condition -- compare it, e.g. "
