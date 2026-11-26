@@ -3326,3 +3326,18 @@ def test_any_multiple_for_rejected(expr, message):
 def test_len_multiple_for_rejected(expr, message):
     with pytest.raises(QueryLangError, match=message):
         parse_expr("person", expr)
+
+
+def test_siblings_used_as_a_field_rejected_without_stored_list_hint():
+    from gramps_object_query_language.query_lang import compile_expr
+
+    with pytest.raises(Exception, match="collection of Person records") as info:
+        compile_expr("Person", "siblings.gender == 1")
+    assert "parent_family_list" not in str(info.value)
+
+
+def test_siblings_only_on_person():
+    from gramps_object_query_language.query_lang import compile_expr
+
+    with pytest.raises(Exception, match="siblings"):
+        compile_expr("Family", "len(siblings) > 0")

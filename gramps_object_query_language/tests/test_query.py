@@ -2874,6 +2874,7 @@ _EXPECTED_COLLECTIONS = {
     (PERSON, "child_refs"): (FAMILY, "parent_family_list", None),
     (PERSON, "associations"): (PERSON, "person_ref_list", "ref"),
     (PERSON, "events"): (EVENT, "event_ref_list", "ref"),
+    (PERSON, "siblings"): (PERSON, "parent_family_list", None),
     (FAMILY, "children"): (PERSON, "child_ref_list", "ref"),
     (FAMILY, "notes"): (NOTE, "note_list", None),
     (FAMILY, "citations"): (CITATION, "citation_list", None),

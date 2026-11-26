@@ -457,6 +457,7 @@ cite other citations; a `Repository` has neither `citations` nor `media`;
 | `Person`    | `tags` -> `Tag`               | attached tags | `tag_list` |
 | `Person`    | `families` -> `Family`        | families as a spouse/parent | `family_list` |
 | `Person`    | `parent_families` -> `Family` | families as a child | `parent_family_list` |
+| `Person`    | `siblings` -> `Person`        | everyone else in one of those families, each once | `parent_family_list`, then each family's `child_ref_list` |
 | `Person`    | `associations` -> `Person`    | other people linked via an association | `person_ref_list` |
 | `Person`    | `events` -> `Event`           | every recorded event, not just birth/death | `event_ref_list` |
 | `Family`    | `children` -> `Person`        | the family's children | `child_ref_list` |

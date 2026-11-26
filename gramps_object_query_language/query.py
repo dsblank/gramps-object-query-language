@@ -323,11 +323,13 @@ def _misused_collection(spec: ObjectTypeSpec, name: str) -> Optional[str]:
         )
     target = _record_name(collection.target)
     stored = ".".join(map(str, collection.list_path.segments))
+    # `siblings` isn't stored on the record, so there's no list to count.
+    anywhere = "" if collection.via_chain else f"; len({stored}) counts them from anywhere"
     return (
         f"{name} is a collection of {target} records, not a field -- read one of them "
         f"as {name}[0].<field> (e.g. {name}[0].gramps_id), or loop over them where "
         f"they're on the record being queried: any(x.gramps_id == ... for x in {name}), "
-        f"len({name}); len({stored}) counts them from anywhere"
+        f"len({name}){anywhere}"
     )
 
 
@@ -790,6 +792,11 @@ class Collection:
     #: that class's spec; `list_path` is unused). Ordered by handle, byte by
     #: byte, for `[n]`. See `resolve_collection` and `_collection_subquery_body`.
     backlink_class: Optional[str] = None
+    #: `Person.siblings`: the records reached by walking these collections
+    #: in turn from the current row (`parent_families`, then each one's
+    #: `children`), each once, never the current row itself; `list_path`
+    #: is unused. Ordered by handle, like `backlink_class`, for `[n]`.
+    via_chain: Tuple["Collection", ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1253,6 +1260,7 @@ def resolve_any_path(
             if isinstance(collection, Collection)
             and not collection.self_link_field
             and not collection.backlink_class
+            and not collection.via_chain
             and collection.list_path.segments == tuple(array_path.segments)
         ]
         hint = (
@@ -1400,6 +1408,16 @@ _COLLECTIONS: dict[str, dict[str, Collection]] = {
     },
 }
 
+# Everyone recorded as a child in one of the person's parent families, but
+# the person. Each once, even someone in two of those families.
+_COLLECTIONS[PERSON.table]["siblings"] = Collection(
+    "siblings",
+    PERSON,
+    JsonPath(("parent_family_list",)),  # unused, see Collection.via_chain
+    None,
+    via_chain=(_COLLECTIONS[PERSON.table]["parent_families"], _COLLECTIONS[FAMILY.table]["children"]),
+)
+
 # Every one of the ten object types can be pointed to by something else --
 # even Tag, via any other type's own tag_list -- so "backlinks" is injected
 # into every table uniformly here, rather than repeated by hand in each
@@ -1516,6 +1534,14 @@ def _resolve_indexed_collection_hop(
         raise QueryError(
             f"{head}[{index}] is a {collection.target.table} record, not a value on "
             f"its own -- use {head}[{index}].<field>, e.g. {head}[{index}].gramps_id"
+        )
+    if collection.via_chain:
+        # `siblings[1]`: the second of them, in handle order.
+        return RelatedObject(
+            name=f"{head}[{index}]",
+            target=collection.target,
+            handle_ref=CollectionPick(collection, spec, None, index),
+            field=resolve_column_path(collection.target, rest),
         )
     handle_segments: Tuple[Union[str, int], ...] = (*collection.list_path.segments, index)
     if collection.ref_field is not None:
@@ -2942,6 +2968,38 @@ def _collection_subquery_parts(
         where_parts = [f"{target_alias}.handle IN ({references})"]
         from_parts = [f"{target_table} AS {target_alias}"]
         from_params: list = []
+    elif collection.via_chain:
+        # `siblings`: the rows the chain reaches, by handle (so each once),
+        # less the current row.
+        chain_from: List[str] = []
+        chain_from_params: list = []
+        chain_where: List[str] = []
+        chain_where_params: list = []
+        level_spec = outer_spec
+        for index, link in enumerate(collection.via_chain):
+            parts = _collection_subquery_parts(
+                link, level_spec, None, dialect, treeid, source_alias=f"je_s{index}"
+            )
+            chain_from += parts[0]
+            chain_from_params += parts[1]
+            chain_where += parts[2]
+            chain_where_params += parts[3]
+            level_spec = replace(
+                link.target,
+                sql_alias=_collection_target_alias(link, level_spec),
+                collection_depth=level_spec.collection_depth + 1,
+            )
+        reached = (
+            f"SELECT {_sql_table(level_spec)}.handle FROM {', '.join(chain_from)} "
+            f"WHERE {' AND '.join(chain_where)}"
+        )
+        where_parts = [
+            f"{target_alias}.handle IN ({reached})",
+            f"{target_alias}.handle != {outer_table}.handle",
+        ]
+        params = chain_from_params + chain_where_params
+        from_parts = [f"{target_table} AS {target_alias}"]
+        from_params = []
     else:
         if dialect == Dialect.SQLITE:
             source, handle_expr, source_params = _collection_source_sqlite(
@@ -3574,7 +3632,7 @@ def _render_collection_pick(
     )
     depth = owner.collection_depth
     target_alias = f"{pick.collection.target.table}__target{depth or ''}"
-    if pick.collection.backlink_class is not None:
+    if pick.collection.backlink_class is not None or pick.collection.via_chain:
         # By handle, byte by byte, whatever the database's collation.
         collate = "BINARY" if dialect == Dialect.SQLITE else '"C"'
         order = f"{target_alias}.handle COLLATE {collate}"

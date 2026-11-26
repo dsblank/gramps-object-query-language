@@ -3227,6 +3227,85 @@ def test_count_across_several_for_clauses_as_a_filter(sibling_db, pg_conn):
     )
 
 
+@pytest.mark.parametrize(
+    "expr, expected",
+    [
+        ("len(siblings)", {"a": 2, "b": 2, "c": 2, "solo": 0, "lonely": 0}),
+        ("count(siblings)", {"a": 2, "b": 2, "c": 2, "solo": 0, "lonely": 0}),
+        ("len([s for s in siblings])", {"a": 2, "b": 2, "c": 2, "solo": 0, "lonely": 0}),
+        (
+            "len([s for s in siblings if s.gender == Person.FEMALE])",
+            {"a": 1, "b": 1, "c": 0, "solo": 0, "lonely": 0},
+        ),
+        ("len([s.gender for s in siblings])", {"a": 2, "b": 2, "c": 2, "solo": 0, "lonely": 0}),
+        (
+            "len(distinct([s.gender for s in siblings]))",
+            {"a": 2, "b": 2, "c": 1, "solo": 0, "lonely": 0},
+        ),
+        (
+            "len([e for s in siblings for e in s.events])",
+            {"a": 1, "b": 1, "c": 0, "solo": 0, "lonely": 0},
+        ),
+    ],
+)
+def test_siblings_count(sibling_db, pg_conn, expr, expected):
+    """`siblings`: everyone in one of the person's parent families but the
+    person, each once (a and b share two families)."""
+    test_count_across_several_for_clauses(sibling_db, pg_conn, expr, expected)
+
+
+def test_siblings_as_a_filter(sibling_db, pg_conn):
+    db, handles = sibling_db
+    for expr, expected in (
+        ("any(s.gender == Person.FEMALE for s in siblings)", {"a", "b"}),
+        ("any(s for s in siblings)", {"a", "b", "c"}),
+        ("exists(siblings)", {"a", "b", "c"}),
+        ("len(siblings) == 0", {"solo", "lonely"}),
+    ):
+        _assert_sql_and_evaluator_agree(db, handles, PERSON, _SIBLING_PEOPLE, expr, expected, pg_conn)
+    _assert_sql_and_evaluator_agree(
+        db, handles, FAMILY, ("fam1", "fam2", "fam3"),
+        "any(len(c.siblings) > 1 for c in children)", {"fam1", "fam2"}, pg_conn,
+    )
+
+
+@pytest.mark.parametrize(
+    "expr, pick",
+    [
+        ("siblings[0].gramps_id", lambda sibs, female: sibs[0]),
+        ("siblings[1].gramps_id", lambda sibs, female: sibs[1] if len(sibs) > 1 else None),
+        ("[s for s in siblings][0].gramps_id", lambda sibs, female: sibs[0]),
+        (
+            "[s for s in siblings if s.gender == Person.FEMALE][0].gramps_id",
+            lambda sibs, female: next((h for h in sibs if h in female), None),
+        ),
+    ],
+)
+def test_siblings_picked_in_handle_order(sibling_db, pg_conn, expr, pick):
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+    from gramps_object_query_language.query_lang import parse_select
+
+    db, handles = sibling_db
+    family_children = {"a": "abc", "b": "abc", "c": "abc"}
+    expected = {}
+    for key in _SIBLING_PEOPLE:
+        sibs = sorted(handles[k] for k in family_children.get(key, "") if k != key)
+        chosen = pick(sibs, {handles["c"]}) if sibs else None
+        expected[handles[key]] = db.get_person_from_handle(chosen).gramps_id if chosen else None
+    [(ref, _key)] = parse_select(PERSON, [f"{expr} as n"])
+    query = Query(select=["handle", ref])
+    sql, params = compile_query(PERSON, query, dialect=Dialect.SQLITE)
+    db.dbapi.execute(sql, params)
+    assert {h: v for h, v in db.dbapi.fetchall() if h in expected} == expected, "SQLite"
+    if pg_conn is not None:
+        sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
+        rows = _rows_on_postgresql(pg_conn, db, sql, params)
+        assert {h: v for h, v in rows if h in expected} == expected, "PostgreSQL"
+    for handle, value in expected.items():
+        person = db.get_person_from_handle(handle)
+        assert resolve_column_ref(db, person, ref, PERSON) == value, "evaluator"
+
+
 def test_distinct_count_as_a_filter(distinct_db, pg_conn):
     db, handles = distinct_db
     _assert_sql_and_evaluator_agree(

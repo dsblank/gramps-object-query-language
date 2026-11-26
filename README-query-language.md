@@ -508,13 +508,21 @@ each family's children, each child's own families, and their children.
 ### Goal: Find people with more than two brothers and sisters
 
 ```
-Person "len(distinct([c.handle for f in parent_families for c in f.children])) - 1 > 2"
+Person "len(siblings) > 2"
 ```
 
-Two `for`s go through every child of every one of the person's parent
-families. `distinct(...)` counts each child once, even one recorded in two
-of those families, and `- 1` leaves out the person themselves. (Someone
-with no parent family at all comes out as -1, which is fine for `> 2`.)
+`siblings` is everyone else recorded as a child in one of the person's
+parent families, each counted once -- even someone in two of those
+families. It works like any other list: `any(s.given_name == 'Mary' for s
+in siblings)`, `siblings[0].gramps_id`.
+
+The same count spelled out with two `for`s goes through every child of
+every parent family; `distinct(...)` counts each child once and `- 1`
+leaves out the person (someone with no parent family comes out as -1):
+
+```
+Person "len(distinct([c.handle for f in parent_families for c in f.children])) - 1 > 2"
+```
 
 ### Goal: Find people whose events happened in more than one place
 
