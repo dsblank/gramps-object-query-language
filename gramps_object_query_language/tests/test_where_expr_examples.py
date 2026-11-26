@@ -406,6 +406,28 @@ def test_any_with_several_for_clauses(db):
         db.execute("UPDATE family SET json_data = NULL WHERE handle = 'fam2'")
         db.execute("UPDATE person SET json_data = json_remove(json_data, '$.family_list')")
 
+def test_count_across_several_for_clauses(db):
+    # kid1 is fam1's only child: no brothers or sisters; nobody else has
+    # a parent family. Raise fam1 to three children (kid1, other1, mom1)
+    # for a match.
+    expr = "len(distinct([c.handle for f in parent_families for c in f.children])) - 1 > 1"
+    for handle in ("kid1", "other1", "mom1"):
+        db.execute(
+            "UPDATE person SET json_data = json_set(json_data, '$.parent_family_list', "
+            "json_array('fam1')) WHERE handle = ?",
+            (handle,),
+        )
+    try:
+        assert run(db, "Person", expr) == []
+        db.execute("UPDATE family SET json_data = ? WHERE handle = 'fam1'", (json.dumps(
+            {"child_ref_list": [{"ref": "kid1"}, {"ref": "other1"}, {"ref": "mom1"}]}),))
+        assert run(db, "Person", expr) == [("kid1",), ("mom1",), ("other1",)]
+    finally:
+        db.execute("UPDATE family SET json_data = ? WHERE handle = 'fam1'",
+                   (json.dumps({"child_ref_list": [{"ref": "kid1"}]}),))
+        db.execute("UPDATE person SET json_data = json_remove(json_data, '$.parent_family_list')")
+
+
 def test_arithmetic(db):
     # Whole years from the fixture's sortvals: dad1 (1940-1990, 50),
     # granddad1 (55), grandma1 (52) and other1 (1900-1980, 80) lived more
