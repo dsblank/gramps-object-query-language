@@ -1792,13 +1792,14 @@
       "namespace": "Person",
       "source": "any(c.gender == 1 for f in parent_families for c in f.",
       "excludes": [
-        "father",
-        "child_refs"
+        "child_refs",
+        "gramps_id"
       ],
       "contains": [
         "attribute_list",
         "events",
-        "children"
+        "children",
+        "father"
       ]
     },
     {
@@ -1876,8 +1877,10 @@
     },
     {
       "namespace": "Family",
-      "source": "any(a.value == 'a' for a in father.mo",
-      "expect": []
+      "source": "any(a.value == 'a' for a in father.bi",
+      "expect": [
+        "birth"
+      ]
     },
     {
       "namespace": "Note",
@@ -1928,6 +1931,69 @@
       "source": "any(s.given_name == 'R' for s in [c for c in children if c.gender == Person.MALE] if s.gender in [Person.MALE] and s.given_name in [",
       "contains": [
         "\""
+      ]
+    },
+    {
+      "namespace": "Family",
+      "source": "any(s.surname == 'a' for s in father.",
+      "contains": [
+        "primary_name",
+        "attribute_list",
+        "birth"
+      ],
+      "excludes": [
+        "gender",
+        "gramps_id"
+      ]
+    },
+    {
+      "namespace": "Family",
+      "source": "any(s.surname == 'a' for s in father.primary_name.",
+      "contains": [
+        "surname_list",
+        "citation_list"
+      ],
+      "excludes": [
+        "first_name",
+        "call"
+      ]
+    },
+    {
+      "namespace": "Family",
+      "source": "any(s.su for s in father.primary_name.surname_list)",
+      "cursor": 8,
+      "expect": [
+        "surname"
+      ]
+    },
+    {
+      "namespace": "Family",
+      "source": "any(s.su for c in children for s in c.primary_name.surname_list)",
+      "cursor": 8,
+      "expect": [
+        "surname"
+      ]
+    },
+    {
+      "namespace": "Family",
+      "source": "any(any(s.su for s in c.primary_name.surname_list) for c in children)",
+      "cursor": 12,
+      "expect": [
+        "surname"
+      ]
+    },
+    {
+      "namespace": "Person",
+      "source": "any(s.surname == 'a' for f in parent_families for s in f.father.prim",
+      "expect": [
+        "primary_name"
+      ]
+    },
+    {
+      "namespace": "Family",
+      "source": "any(s.surname == 'a' for s in children[0].primary_name.surname_list if s.su",
+      "expect": [
+        "surname"
       ]
     }
   ]

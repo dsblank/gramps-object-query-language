@@ -52,8 +52,9 @@ rarely parses -- it only looks at the dotted path ending at the cursor:
   `for` before it in an `if`, the one just before in a later `for`'s list,
   and none outside every loop or from an outer loop inside an inner one.
 - A loop's list (`for x in`): collections, lists, `[` for a list
-  comprehension, then one step on (`father.attribute_list`,
-  `f.children`); after another `for`, only the variable just before it.
+  comprehension, then on along a path to a list
+  (`father.primary_name.surname_list`, `f.children`); after another
+  `for`, only the variable just before it.
 - `backlinks[`: `"`, then the kinds of record (`backlinks["Pe` ->
   `Person"]`).
 - A Gramps type compared with a value (`type ==`, `type in [`): `"`, and
@@ -811,30 +812,31 @@ def _ends_with_in(text: str) -> bool:
 
 
 def _holds_lists(node: Optional[Dict[str, Any]]) -> bool:
-    """Whether a JSON object field has a list field of its own
+    """Whether a JSON object field has a list somewhere inside it
     (`primary_name` has `surname_list`)."""
     return node is not None and any(
-        _is_array(field.get("type")) for field in node.get("fields", {}).values()
+        _is_array(field.get("type")) or _holds_lists(field)
+        for field in node.get("fields", {}).values()
     )
 
 
 def _list_steps(
     vocabs: Dict[str, Any],
+    context: Optional[_Context],
     candidates: List[Tuple[str, str, Any]],
     segments: List[Tuple[str, int]],
     bindings: Dict[str, Optional[_Context]],
     later_loop: bool,
-    loop_list: bool,
 ) -> List[Tuple[str, str, Any]]:
-    """Of the names after `segments.`, those that lead toward a list.
-
-    A loop's list (`loop_list`) is one step at most: off a relationship or
-    a JSON object (`father.attribute_list`, `primary_name.surname_list`),
-    or off a loop variable (`f.attribute_list`, and its collections,
-    `f.children`); a `for` after the first goes over a list of the loop
-    variable just before it. `len(` reads any list along a path."""
+    """Of the names after `segments.` (which lead to `context`), those that
+    lead toward a list: lists, relationships, objects holding lists
+    (`father.primary_name.surname_list`), and a loop variable's collections
+    (`f.children`). A `for` after the first goes over a list of the loop
+    variable just before it."""
     first, first_indexes = segments[0]
     variable = first in bindings and not first_indexes
+    if later_loop and not variable:
+        return []
     binding = bindings.get(first) if variable else None
     collections: List[Tuple[str, str, Any]] = []
     if variable and len(segments) == 1 and binding is not None and binding[0] == "namespace":
@@ -844,14 +846,27 @@ def _list_steps(
             for name, target in owner["collections"].items()
             if name not in owner.get("links", {})
         ]
-    lists = [(name, kind, detail) for name, kind, detail in candidates if _is_array(detail)]
-    if loop_list:
-        if len(segments) > 1 or first_indexes or (later_loop and not variable):
-            return []
-        return lists + collections
+    holders = set(_list_holders(vocabs, context)) if context is not None else set()
     return [
-        (name, kind, detail) for name, kind, detail in candidates if kind == "relationship"
-    ] + lists + collections
+        (name, kind, detail)
+        for name, kind, detail in candidates
+        if kind == "relationship" or _is_array(detail) or (kind == "field" and name in holders)
+    ] + collections
+
+
+def _list_holders(vocabs: Dict[str, Any], context: _Context) -> List[str]:
+    """The JSON object fields at `context` that hold a list somewhere
+    inside (`primary_name` -> `surname_list`)."""
+    kind, value = context
+    if kind in ("referrers", "any"):
+        return [name for alternative in _alternatives(context) for name in _list_holders(vocabs, alternative)]
+    if kind == "namespace":
+        fields = vocabs[value]["fields"]
+    elif kind == "link":
+        fields = value["entry"].get("fields", {})
+    else:
+        fields = value.get("fields", {})
+    return [name for name, node in fields.items() if _holds_lists(node)]
 
 
 def complete_from_vocabularies(
@@ -1082,10 +1097,7 @@ def complete_from_vocabularies(
                 # `father.families[0]...`: one entry of a collection, across a hop.
                 candidates += _indexed_steps(vocabs, context)
             if role == "iterable":
-                candidates = _list_steps(
-                    vocabs, candidates, segments, bindings, later_loop,
-                    _ends_with_in(before[:chain_start]),
-                )
+                candidates = _list_steps(vocabs, context, candidates, segments, bindings, later_loop)
             elif role not in ("operand", "value", "is_value", "path", "number"):
                 candidates = []
 
