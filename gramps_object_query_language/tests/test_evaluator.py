@@ -3755,3 +3755,36 @@ def test_typed_backlinks_respects_privacy(event_refs_db):
         cat.set_privacy(False)
         with DbTxn("public", db) as trans:
             db.commit_person(cat, trans)
+
+
+_PATH_FAMILIES = ("family", "childless_family")
+_PATH_PEOPLE = ("father", "mother", "child_steve", "child_anna", "no_birth")
+
+
+@pytest.mark.parametrize(
+    "spec_name, where_expr, expected",
+    [
+        ("FAMILY", "any(s.surname == 'Anderson' for s in father.primary_name.surname_list)", {"family"}),
+        ("FAMILY", "any(s.surname == 'Baker' for s in father.primary_name.surname_list)", set()),
+        ("FAMILY", "len([s for s in father.primary_name.surname_list if s.surname == 'Anderson']) == 1", {"family"}),
+        ("FAMILY", "len([s.surname for s in father.primary_name.surname_list]) == 1", {"family"}),
+        ("FAMILY", "len(distinct([s.surname for s in father.primary_name.surname_list])) == 1", {"family"}),
+        ("FAMILY", "[s for s in father.primary_name.surname_list if s.surname != None][0].surname == 'Anderson'", {"family"}),
+        ("FAMILY", "[s.surname for s in father.primary_name.surname_list][0] == 'Anderson'", {"family"}),
+        ("FAMILY", "any(any(s.surname == 'Anderson' for s in c.primary_name.surname_list) for c in children)", {"family"}),
+        ("FAMILY", "any(s.surname == 'Anderson' for c in children for s in c.primary_name.surname_list)", {"family"}),
+        ("FAMILY", "any(s.surname == 'Baker' for c in children for s in c.primary_name.surname_list)", set()),
+        ("FAMILY", "any(s.surname == 'Anderson' for s in children[1].primary_name.surname_list)", {"family"}),
+        ("FAMILY", "len([s for s in children[0].primary_name.surname_list if s.surname == 'Baker']) == 0", {"family", "childless_family"}),
+        ("FAMILY", "[s.surname for s in children[0].primary_name.surname_list][0] == 'Anderson'", {"family"}),
+        ("PERSON", "any(n.first_name == 'Karl' for n in [m for m in alternate_names])", set()),
+    ],
+)
+def test_loop_over_a_list_more_than_one_step_away(db_handles, pg_conn, spec_name, where_expr, expected):
+    """A loop goes over any list `any(path, ...)` reaches: through a
+    relationship and a JSON object (`father.primary_name.surname_list`),
+    and off a loop variable (`c.primary_name.surname_list`)."""
+    db, handles = db_handles
+    spec = {"FAMILY": FAMILY, "PERSON": PERSON}[spec_name]
+    keys = _PATH_FAMILIES if spec is FAMILY else _PATH_PEOPLE
+    _assert_sql_and_evaluator_agree(db, handles, spec, keys, where_expr, expected, pg_conn)

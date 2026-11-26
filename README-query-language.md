@@ -534,6 +534,17 @@ A loop can go over a list comprehension -- here, the family's sons. It
 means the same as one comprehension with both conditions:
 `any(c.given_name == 'Robert' for c in children if c.gender == Person.MALE)`.
 
+### Goal: Find families whose mother has Doyle among her surnames
+
+```
+Family "any(s.surname == 'Doyle' for s in mother.primary_name.surname_list)"
+```
+
+A loop's list can be anywhere a path reaches: across the `mother`
+relationship and into her name's list of surnames. Inside another loop it
+starts from that loop's variable:
+`any(s.surname == 'Doyle' for c in children for s in c.primary_name.surname_list)`.
+
 ### Goal: Find people whose events happened in more than one place
 
 ```

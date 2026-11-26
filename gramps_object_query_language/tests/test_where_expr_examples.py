@@ -441,6 +441,25 @@ def test_loop_over_a_list_comprehension(db):
     assert run(db, "Family", expr) == []
 
 
+def test_loop_over_a_list_several_steps_away(db):
+    # grandma1 (fam2's mother) has two surnames, Doyle among them.
+    db.execute(
+        "UPDATE person SET json_data = json_set(json_data, '$.primary_name', "
+        "json('{\"surname_list\": [{\"surname\": \"Ryan\"}, {\"surname\": \"Doyle\"}]}')) "
+        "WHERE handle = 'grandma1'"
+    )
+    expr = "any(s.surname == 'Doyle' for s in mother.primary_name.surname_list)"
+    assert run(db, "Family", expr) == [("fam2",)]
+    # Give kid1, fam1's child, the same two surnames.
+    db.execute(
+        "UPDATE person SET json_data = json_set(json_data, '$.primary_name', "
+        "json('{\"surname_list\": [{\"surname\": \"Smith\"}, {\"surname\": \"Doyle\"}]}')) "
+        "WHERE handle = 'kid1'"
+    )
+    expr = "any(s.surname == 'Doyle' for c in children for s in c.primary_name.surname_list)"
+    assert run(db, "Family", expr) == [("fam1",)]
+
+
 def test_arithmetic(db):
     # Whole years from the fixture's sortvals: dad1 (1940-1990, 50),
     # granddad1 (55), grandma1 (52) and other1 (1900-1980, 80) lived more

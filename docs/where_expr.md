@@ -821,11 +821,13 @@ Python itself:
   == 'Ann' for c in children if c.gender == Person.FEMALE)`, `for`s and `if`s
   included. Collecting anything else (`[c.father for c in ...]`, `[1 for
   ...]`) is an error.
-- `<list>` is a collection name, a list inside the record (optionally
-  across a relationship, `father.attribute_list`), or -- inside another
-  comprehension -- exactly one attribute off the enclosing loop variable:
+- `<list>` is a collection name, or a list reached by any path -- inside
+  the record, through objects, relationships and indexes
+  (`father.primary_name.surname_list`, `children[0].attribute_list`), or,
+  inside another comprehension, off the enclosing loop variable:
   `any(any(e.type.value == EventType.BIRTH for e in c.events) for c in
-  children)`, not a longer chain.
+  children)`, `any(s.surname == 'Smith' for c in children for s in
+  c.primary_name.surname_list)`.
 - `all(...)`/`sum(...)` aren't recognized -- there's no established
   motivating query for them yet, and `all(...)` in particular would need a
   double negation (`not any(not ... for ...)`) under the hood.

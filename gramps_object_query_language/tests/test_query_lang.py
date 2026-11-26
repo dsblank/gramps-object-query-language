@@ -3002,18 +3002,17 @@ def test_entries_of_a_type_on_other_records():
         ),
     ],
 )
-def test_attribute_lookup_has_the_long_forms_limits(short, long):
-    """The sugar is the long form, so it reaches exactly as far: a list on
-    the record or one link away, not further (TODO: lists one link away)."""
+def test_attribute_lookup_reaches_as_far_as_the_long_form(short, long):
+    """The sugar is the long form, so it reaches exactly as far: a list
+    several links away (`parent_families[0].father.attribute_list`), or off
+    a loop variable and across a link (`f.father.attribute_list`)."""
     from gramps_object_query_language.query import PERSON
-    from gramps_object_query_language.query_lang import QueryLangError, parse_expr_for_spec
+    from gramps_object_query_language.query_lang import parse_expr_for_spec
 
-    def message(expr):
-        with pytest.raises(QueryLangError) as error:
-            parse_expr_for_spec(PERSON, expr if "==" in expr else expr + " == 'y'")
-        return str(error.value).split(":")[0]
+    def parsed(expr):
+        return parse_expr_for_spec(PERSON, expr if expr.startswith("any(") else expr + " == 'y'")
 
-    assert message(short) == message(long)
+    assert parsed(short) == parsed(long)
 
 
 def test_type_name_compiles_to_value():
@@ -3293,7 +3292,7 @@ def test_any_multiple_for_matches_nested_any(multi, nested):
     "expr, message",
     [
         ("any(c.gender == 1 for f in parent_families for c in children)", "loop variable just before it"),
-        ("any(c.gender == 1 for f in parent_families for c in f.father.events)", "loop variable just before it"),
+        ("any(c.gender == 1 for f in parent_families for c in f.father.events)", "through a relationship hop"),
         ("any(c.gender == 1 for f in parent_families for c in f.children if f.private == True)", "inner loop's condition"),
     ],
 )
