@@ -381,6 +381,18 @@ is every Occupation attribute, not just the first. Web links work the same
 way by their type: `urls['E-mail'].path` is a person's first e-mail
 address, and `len(urls['E-mail'])` how many they have.
 
+### Goal: Find notes attached to someone named Ann
+
+```
+Note "any(p.primary_name.first_name == 'Ann' for p in backlinks['Person'])"
+```
+
+`backlinks` is everything pointing at a record; with a kind of record in
+brackets, it is those records themselves, so their own fields can be
+tested. `len(backlinks['Family'])` counts the families pointing here, and
+`backlinks['Person'].gramps_id` reads one of the people. See
+[One kind of referrer](docs/where_expr.md#one-kind-of-referrer-backlinksperson).
+
 ### Goal: Show who each event belongs to, and their age at it
 
 ```

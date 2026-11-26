@@ -3458,3 +3458,82 @@ def test_event_refs_select_objects(event_refs_db, pg_conn, entry):
     if pg_conn is not None:
         sql, params = compile_query(EVENT, query, dialect=Dialect.POSTGRESQL)
         assert dict(normalize(row) for row in _rows_on_postgresql(pg_conn, db, sql, params)) == sqlite
+
+
+# --- backlinks['Person']: the records of one kind pointing here ------------
+
+
+@pytest.mark.parametrize(
+    "where_expr, expected",
+    [
+        ("any(backlinks['Person'])", {"death", "census", "marriage", "double"}),
+        ("exists(backlinks['Person'], gramps_id == 'I0003')", {"census", "marriage"}),
+        ("count(backlinks['Person']) == 0", {"orphan"}),
+        ("not any(backlinks['Note'])", set(_EVENTS)),
+        ("len(backlinks['Person']) == 3", {"census"}),
+        # Bob points at "double" twice; he is one record.
+        ("len(backlinks['Person']) == 1", {"death", "marriage", "double"}),
+        ("len(backlinks['Family']) == 1", {"marriage"}),
+        ("len([p for p in backlinks['Person'] if p.gender == Person.FEMALE]) == 2", {"census"}),
+        ("any(p.gender == Person.MALE for p in backlinks['Person'])", {"census", "double"}),
+        ("any(backlinks['Family'], father.primary_name.first_name == 'Bob')", {"marriage"}),
+        ("any(p.birth.date.sortval > 0 for p in backlinks['Person'])", {"death", "census", "double"}),
+        ("any(any(f.gramps_id == 'F0001' for f in p.parent_families) for p in backlinks['Person'])", {"census", "marriage"}),
+        ("len(distinct([p.gender for p in backlinks['Person']])) == 2", {"census"}),
+        # First by handle, byte by byte: Bzz_ann, aaa_bob, ccc_cat.
+        ("backlinks['Person'].gramps_id == 'I0001'", {"death", "census"}),
+        ("backlinks['Person'][1].gramps_id == 'I0002'", {"census"}),
+        ("backlinks['Person'][2].primary_name.first_name == 'Cat'", {"census"}),
+        ("[p.gramps_id for p in backlinks['Person'] if p.gender == Person.MALE][0] == 'I0002'", {"census", "double"}),
+        ("backlinks['Person'].gramps_id == None", {"orphan"}),
+    ],
+)
+def test_typed_backlinks_where(event_refs_db, pg_conn, where_expr, expected):
+    db, handles = event_refs_db
+    _assert_sql_and_evaluator_agree(db, handles, EVENT, _EVENTS, where_expr, expected, pg_conn)
+
+
+@pytest.mark.parametrize(
+    "where_expr, expected",
+    [
+        ("backlinks['Family'].gramps_id == 'F0001'", {"ann", "bob", "cat"}),
+        ("any(f.father.primary_name.first_name == 'Bob' for f in backlinks['Family'])", {"ann", "bob", "cat"}),
+        ("not any(backlinks['Person'])", {"ann", "bob", "cat"}),
+    ],
+)
+def test_typed_backlinks_on_people(event_refs_db, pg_conn, where_expr, expected):
+    db, handles = event_refs_db
+    _assert_sql_and_evaluator_agree(db, handles, PERSON, ("ann", "bob", "cat"), where_expr, expected, pg_conn)
+
+
+@pytest.mark.parametrize(
+    "entry, expected",
+    [
+        ("backlinks['Person'].primary_name.first_name", {"death": "Ann", "census": "Ann", "marriage": "Cat", "double": "Bob"}),
+        ("backlinks['Person'][2].gramps_id", {"census": "I0003"}),
+        ("len(backlinks['Person'])", {"death": 1, "census": 3, "marriage": 1, "double": 1, "orphan": 0}),
+        ("backlinks['Family'].father.gramps_id", {"marriage": "I0002"}),
+    ],
+)
+def test_typed_backlinks_select(event_refs_db, pg_conn, entry, expected):
+    test_event_refs_select(event_refs_db, pg_conn, entry, expected)
+
+
+def test_typed_backlinks_respects_privacy(event_refs_db):
+    """Through PrivateProxyDb a private person isn't among the backlinks."""
+    from gramps_object_query_language.query_lang import compile_expr_for_spec
+
+    db, handles = event_refs_db
+    cat = db.get_person_from_handle(handles["cat"])
+    cat.set_privacy(True)
+    with DbTxn("private", db) as trans:
+        db.commit_person(cat, trans)
+    try:
+        proxy = PrivateProxyDb(db)
+        where = compile_expr_for_spec(EVENT, "len(backlinks['Person']) == 3")
+        assert evaluate_where(db, db.get_event_from_handle(handles["census"]), where, EVENT) is True
+        assert evaluate_where(proxy, proxy.get_event_from_handle(handles["census"]), where, EVENT) is False
+    finally:
+        cat.set_privacy(False)
+        with DbTxn("public", db) as trans:
+            db.commit_person(cat, trans)

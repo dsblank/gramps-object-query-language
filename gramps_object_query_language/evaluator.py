@@ -420,13 +420,25 @@ def _resolve(
     return get_flat_column(data, ref, spec)
 
 
-def _collection_handles(data: Any, collection: Collection) -> list:
+def _collection_handles(data: Any, collection: Collection, reader: Optional[RecordReader] = None) -> list:
     """The list of related handles for `collection` on `data` -- a plain
     handle string per element (`notes`), or each element's `ref_field`
     pulled out (`children`'s `ChildRef.ref`) -- mirrors `query.py`'s
     `_collection_source_sqlite`/`_collection_source_postgresql` exactly, just
     walking the real in-memory list instead of rendering SQL to iterate it.
     """
+    if collection.backlink_class is not None:
+        # `backlinks['Person']`: in handle order, as the SQL picks them.
+        assert reader is not None
+        return sorted(
+            {
+                handle
+                for class_name, handle in reader.db.find_backlink_handles(
+                    _handle(data), [collection.backlink_class]
+                )
+                if class_name == collection.backlink_class
+            }
+        )
     items = get_json_path(data, collection.list_path) or []
     if collection.ref_field:
         return [item.get(collection.ref_field) for item in items if item]
@@ -601,7 +613,7 @@ def _collection_rows(
     if collection.referrers:
         yield from _referring_entries(reader, data, collection)
         return
-    for handle in _collection_handles(data, collection):
+    for handle in _collection_handles(data, collection, reader):
         related = reader.get(collection.target.table, handle)
         if related is None:
             continue
@@ -706,7 +718,7 @@ def _collection_pick(reader: RecordReader, data: Any, pick: CollectionPick) -> A
     as the SQL join finds no row for it."""
     target = pick.collection.target
     position = 0
-    for handle in _collection_handles(data, pick.collection):
+    for handle in _collection_handles(data, pick.collection, reader):
         related = reader.get(target.table, handle)
         if related is None:
             continue
