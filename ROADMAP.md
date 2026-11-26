@@ -1560,6 +1560,29 @@ living" on the server) is in gramps-connect's `TODO.md`.
   as `test_sql_and_evaluator_agree_on_like_and_contains`. Note for anyone
   indexing these columns: a plain btree can serve `LIKE 'Smi%'` (with
   `text_pattern_ops`) but not `ILIKE`; a trigram index can serve both.
+- **BUG: field-vs-field substring `in` crashes on PostgreSQL** (found
+  2026-11-26). `Family "father.surname in mother.surname"` compiles, but
+  the PostgreSQL SQL contains bare `'%' || ... || '%'` literals next to
+  `%s` placeholders, and psycopg2 reads the literal `%` as a placeholder:
+  `IndexError: list index out of range` in `cursor.execute` (SharedPostgreSQL),
+  a 500 from gramps-web-api's `/api/families/query/`. Repro:
+  `compile_query(spec, Query(select=["handle"], where=cond),
+  dialect=Dialect.POSTGRESQL)` -> SQL has `ILIKE '%' || REPLACE(...`
+  with `params == [50]`. Fix: escape literal `%` as `%%` in SQL
+  rendered for a pyformat driver (or pass the `'%'` pieces as bound
+  parameters), and check `like(...)`'s rendering and any other literal `%`
+  the same way. SQLite (`?` placeholders) is unaffected. The PostgreSQL
+  parity test above would have caught it.
+- **Type in brackets on `events` (and `notes`)** -- `len(events['Census'])`
+  is rejected ("a name in brackets ... works on attribute_list,
+  event_refs, urls -- not on events['Census']"), so counting a person's
+  census events needs `len([e for e in events if e.type == 'Census'])`.
+  It looks exactly like `attribute_list['Occupation']`, so it should work
+  the same (AGENTS.md: things that look the same work the same): on
+  `events` the bracket matches the event's `type`; on `notes`, the note's
+  `type`. Same meaning as the existing typed lists: a path read straight
+  off it is the first one, and looped over / `len()` / `any()` it is all
+  of them. Needs completion of the type names after `events['`.
 - **Duplicate `RelatedObject` subqueries across `And` legs** -- a chained
   comparison against the same relationship path
   (`Date(...) < mother.birth.sortval < Date(...)`) renders the *entire*
