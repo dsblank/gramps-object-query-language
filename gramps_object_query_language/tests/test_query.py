@@ -2474,13 +2474,14 @@ def test_resolve_any_path_uses_class_not_title():
 
 
 def test_resolve_any_path_rejects_list_of_scalars():
-    for segments in [("note_list",), ("tag_list",)]:
-        with pytest.raises(QueryError, match="list-of-structs"):
-            resolve_any_path(PERSON, segments)
+    with pytest.raises(QueryError, match=r"note_list holds plain values, with no fields for a condition to test.*loop over notes"):
+        resolve_any_path(PERSON, ("note_list",))
+    with pytest.raises(QueryError, match=r"tag_list holds plain values.*loop over tags"):
+        resolve_any_path(PERSON, ("tag_list",))
 
 
 def test_resolve_any_path_rejects_non_array_field():
-    with pytest.raises(QueryError, match="JSON array path"):
+    with pytest.raises(QueryError, match="gender isn't a list -- a loop, any"):
         resolve_any_path(PERSON, ("gender",))
 
 

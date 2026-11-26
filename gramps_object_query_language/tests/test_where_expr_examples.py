@@ -1037,7 +1037,7 @@ def test_any_of_path_rejects_list_of_scalars_doc_example():
     conn.execute(
         "INSERT INTO person VALUES ('p1', ?)", (json.dumps({"note_list": ["note-1"]}),)
     )
-    with pytest.raises(QueryLangError, match="list-of-structs"):
+    with pytest.raises(QueryLangError, match="holds plain values"):
         run(conn, "Person", "any(n.format == 0 for n in note_list)")
 
 

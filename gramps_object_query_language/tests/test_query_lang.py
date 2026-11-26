@@ -715,16 +715,13 @@ def test_constant_inside_in_list():
 
 
 def test_unknown_constant_namespace_treated_as_path():
-    # `Foo.BAR`'s base name isn't a registered constant class
-    # (`_CONSTANT_CLASSES`), so `_is_path_node` can't tell it apart from a
-    # genuine (if made-up) relationship-style path like `father.surname` --
-    # same deferred-validation philosophy as any other unrecognized path
-    # segment (see test_bare_relationship_name_parses_here_rejected_downstream).
-    # It parses to a value_column, not an error, here.
-    result = parse_expr("person", "gender == Foo.BAR")
-    assert result == [
-        {"column": "gender", "op": "eq", "value_column": {"json_path": ["Foo", "BAR"]}}
-    ]
+    # `Foo.BAR`'s base name isn't a registered constant class, and no
+    # field starts with a capital letter, so it can only be a misspelled
+    # named value: said so here, rather than as an unknown field later.
+    with pytest.raises(QueryLangError, match=r"unknown name 'Foo' -- fields start with a small letter"):
+        parse_expr("person", "gender == Foo.BAR")
+    with pytest.raises(QueryLangError, match=r"unknown name 'Persn' \(did you mean 'Person'\?\) -- fields start"):
+        parse_expr("person", "gender == Persn.MALE")
 
 
 def test_unknown_constant_namespace_still_rejected_inside_in_list():
@@ -1627,9 +1624,9 @@ def test_len_of_path_without_condition_unchanged():
 
 
 def test_any_len_of_path_with_condition_rejects_list_of_scalars():
-    with pytest.raises(QueryLangError, match="list-of-structs"):
+    with pytest.raises(QueryLangError, match="note_list holds plain values"):
         parse_expr("person", "any(note_list, value == 'X')")
-    with pytest.raises(QueryLangError, match="list-of-structs"):
+    with pytest.raises(QueryLangError, match="note_list holds plain values"):
         parse_expr("person", "len(note_list, value == 'X') > 0")
 
 
@@ -2493,9 +2490,9 @@ def test_env_through_a_relationship_and_inside_any():
 
 
 def test_env_name_is_case_sensitive_and_must_be_known():
-    with pytest.raises(QueryLangError, match=r"unknown Env value: Env.home \(known: Env.HOME\)"):
+    with pytest.raises(QueryLangError, match=r"unknown Env value Env.home \(did you mean 'Env.HOME'\?\) \(passed in: Env.HOME\)"):
         parse_expr("person", "handle == Env.home", env={"HOME": "H1"})
-    with pytest.raises(QueryLangError, match=r"known: none"):
+    with pytest.raises(QueryLangError, match=r"unknown Env value Env.HOME: no Env values were passed in"):
         parse_expr("person", "handle == Env.HOME")
 
 
@@ -2562,7 +2559,7 @@ def test_env_in_select_and_order_by():
     order = parse_order_by_entry(PERSON, "-count(events, description == Env.D)", env)
     assert order == OrderBy(ref, "desc")
     assert parse_order_by(PERSON, ["-count(events, description == Env.D)"], env) == [order]
-    with pytest.raises(QueryLangError, match=r"unknown Env value: Env.D \(known: none\)"):
+    with pytest.raises(QueryLangError, match=r"unknown Env value Env.D: no Env values were passed in"):
         parse_select_entry(PERSON, "count(events, description == Env.D)")
 
 
@@ -2580,7 +2577,7 @@ def test_env_in_select_and_order_by():
     ],
 )
 def test_literal_of_the_wrong_type_is_rejected(expr, env):
-    with pytest.raises(QueryError, match="^cannot compare a (number|string|boolean) field with "):
+    with pytest.raises(QueryError, match=r"^cannot compare \S+( count| value)? with .*: it holds (text|a number|True or False), so compare it with "):
         compile_expr_for_spec(PERSON, expr, env=env)
 
 
@@ -2621,7 +2618,7 @@ def test_date_today_is_todays_sortval():
     assert parse_expr("person", "birth.date.sortval > Date('today')") == [
         {"column": {"json_path": ["birth", "date", "sortval"]}, "op": "gt", "value": expected}
     ]
-    with pytest.raises(QueryLangError, match="could not parse 'now'"):
+    with pytest.raises(QueryLangError, match=r"Date\('now'\): not a date Gramps can read -- try Date\('1900-01-31'\)"):
         parse_expr("person", "change > Date('now')")
 
 
@@ -2641,7 +2638,7 @@ def test_bare_relationship_as_condition_explains_itself(namespace, expr):
     with pytest.raises(QueryLangError) as excinfo:
         parse_expr(namespace, expr)
     message = str(excinfo.value)
-    assert "is a relationship on" in message
+    assert "is a link from" in message
     assert ".handle != None" in message
     assert "Name(" not in message
 
@@ -2651,7 +2648,7 @@ def test_bare_collection_as_condition_explains_itself(expr):
     with pytest.raises(QueryLangError) as excinfo:
         parse_expr("person", expr)
     message = str(excinfo.value)
-    assert "'events' is a collection on 'person'" in message
+    assert "'events' is one of Person's collections, not a condition" in message
     assert "any(events)" in message
     assert "any(x for x in events if" in message
 
@@ -2745,9 +2742,9 @@ def test_indexed_collection_hop_resolves_like_a_relationship():
     "entry, message",
     [
         ("parent_families[0]", "use parent_families[0].<field>"),
-        ("child_refs[0].frel", "unknown field 'child_refs'"),
-        ("backlinks[0].handle", "unknown field 'backlinks'"),
-        ("parent_families.father.surname", "unknown field 'parent_families'"),
+        ("child_refs[0].frel", "child_refs is a collection, not a field, and its entries can't be picked by number"),
+        ("backlinks[0].handle", "backlinks is a collection, not a field"),
+        ("parent_families.father.surname", "parent_families is a collection of Family records, not a field -- read one of them as parent_families[0]"),
     ],
 )
 def test_indexed_collection_hop_rejects(entry, message):
@@ -2775,10 +2772,10 @@ def test_picked_entry_parses_in_select_where_and_order_by():
     [
         ("[f for f in parent_families][0]", "add a field after it"),
         ("[b for b in backlinks][0].handle", "can't take one entry of 'backlinks'"),
-        ("[a.value for a in attribute_list][-1]", "plain number"),
+        ("[a.value for a in attribute_list][-1]", "an index is a number from 0"),
         ("[len(a) for a in attribute_list][0]", "collect the loop variable or a field of it"),
         ("[surname for a in attribute_list][0]", "collect the loop variable or a field of it"),
-        ("[a for a in gramps_id][0]", "requires a JSON array path"),
+        ("[a for a in gramps_id][0]", "gramps_id isn't a list"),
     ],
 )
 def test_picked_entry_rejects(entry, message):
@@ -2887,10 +2884,10 @@ def test_attribute_lookup_custom_is_not_a_builtin():
 @pytest.mark.parametrize(
     "entry, message",
     [
-        ("primary_name['x']", "only works on attribute_list, event_refs, urls"),
-        ("alternate_names['Birth Name'].surname", "only works on attribute_list, event_refs, urls"),
-        ("len(event_ref_list['Primary'])", "only works on attribute_list, event_refs, urls"),
-        ("any(e for e in alternate_names['x'])", "only works on attribute_list, event_refs, urls"),
+        ("primary_name['x']", "which works on attribute_list, event_refs, urls -- not on"),
+        ("alternate_names['Birth Name'].surname", "which works on attribute_list, event_refs, urls -- not on"),
+        ("len(event_ref_list['Primary'])", "which works on attribute_list, event_refs, urls -- not on"),
+        ("any(e for e in alternate_names['x'])", "which works on attribute_list, event_refs, urls -- not on"),
     ],
 )
 def test_attribute_lookup_rejects(entry, message):

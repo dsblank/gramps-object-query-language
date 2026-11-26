@@ -36,6 +36,7 @@ the caller's job; see `after_columns()`.
 
 from __future__ import annotations
 
+import difflib
 import enum
 import json
 import re
@@ -275,6 +276,61 @@ def _describe_schema(schema: dict) -> str:
     return schema.get("title") or schema.get("type") or "value"
 
 
+def _did_you_mean(name: Any, candidates: Iterable[str]) -> str:
+    """` -- did you mean 'surname'?` for a near miss, else `""`."""
+    if not isinstance(name, str):
+        return ""
+    close = difflib.get_close_matches(name, list(candidates), n=3, cutoff=0.75)
+    if not close:
+        lowered = {candidate.lower(): candidate for candidate in candidates}
+        close = [lowered[name.lower()]] if name.lower() in lowered else []
+    if not close:
+        return ""
+    return " (did you mean " + " or ".join(repr(c) for c in close) + "?)"
+
+
+def _record_name(spec: ObjectTypeSpec) -> str:
+    """`Person`, as a user knows the type (not its table name)."""
+    return spec.cls.__name__
+
+
+def _a(word: str) -> str:
+    return ("an " if word[:1].lower() in "aeiou" else "a ") + word
+
+
+def _misused_collection(spec: ObjectTypeSpec, name: str) -> Optional[str]:
+    """The message for a collection name used as a field (`parent_families.
+    father`, `child_refs[0]`), or `None` if `name` isn't a collection here."""
+    collection = _COLLECTIONS.get(spec.table, {}).get(name)
+    if collection is None:
+        return None
+    if isinstance(collection, Backlinks):
+        return (
+            f"{name} is a collection, not a field -- for the records of one kind, name it: "
+            f"backlinks['Person'][0].gramps_id, any(p.gramps_id == ... for p in backlinks['Person'])"
+        )
+    if collection.referrers:
+        return (
+            f"{name} is a collection, not a field -- pick an entry by role "
+            f"({name}['Primary'].referrer.gramps_id) or by a condition "
+            f"([r for r in {name} if ...][0]), or loop over them: any(r for r in {name} if ...)"
+        )
+    if collection.self_link_field:
+        return (
+            f"{name} is a collection, not a field, and its entries can't be picked "
+            f"by number -- loop over it instead: any(x for x in {name} if ...), "
+            f"len({name})"
+        )
+    target = _record_name(collection.target)
+    stored = ".".join(map(str, collection.list_path.segments))
+    return (
+        f"{name} is a collection of {target} records, not a field -- read one of them "
+        f"as {name}[0].<field> (e.g. {name}[0].gramps_id), or loop over them where "
+        f"they're on the record being queried: any(x.gramps_id == ... for x in {name}), "
+        f"len({name}); len({stored}) counts them from anywhere"
+    )
+
+
 def _relationship_names_hint(spec: ObjectTypeSpec) -> str:
     """The names that are valid at the *start* of a path on `spec` but
     aren't JSON Schema fields -- `_RELATIONSHIPS` (`birth.date`,
@@ -339,9 +395,20 @@ def walk_schema(spec: ObjectTypeSpec, segments: Sequence[Union[str, int]]) -> di
             )
         if segment not in properties:
             known = sorted(name for name in properties if not name.startswith("_"))
+            if not walked:
+                misused = _misused_collection(spec, segment) if isinstance(segment, str) else None
+                if misused is not None:
+                    raise QueryError(misused)
+                # Flat columns that aren't JSON fields (a person's `surname`).
+                known = sorted(set(known) | set(spec.columns))
+            names = known + (
+                [] if walked else list(_RELATIONSHIPS.get(spec.table, {})) + list(_COLLECTIONS.get(spec.table, {}))
+            )
+            if not walked and spec.referrers:
+                names.append("referrer")
             raise QueryError(
                 f"unknown field {segment!r} on "
-                f"{_describe_schema(schema)} -- known fields: "
+                f"{_describe_schema(schema)}{_did_you_mean(segment, names)} -- known fields: "
                 f"{', '.join(known)}"
                 f"{'' if walked else _relationship_names_hint(spec)}"
             )
@@ -1070,8 +1137,11 @@ def _wrap_length(field: "ColumnRef") -> "ColumnRef":
     if isinstance(field, RelatedObject):
         return replace(field, field=_wrap_length(field.field))
     if not isinstance(field, JsonPath):
+        name = field.name if isinstance(field, FlatColumnRef) else field
         raise QueryError(
-            f"len(...) requires a JSON array path, not a flat column: {field!r}"
+            f"{name} isn't a list, so it can't be counted or tested with any(...) -- "
+            f"len() and any() take a list on the record (attribute_list, event_ref_list) "
+            f"or a collection (events, notes)"
         )
     return Length(field)
 
@@ -1088,7 +1158,11 @@ def _terminal_json_path(ref: "ColumnRef", spec: ObjectTypeSpec) -> Tuple[JsonPat
         return _terminal_json_path(ref.field, ref.target)
     if isinstance(ref, JsonPath):
         return ref, spec
-    raise QueryError(f"any(...)/len(...) requires a JSON array path, got {ref!r}")
+    name = ref.name if isinstance(ref, FlatColumnRef) else ref if isinstance(ref, str) else "this value"
+    raise QueryError(
+        f"{name} isn't a list -- a loop, any() and len() go over a list on the record "
+        f"(attribute_list, alternate_names) or a collection (events, notes)"
+    )
 
 
 def _element_alias(depth: int) -> str:
@@ -1162,17 +1236,29 @@ def resolve_any_path(
     path_text = ".".join(str(s) for s in segments)
     if schema.get("type") != "array":
         raise QueryError(
-            f"any(...)/len(...) with a condition requires a JSON array path, "
-            f"got {_describe_schema(schema)}: {path_text!r}"
+            f"{path_text} is {_a(_describe_schema(schema))}, not a list -- any() and len() "
+            f"take a list (attribute_list, alternate_names) or a collection (events, notes)"
         )
     items_schema = schema.get("items", {})
     if items_schema.get("type") != "object":
+        # `note_list` holds handles: point at the collection that follows them.
+        via = [
+            name
+            for name, collection in _COLLECTIONS.get(owning_spec.table, {}).items()
+            if isinstance(collection, Collection)
+            and not collection.self_link_field
+            and not collection.backlink_class
+            and collection.list_path.segments == tuple(array_path.segments)
+        ]
+        hint = (
+            f"; to test the {_record_name(_COLLECTIONS[owning_spec.table][via[0]].target)} "
+            f"records themselves, loop over {via[0]}: any(x.gramps_id == ... for x in {via[0]})"
+            if via
+            else ""
+        )
         raise QueryError(
-            "any(...)/len(...) with a condition requires a list-of-structs "
-            "array (e.g. attribute_list, primary_name.surname_list) -- a "
-            "list of plain values has no sub-field to write a condition "
-            "against; len(path) > 0/any(path) (no condition) already cover "
-            f"'has any at all': got {_describe_schema(schema)} for {path_text!r}"
+            f"{path_text} holds plain values, with no fields for a condition to test -- "
+            f"any({path_text}) or len({path_text}) alone count or test them{hint}"
         )
     class_name = items_schema.get("properties", {}).get("_class", {}).get("enum", [None])[0]
     if not class_name or not hasattr(gramps_lib, class_name):
@@ -1381,8 +1467,9 @@ def resolve_collection(spec: ObjectTypeSpec, name: str) -> Union[Collection, Bac
     collections = _COLLECTIONS.get(spec.table, {})
     if name not in collections:
         raise QueryError(
-            f"unknown collection {name!r} on {spec.table!r} "
-            f"(known: {', '.join(sorted(collections)) or 'none'})"
+            f"{name!r} isn't a collection of {_record_name(spec)}"
+            f"{_did_you_mean(name, collections)} (its collections: "
+            f"{', '.join(sorted(collections)) or 'none'})"
         )
     return collections[name]
 
@@ -1485,9 +1572,11 @@ def resolve_column_path(
     relationships = _RELATIONSHIPS.get(spec.table, {})
     if isinstance(head, str) and head in relationships:
         if not rest:
+            target = _record_name(relationships[head][0])
             raise QueryError(
-                f"{head!r} is a relationship on {spec.table!r}, not a value on its "
-                f"own -- use {head}.<field>, e.g. {head}.gramps_id"
+                f"{head} is a link to {_a(target)} record, not a value on its own -- "
+                f"use one of its fields (e.g. {head}.gramps_id), or {head}.handle == None "
+                f"to find where there is none"
             )
         target_spec, handle_ref = relationships[head]
         field = resolve_column_path(target_spec, rest, base_column)
