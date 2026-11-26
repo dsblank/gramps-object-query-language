@@ -88,10 +88,12 @@ from .query import (
     JsonArrayExists,
     JsonPath,
     Length,
+    LinkPick,
     Not,
     ObjectTypeSpec,
     Or,
     RelatedObject,
+    Referrer,
     nocase_key,
     ordering_ignores_case,
     undated_guard,
@@ -403,6 +405,14 @@ def _resolve(
         return _json_array_count(reader, data, ref, spec)
     if isinstance(ref, JsonArrayPick):
         return _json_array_pick(reader, data, ref, spec)
+    if isinstance(ref, Referrer):
+        holder = data.referrer if isinstance(data, _LinkEntry) else None
+        if holder is None:
+            return None
+        field = ref.field_for(data.referrer_spec.table)
+        return None if field is None else _resolve(reader, holder, field, data.referrer_spec)
+    if isinstance(ref, LinkPick):
+        return _link_pick(reader, data, ref)
     if isinstance(ref, Arithmetic):
         return _arithmetic(reader, data, ref, spec)
     if isinstance(ref, FlatColumnRef):
@@ -450,6 +460,57 @@ def _self_linked_entry(related: Any, data: Any, collection: Collection) -> Optio
         ),
         None,
     )
+
+
+class _LinkEntry(dict):
+    """A self-linked collection's entry (a ChildRef's or EventRef's data),
+    which also knows the record it is stored in, for `referrer.<path>`
+    (see `query.py`'s `Referrer`). Still a plain dict to everything else,
+    so an entry field reads exactly as before."""
+
+    def __init__(self, entry: dict, referrer: Any, referrer_spec: ObjectTypeSpec) -> None:
+        super().__init__(entry)
+        self.referrer = referrer
+        self.referrer_spec = referrer_spec
+
+
+def _referring_entries(
+    reader: RecordReader, data: Any, collection: Collection
+) -> Iterator[Tuple["_LinkEntry", ObjectTypeSpec]]:
+    """A reverse self-linked collection's entries (`Event.event_refs`):
+    the `self_link_field` entries pointing at `data` in every record that
+    references it, people before families, each type by handle, then in
+    list order -- the order `query.py`'s `_render_link_pick` sorts by."""
+    db = reader.db
+    handle = _handle(data)
+    for referrer in collection.referrers:
+        class_name = referrer.cls.__name__
+        handles = sorted(
+            {ref_handle for cls, ref_handle in db.find_backlink_handles(handle, [class_name]) if cls == class_name}
+        )
+        for ref_handle in handles:
+            record = reader.get(referrer.table, ref_handle)
+            if record is None:
+                continue
+            entries = get_json_path(record, JsonPath((collection.self_link_field,))) or []
+            for entry in entries:
+                if isinstance(entry, dict) and entry.get(collection.self_link_ref_field) == handle:
+                    yield _LinkEntry(entry, record, referrer), referrer
+
+
+def _link_pick(reader: RecordReader, data: Any, pick: LinkPick) -> Any:
+    """`pick.field` of the `pick.index`-th entry of `pick.collection`
+    matching `pick.condition` (the entry itself without a field), or `None`
+    -- the evaluator counterpart to `query.py`'s `_render_link_pick`."""
+    position = 0
+    for entry, row_spec in _referring_entries(reader, data, pick.collection):
+        if pick.condition is None or _matches(reader, entry, pick.condition, row_spec):
+            if position == pick.index:
+                if pick.field is None:
+                    return dict(entry)
+                return _resolve(reader, entry, pick.field, row_spec)
+            position += 1
+    return None
 
 
 def _backlink_handles(
@@ -535,7 +596,11 @@ def _collection_rows(
 ) -> Iterator[Tuple[Any, ObjectTypeSpec]]:
     """What `collection`'s condition is tested against, for each related
     record that reads back: the record itself, or for a self-linked
-    collection its entry pointing back at `data` (`_self_linked_entry`)."""
+    collection its entry pointing back at `data` (`_self_linked_entry`),
+    which carries the record it is in (`_LinkEntry`)."""
+    if collection.referrers:
+        yield from _referring_entries(reader, data, collection)
+        return
     for handle in _collection_handles(data, collection):
         related = reader.get(collection.target.table, handle)
         if related is None:
@@ -543,7 +608,7 @@ def _collection_rows(
         if collection.self_link_field:
             entry = _self_linked_entry(related, data, collection)
             if entry is not None:
-                yield entry, collection.target
+                yield _LinkEntry(entry, related, collection.target), collection.target
         else:
             yield related, collection.target
 

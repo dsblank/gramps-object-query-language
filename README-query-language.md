@@ -381,6 +381,26 @@ is every Occupation attribute, not just the first. Web links work the same
 way by their type: `urls['E-mail'].path` is a person's first e-mail
 address, and `len(urls['E-mail'])` how many they have.
 
+### Goal: Show who each event belongs to, and their age at it
+
+```
+Event "any(r.referrer.primary_name.surname == 'Smith' for r in event_refs['Primary'])"
+```
+
+with `select`:
+
+```
+event_refs['Primary'].referrer.primary_name as participant
+(date.sortval - event_refs['Primary'].referrer.birth.date.sortval) // 365 as age
+```
+
+An event doesn't list its people -- each person and family lists the event,
+with a role. `event_refs` is those links seen from the event, and
+`referrer` is the person or family holding one. `event_refs['Primary']` is
+the Primary ones; read straight off, the first of them. A path that only a
+person has (`primary_name`) gives no value for a family's link. See
+[Who an event belongs to](docs/where_expr.md#who-an-event-belongs-to-eventevent_refs).
+
 ### Goal: Find people who were adopted
 
 ```

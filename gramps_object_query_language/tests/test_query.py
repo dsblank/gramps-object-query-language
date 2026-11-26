@@ -2883,6 +2883,8 @@ _EXPECTED_COLLECTIONS = {
     (EVENT, "citations"): (CITATION, "citation_list", None),
     (EVENT, "media"): (MEDIA, "media_list", "ref"),
     (EVENT, "tags"): (TAG, "tag_list", None),
+    # Reverse: people's and families' event_ref_list entries pointing here.
+    (EVENT, "event_refs"): (PERSON, "event_ref_list", None),
     (PLACE, "notes"): (NOTE, "note_list", None),
     (PLACE, "citations"): (CITATION, "citation_list", None),
     (PLACE, "media"): (MEDIA, "media_list", "ref"),

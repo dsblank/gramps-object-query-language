@@ -52,6 +52,7 @@ from gramps.gen.lib import (
     Place,
     PlaceName,
     Source,
+    EventRoleType,
     Surname,
     Url,
     UrlType,
@@ -1705,6 +1706,7 @@ def pg_conn():
 _PRIMARY_TABLES = (
     "person", "family", "event", "place", "citation",
     "source", "repository", "media", "note", "tag",
+    "reference",  # backlinks, event_refs
 )
 
 
@@ -3220,3 +3222,236 @@ def test_type_name_people(type_names_db, pg_conn, where_expr, expected):
     _assert_sql_and_evaluator_agree(
         db, handles, PERSON, ("p_kid", "p_other"), where_expr, expected, pg_conn
     )
+
+
+# --- event_refs and referrer: the people and families pointing at an event ---
+
+
+@pytest.fixture(scope="module")
+def event_refs_db():
+    """Ann and Bob, married (family F0001) with a child Cat, and events
+    linked to them in different roles:
+
+    - death: Ann, Primary.
+    - census: Ann and Bob both Primary, Cat a Witness.
+    - marriage: the family, role Family; Cat a Witness.
+    - double: Bob twice, Primary and Informant.
+    - orphan: nobody.
+
+    Handles are set so that byte order (`Bzz_ann` before `aaa_bob`) and
+    case-insensitive order disagree: `[0]` follows byte order everywhere.
+    """
+    dbman = CLIDbManager(DbState())
+    dirpath, _name_ = dbman.create_new_db_cli("_test_evaluator_event_refs", dbid="sqlite")
+    db = make_database("sqlite")
+    db.load(dirpath)
+    handles = {}
+
+    def event(key, event_type, year=None):
+        e = Event()
+        e.set_handle(f"ev_{key}")
+        e.set_type(event_type)
+        if year is not None:
+            d = Date()
+            d.set_yr_mon_day(year, 6, 1)
+            e.set_date_object(d)
+        handles[key] = db.add_event(e, trans)
+        return handles[key]
+
+    def link(obj, event_handle, role):
+        ref = EventRef()
+        ref.set_reference_handle(event_handle)
+        ref.set_role(role)
+        obj.add_event_ref(ref)
+
+    with DbTxn("setup", db) as trans:
+        ann_birth = event("ann_birth", EventType.BIRTH, 1900)
+        bob_birth = event("bob_birth", EventType.BIRTH, 1890)
+        death = event("death", EventType.DEATH, 1980)
+        census = event("census", EventType.CENSUS, 1930)
+        marriage = event("marriage", EventType.MARRIAGE, 1920)
+        double = event("double", EventType.RESIDENCE, 1940)
+        event("orphan", EventType.BURIAL)
+
+        people = {}
+        for key, handle, gramps_id, given, gender in (
+            ("ann", "Bzz_ann", "I0001", "Ann", Person.FEMALE),
+            ("bob", "aaa_bob", "I0002", "Bob", Person.MALE),
+            ("cat", "ccc_cat", "I0003", "Cat", Person.FEMALE),
+        ):
+            p = Person()
+            p.set_handle(handle)
+            p.set_gramps_id(gramps_id)
+            p.set_gender(gender)
+            p.set_primary_name(_name(given, "Smith"))
+            people[key] = p
+        link(people["ann"], ann_birth, EventRoleType.PRIMARY)
+        people["ann"].set_birth_ref(people["ann"].get_event_ref_list()[0])
+        link(people["ann"], death, EventRoleType.PRIMARY)
+        link(people["ann"], census, EventRoleType.PRIMARY)
+        link(people["bob"], bob_birth, EventRoleType.PRIMARY)
+        people["bob"].set_birth_ref(people["bob"].get_event_ref_list()[0])
+        link(people["bob"], census, EventRoleType.PRIMARY)
+        link(people["bob"], double, EventRoleType.PRIMARY)
+        link(people["bob"], double, EventRoleType.INFORMANT)
+        link(people["cat"], census, EventRoleType.WITNESS)
+        link(people["cat"], marriage, EventRoleType.WITNESS)
+
+        family = Family()
+        family.set_handle("fam_f")
+        family.set_gramps_id("F0001")
+        family.set_father_handle("aaa_bob")
+        family.set_mother_handle("Bzz_ann")
+        child = ChildRef()
+        child.set_reference_handle("ccc_cat")
+        child.set_father_relation(ChildRefType.ADOPTED)
+        family.add_child_ref(child)
+        link(family, marriage, EventRoleType.FAMILY)
+        people["ann"].add_family_handle("fam_f")
+        people["bob"].add_family_handle("fam_f")
+        people["cat"].add_parent_family_handle("fam_f")
+        for key, p in people.items():
+            handles[key] = db.add_person(p, trans)
+        handles["family"] = db.add_family(family, trans)
+    yield db, handles
+    db.close()
+    dbman.remove_database(_name_)
+
+
+_EVENTS = ("death", "census", "marriage", "double", "orphan")
+
+
+@pytest.mark.parametrize(
+    "where_expr, expected",
+    [
+        ("any(event_refs)", {"death", "census", "marriage", "double"}),
+        ("not any(event_refs)", {"orphan"}),
+        ("len(event_refs) == 3", {"census"}),
+        ("len(event_refs) == 2", {"marriage", "double"}),
+        ("len([r for r in event_refs]) == 2", {"marriage", "double"}),
+        ("len(event_refs['Primary']) == 2", {"census"}),
+        ("len(event_refs['Primary']) == 1", {"death", "double"}),
+        ("len(event_refs, role.value == EventRoleType.WITNESS) == 1", {"census", "marriage"}),
+        ("any(event_refs['Family'])", {"marriage"}),
+        ("any(event_refs['Informant'], referrer.gramps_id == 'I0002')", {"double"}),
+        ("any(r.referrer.primary_name.first_name == 'Cat' for r in event_refs['Witness'])", {"census", "marriage"}),
+        ("any(r for r in event_refs if r.referrer.gender == Person.MALE)", {"census", "double"}),
+        # A path only a Family has: no value on a person's entry.
+        ("any(r.referrer.father.primary_name.first_name == 'Bob' for r in event_refs)", {"marriage"}),
+        ("any(r.referrer.father.gramps_id == None for r in event_refs)", {"death", "census", "marriage", "double"}),
+        ("any(event_refs, referrer.gramps_id == 'F0001')", {"marriage"}),
+        ("len(distinct([r.referrer.gramps_id for r in event_refs])) == 1", {"death", "double"}),
+        ("len([r.referrer.gramps_id for r in event_refs]) == 2", {"marriage", "double"}),
+        # [0] is the first by byte order of handle: Ann (Bzz_ann) before Bob (aaa_bob).
+        ("event_refs['Primary'].referrer.primary_name.first_name == 'Ann'", {"death", "census"}),
+        ("[r.referrer.primary_name.first_name for r in event_refs['Primary']][1] == 'Bob'", {"census"}),
+        ("[r for r in event_refs if r.role.value == EventRoleType.WITNESS][0].referrer.gramps_id == 'I0003'", {"census", "marriage"}),
+        ("event_refs['Primary'] == None", {"marriage", "orphan"}),
+        ("event_refs['Primary'].role.value == EventRoleType.PRIMARY", {"death", "census", "double"}),
+        ("[r.role.value for r in event_refs][1] == EventRoleType.INFORMANT", {"double"}),
+        # People before families.
+        ("[r.referrer.gramps_id for r in event_refs][0] == 'I0003'", {"marriage"}),
+        ("(date.sortval - event_refs['Primary'].referrer.birth.date.sortval) // 365 == 80", {"death"}),
+        ("event_refs['Primary'].referrer.birth.date.sortval < date.sortval", {"death", "census", "double"}),
+        ("any(e for e in event_refs if e.referrer.primary_name.first_name < 'b')", {"death", "census"}),
+        ("any(e for e in event_refs if e.referrer.gramps_id < 'i0002')", {"death", "census", "marriage"}),
+    ],
+)
+def test_event_refs_where(event_refs_db, pg_conn, where_expr, expected):
+    db, handles = event_refs_db
+    _assert_sql_and_evaluator_agree(db, handles, EVENT, _EVENTS, where_expr, expected, pg_conn)
+
+
+@pytest.mark.parametrize(
+    "entry, expected",
+    [
+        ("event_refs['Primary'].referrer.gramps_id", {"death": "I0001", "census": "I0001", "double": "I0002"}),
+        ("event_refs['Family'].referrer.gramps_id", {"marriage": "F0001"}),
+        ("event_refs['Primary'].referrer.primary_name.first_name", {"death": "Ann", "census": "Ann", "double": "Bob"}),
+        ("len(event_refs)", {"death": 1, "census": 3, "marriage": 2, "double": 2, "orphan": 0}),
+        ("len(event_refs['Primary'])", {"death": 1, "census": 2, "marriage": 0, "double": 1, "orphan": 0}),
+        ("(date.sortval - event_refs['Primary'].referrer.birth.date.sortval) // 365", {"death": 80, "census": 30, "double": 50}),
+        ("event_refs['Witness'].role.value", {"census": EventRoleType.WITNESS, "marriage": EventRoleType.WITNESS}),
+    ],
+)
+def test_event_refs_select(event_refs_db, pg_conn, entry, expected):
+    from gramps_object_query_language.query import Dialect, Query, compile_query, select_normalizer
+    from gramps_object_query_language.query_lang import parse_select
+
+    db, handles = event_refs_db
+    [(ref, _)] = parse_select(EVENT, [entry + " as v"])
+    want = {handles[key]: expected.get(key) for key in _EVENTS}
+    query = Query(select=["handle", ref])
+    normalize = select_normalizer(EVENT, ["handle", ref])
+    sql, params = compile_query(EVENT, query, dialect=Dialect.SQLITE)
+    db.dbapi.execute(sql, params)
+    got = {h: v for h, v in map(normalize, db.dbapi.fetchall()) if h in want}
+    assert got == want, "SQLite"
+    if pg_conn is not None:
+        sql, params = compile_query(EVENT, query, dialect=Dialect.POSTGRESQL)
+        rows = [normalize(row) for row in _rows_on_postgresql(pg_conn, db, sql, params)]
+        assert {h: v for h, v in rows if h in want} == want, "PostgreSQL"
+    for handle, value in want.items():
+        assert resolve_column_ref(db, db.get_event_from_handle(handle), ref, EVENT) == value, "evaluator"
+
+
+@pytest.mark.parametrize(
+    "where_expr, expected",
+    [
+        ("any(r.referrer.father.primary_name.first_name == 'Bob' for r in child_refs)", {"cat"}),
+        ("any(child_refs, referrer.gramps_id == 'F0001' and frel.value == ChildRefType.ADOPTED)", {"cat"}),
+        ("len([r.referrer.mother for r in child_refs]) == 1", {"cat"}),
+        ("len(distinct([r.referrer.father for r in child_refs])) == 1", {"cat"}),
+        ("any(r.referrer.gramps_id == 'F0002' for r in child_refs)", set()),
+    ],
+)
+def test_child_refs_referrer(event_refs_db, pg_conn, where_expr, expected):
+    """`referrer` on a child_refs entry is the family listing the child."""
+    db, handles = event_refs_db
+    _assert_sql_and_evaluator_agree(db, handles, PERSON, ("ann", "bob", "cat"), where_expr, expected, pg_conn)
+
+
+def test_event_refs_respects_privacy(event_refs_db):
+    """Through PrivateProxyDb, a private person's link to an event isn't
+    seen: the evaluator reads referrers through the proxy."""
+    from gramps_object_query_language.query_lang import compile_expr_for_spec
+
+    db, handles = event_refs_db
+    cat = db.get_person_from_handle(handles["cat"])
+    cat.set_privacy(True)
+    with DbTxn("private", db) as trans:
+        db.commit_person(cat, trans)
+    try:
+        proxy = PrivateProxyDb(db)
+        census = proxy.get_event_from_handle(handles["census"])
+        where = compile_expr_for_spec(EVENT, "any(event_refs['Witness'])")
+        assert evaluate_where(proxy, census, where, EVENT) is False
+        assert evaluate_where(db, db.get_event_from_handle(handles["census"]), where, EVENT) is True
+    finally:
+        cat.set_privacy(False)
+        with DbTxn("public", db) as trans:
+            db.commit_person(cat, trans)
+
+
+@pytest.mark.parametrize(
+    "entry", ["event_refs['Primary'].referrer.primary_name", "event_refs['Primary']", "event_refs['Family'].referrer.father.primary_name"]
+)
+def test_event_refs_select_objects(event_refs_db, pg_conn, entry):
+    """A whole object read through event_refs (a name, the link itself)
+    comes back the same from SQLite, PostgreSQL and the evaluator."""
+    from gramps_object_query_language.query import Dialect, Query, compile_query, select_normalizer
+    from gramps_object_query_language.query_lang import parse_select
+
+    db, handles = event_refs_db
+    [(ref, _)] = parse_select(EVENT, [entry + " as v"])
+    query = Query(select=["handle", ref])
+    normalize = select_normalizer(EVENT, ["handle", ref])
+    sql, params = compile_query(EVENT, query, dialect=Dialect.SQLITE)
+    db.dbapi.execute(sql, params)
+    sqlite = dict(map(normalize, db.dbapi.fetchall()))
+    evaluated = {h: resolve_column_ref(db, db.get_event_from_handle(h), ref, EVENT) for h in sqlite}
+    assert sqlite == evaluated
+    assert any(value is not None for value in sqlite.values())
+    if pg_conn is not None:
+        sql, params = compile_query(EVENT, query, dialect=Dialect.POSTGRESQL)
+        assert dict(normalize(row) for row in _rows_on_postgresql(pg_conn, db, sql, params)) == sqlite

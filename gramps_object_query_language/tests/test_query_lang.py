@@ -2887,10 +2887,10 @@ def test_attribute_lookup_custom_is_not_a_builtin():
 @pytest.mark.parametrize(
     "entry, message",
     [
-        ("primary_name['x']", "only works on attribute_list, urls"),
-        ("alternate_names['Birth Name'].surname", "only works on attribute_list, urls"),
-        ("len(event_ref_list['Primary'])", "only works on attribute_list, urls"),
-        ("any(e for e in alternate_names['x'])", "only works on attribute_list, urls"),
+        ("primary_name['x']", "only works on attribute_list, event_refs, urls"),
+        ("alternate_names['Birth Name'].surname", "only works on attribute_list, event_refs, urls"),
+        ("len(event_ref_list['Primary'])", "only works on attribute_list, event_refs, urls"),
+        ("any(e for e in alternate_names['x'])", "only works on attribute_list, event_refs, urls"),
     ],
 )
 def test_attribute_lookup_rejects(entry, message):
@@ -3086,3 +3086,84 @@ def test_type_name_leaves_other_shapes_alone():
     assert compile_expr_for_spec(EVENT, "type.string == 'Tax list'") == Eq(
         JsonPath(("type", "string")), "Tax list"
     )
+
+
+# --- event_refs and referrer ---------------------------------------------------
+
+_PRIMARY = "r.role.string == 'Primary' or r.role.value == EventRoleType.PRIMARY"
+
+
+@pytest.mark.parametrize(
+    "short, long",
+    [
+        ("any(event_refs['Primary'])", f"any(r for r in event_refs if {_PRIMARY})"),
+        ("any(event_refs['Primary'])", "exists(event_refs, role.string == 'Primary' or role.value == EventRoleType.PRIMARY)"),
+        ("len(event_refs['Primary']) > 1", f"len([r for r in event_refs if {_PRIMARY}]) > 1"),
+        ("len(event_refs['Primary']) > 1", "count(event_refs, role.string == 'Primary' or role.value == EventRoleType.PRIMARY) > 1"),
+        (
+            "any(event_refs['Primary'], referrer.gramps_id == 'I1')",
+            f"any(r for r in event_refs if ({_PRIMARY}) and r.referrer.gramps_id == 'I1')",
+        ),
+        (
+            "len(event_refs['Primary'], referrer.gramps_id == 'I1') > 0",
+            f"len([r for r in event_refs if ({_PRIMARY}) and r.referrer.gramps_id == 'I1']) > 0",
+        ),
+        (
+            "any(r.referrer.gramps_id == 'I1' for r in event_refs['Primary'])",
+            f"any(r.referrer.gramps_id == 'I1' for r in event_refs if {_PRIMARY})",
+        ),
+        (
+            "event_refs['Primary'].referrer.gramps_id == 'I1'",
+            f"[r for r in event_refs if {_PRIMARY}][0].referrer.gramps_id == 'I1'",
+        ),
+        (
+            "event_refs['Primary'].referrer.gramps_id == 'I1'",
+            f"[r.referrer.gramps_id for r in event_refs if {_PRIMARY}][0] == 'I1'",
+        ),
+        (
+            "len(distinct([r.referrer.gramps_id for r in event_refs['Primary']])) > 1",
+            f"len(distinct([r.referrer.gramps_id for r in event_refs if {_PRIMARY}])) > 1",
+        ),
+    ],
+)
+def test_event_refs_spellings(short, long):
+    """Every spelling of "the Primary links" compiles to its long form."""
+    from gramps_object_query_language.query import EVENT
+    from gramps_object_query_language.query_lang import parse_expr_for_spec
+
+    assert parse_expr_for_spec(EVENT, short) == parse_expr_for_spec(EVENT, long)
+
+
+def test_referrer_resolves_per_type():
+    """A path is resolved on Person and Family each; where a type doesn't
+    have it, that type gives no value rather than an error."""
+    from gramps_object_query_language.query import EVENT, FAMILY, PERSON, Referrer
+    from gramps_object_query_language.query_lang import parse_select_entry
+
+    ref, _ = parse_select_entry(EVENT, "event_refs['Primary'].referrer.primary_name.first_name")
+    assert isinstance(ref.field, Referrer)
+    assert ref.field.field_for(PERSON.table) is not None
+    assert ref.field.field_for(FAMILY.table) is None
+    ref, _ = parse_select_entry(EVENT, "event_refs['Family'].referrer.father.gramps_id")
+    assert ref.field.field_for(PERSON.table) is None
+    assert ref.field.field_for(FAMILY.table) is not None
+
+
+@pytest.mark.parametrize(
+    "namespace, expr, message",
+    [
+        ("Event", "any(r.referrer == 'x' for r in event_refs)", "not a value on its own"),
+        ("Event", "any(r.referrer.nosuch == 'x' for r in event_refs)", "isn't a field of a Person or Family"),
+        # child_refs' referrer is always a Family.
+        ("Person", "any(r.referrer.primary_name.first_name == 'x' for r in child_refs)", "unknown field 'primary_name' on Family"),
+        # Only inside a link's condition.
+        ("Person", "referrer.gramps_id == 'x'", "unknown field 'referrer'"),
+        ("Person", "[r for r in child_refs][0].frel.value == 1", "can't take one entry of 'child_refs'"),
+        ("Family", "any(event_refs)", "unknown"),
+    ],
+)
+def test_referrer_rejects(namespace, expr, message):
+    from gramps_object_query_language.query_lang import compile_expr
+
+    with pytest.raises((QueryLangError, QueryError), match=message):
+        compile_expr(namespace, expr)

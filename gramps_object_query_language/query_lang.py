@@ -113,6 +113,7 @@ supports today:
 from __future__ import annotations
 
 import ast
+from dataclasses import replace
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from gramps.gen.datehandler import parser as _date_parser
@@ -154,9 +155,11 @@ from .query import (
     BacklinkClassFilter,
     Backlinks,
     Arithmetic,
+    Collection,
     CollectionCount,
     CollectionPick,
     ColumnRef,
+    LinkPick,
     Contains,
     Eq,
     Exists,
@@ -178,6 +181,7 @@ from .query import (
     QueryError,
     JsonPath,
     Length,
+    Referrer,
     RelatedObject,
     Regex,
     SelectRef,
@@ -191,6 +195,7 @@ from .query import (
     resolve_length_path,
     resolve_ref_string,
     _schema_properties,
+    unwrap_ref,
     walk_schema,
 )
 
@@ -524,7 +529,8 @@ def _collection_condition_spec(collection: "Collection") -> ObjectTypeSpec:
         _, element_spec = resolve_any_path(
             collection.target, (collection.self_link_field,), base_column="link.value"
         )
-        return element_spec
+        # `referrer.<path>`: the record holding the entry (see `Referrer`).
+        return replace(element_spec, referrers=collection.referrers or (collection.target,))
     return collection.target
 
 
@@ -634,12 +640,18 @@ def _translate_pick(call: ast.Call, rest: List[Union[str, int]], spec: ObjectTyp
     has_condition = not (isinstance(condition, ast.Constant) and condition.value is None)
     collection = _try_resolve_bare_collection(source, spec)
     if collection is not None:
-        if isinstance(collection, Backlinks) or collection.self_link_field:
+        if isinstance(collection, Backlinks) or (
+            collection.self_link_field and not collection.referrers
+        ):
             raise QueryLangError(
                 f"can't take one entry of {source.id!r} -- it isn't a list of "  # type: ignore[attr-defined]
                 f"records stored on this one"
             )
         payload["relationship"] = source.id  # type: ignore[attr-defined]
+        if collection.referrers:
+            if has_condition:
+                payload["where"] = _translate_top_level(condition, _collection_condition_spec(collection))
+            return {"pick": payload}
         if has_condition:
             payload["where"] = _translate_top_level(condition, collection.target)
         return {"pick": payload}
@@ -1691,7 +1703,12 @@ def _substitute_env(node: ast.AST, env: Optional[Mapping[str, EnvValue]]) -> ast
 
 #: The lists `name['X']` works on, with the GrampsType their entries'
 #: `type` holds: attributes (Attribute/SrcAttribute) and web links (Url).
-_LOOKUP_LISTS = {"attribute_list": AttributeType, "urls": UrlType}
+_LOOKUP_LISTS = {
+    "attribute_list": (AttributeType, "type"),
+    "urls": (UrlType, "type"),
+    # An event's links from people and families, by role (`'Primary'`).
+    "event_refs": (EventRoleType, "role"),
+}
 
 #: The loop variable the lookup sugar writes into its comprehension. Never a
 #: Gramps field, and a comprehension's own name is local to it, so it can't
@@ -1708,7 +1725,7 @@ def _builtin_type_values(type_class: type) -> Dict[str, int]:
     return {key: value for value, _label, key in type_class._DATAMAP if value != custom}
 
 
-def _type_lookup(node: ast.AST) -> Optional[Tuple[ast.expr, str, type]]:
+def _type_lookup(node: ast.AST) -> Optional[Tuple[ast.expr, str, Tuple[type, str]]]:
     """`(list, name, type_class)` when `node` is `list['Name']`, else
     `None`. A string index on any other list is an error: it has no other
     meaning in this language."""
@@ -1722,20 +1739,22 @@ def _type_lookup(node: ast.AST) -> Optional[Tuple[ast.expr, str, type]]:
         else node.value.attr if isinstance(node.value, ast.Attribute)
         else None
     )
-    type_class = _LOOKUP_LISTS.get(list_name or "")
-    if type_class is None:
+    kind = _LOOKUP_LISTS.get(list_name or "")
+    if kind is None:
         lists = ", ".join(sorted(_LOOKUP_LISTS))
         raise QueryLangError(
             f"a name in [...] picks entries by type, which only works on {lists}: "
             f"{ast.unparse(node)}"
         )
-    return node.value, key.value, type_class
+    return node.value, key.value, kind
 
 
-def _type_condition(bound_name: Optional[str], name: str, type_class: type) -> ast.expr:
+def _type_condition(bound_name: Optional[str], name: str, kind: Tuple[type, str]) -> ast.expr:
     """`x.type.string == 'Name'`, `or x.type.value == <number>` for a
-    built-in name; with no `bound_name`, the fields are bare (`type.string`),
-    as in `any(list, condition)`."""
+    built-in name (`role` instead of `type` for `event_refs`); with no
+    `bound_name`, the fields are bare (`type.string`), as in
+    `any(list, condition)`."""
+    type_class, type_field = kind
 
     def field(*names: str) -> ast.expr:
         expr: Optional[ast.expr] = None if bound_name is None else ast.Name(id=bound_name, ctx=ast.Load())
@@ -1747,14 +1766,14 @@ def _type_condition(bound_name: Optional[str], name: str, type_class: type) -> a
     def equals(left: ast.expr, value: Any) -> ast.Compare:
         return ast.Compare(left=left, ops=[ast.Eq()], comparators=[ast.Constant(value=value)])
 
-    condition: ast.expr = equals(field("type", "string"), name)
+    condition: ast.expr = equals(field(type_field, "string"), name)
     builtin = _builtin_type_values(type_class).get(name)
     if builtin is not None:
-        condition = ast.BoolOp(op=ast.Or(), values=[condition, equals(field("type", "value"), builtin)])
+        condition = ast.BoolOp(op=ast.Or(), values=[condition, equals(field(type_field, "value"), builtin)])
     return condition
 
 
-def _entries_of_type(list_node: ast.expr, name: str, type_class: type) -> ast.ListComp:
+def _entries_of_type(list_node: ast.expr, name: str, type_class: Tuple[type, str]) -> ast.ListComp:
     """`[_entry for _entry in list if <_entry is of that type>]`."""
     return ast.ListComp(
         elt=ast.Name(id=_LOOKUP_BOUND, ctx=ast.Load()),
@@ -1939,8 +1958,7 @@ def _arithmetic_side(operand: dict, spec: ObjectTypeSpec) -> Tuple[Any, bool]:
 def _schema_types(ref: ColumnRef, spec: ObjectTypeSpec) -> set:
     """The JSON types the schema gives a column's value (no `null`), or an
     empty set when it can't say."""
-    while isinstance(ref, RelatedObject):
-        spec, ref = ref.target, ref.field
+    ref, spec = unwrap_ref(ref, spec)
     if isinstance(ref, JsonArrayPick):
         if ref.field is None:
             return set()
@@ -1968,8 +1986,7 @@ def _holds_numbers(ref: ColumnRef, spec: ObjectTypeSpec) -> bool:
 def _whole_number(ref: ColumnRef, spec: ObjectTypeSpec) -> bool:
     """Whether a numeric column holds whole numbers (the schema says
     `integer`, or it's a count)."""
-    while isinstance(ref, RelatedObject):
-        spec, ref = ref.target, ref.field
+    ref, spec = unwrap_ref(ref, spec)
     if isinstance(ref, (CollectionCount, JsonArrayCount, Length)):
         return True
     return _schema_types(ref, spec) - {"boolean"} == {"integer"}
@@ -1998,6 +2015,11 @@ def _resolve_projection(spec: ObjectTypeSpec, field: Sequence[Union[str, int]]) 
     ref: Optional[ColumnRef] = None
     if len(field) == 1 and isinstance(field[0], str) and not spec.element_base_column:
         ref = relationship_link(spec, field[0])
+    if len(field) == 2 and field[0] == "referrer" and isinstance(field[1], str) and spec.referrers:
+        # `[r.referrer.father for r in child_refs]`: the family's father, by handle.
+        links = tuple((referrer, relationship_link(referrer, field[1])) for referrer in spec.referrers)
+        if any(link is not None for _, link in links):
+            ref = Referrer(links)
     if ref is None:
         ref = resolve_column_path(spec, field, spec.element_base_column or "json_data")
     if _value_kind(ref, spec) is None:
@@ -2016,6 +2038,17 @@ def _pick_from_json(payload: dict, spec: ObjectTypeSpec) -> ColumnRef:
     if "relationship" in payload:
         name = payload["relationship"]
         collection = resolve_collection(spec, name)
+        if isinstance(collection, Collection) and collection.referrers:
+            element_spec = _collection_condition_spec(collection)
+            condition = (
+                where_list_to_ast(payload["where"], element_spec) if "where" in payload else None
+            )
+            field_ref = (
+                resolve_column_path(element_spec, field, element_spec.element_base_column)
+                if field
+                else None
+            )
+            return LinkPick(collection, spec, element_spec, condition, index, field_ref)
         if isinstance(collection, Backlinks) or collection.self_link_field:
             raise QueryError(f"can't take one entry of {name!r}")
         condition = (
@@ -2129,9 +2162,9 @@ def _value_kind(column: ColumnRef, spec: ObjectTypeSpec) -> Optional[str]:
         if column.field is None:
             return None
         spec, column = column.element_spec, column.field
-    while isinstance(column, RelatedObject):
-        spec = column.target
-        column = column.field
+    if isinstance(column, LinkPick) and column.field is None:
+        return None
+    column, spec = unwrap_ref(column, spec)
     # A count reached through a hop (`len(parent_families[0].child_ref_list)`)
     # is as much a number as one on the record itself.
     if isinstance(column, (CollectionCount, JsonArrayCount, Length, Arithmetic)):
@@ -2200,8 +2233,7 @@ def _gramps_type_at(column: ColumnRef, spec: ObjectTypeSpec) -> Optional[type]:
     """The Gramps type class (`EventType`, `FamilyRelType`, ...) whose
     `{"_class", "value", "string"}` object `column` lands on, or `None` when
     it lands on anything else."""
-    while isinstance(column, RelatedObject):
-        spec, column = column.target, column.field
+    column, spec = unwrap_ref(column, spec)
     if not isinstance(column, JsonPath):
         return None
     try:
