@@ -50,7 +50,8 @@ pip install gramps-object-query-language
   `order_by` entries (`"-birth.date.sortval"`) written in that same path
   grammar. See [`docs/where_expr.md`](docs/where_expr.md).
 - `gramps_object_query_language.vocabulary` -- every name a `where_expr`
-  can use (columns, JSON fields, relationships, collections, keywords,
+  can use (columns, JSON fields, relationships, collections, the link
+  entries `child_refs`/`event_refs` loop over, keywords,
   functions, `ClassName.CONST` constants), per namespace, as plain JSON
   data for editors. `python -m gramps_object_query_language.vocabulary`
   prints it for clients without Python.

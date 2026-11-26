@@ -304,12 +304,39 @@ def _segments(chain: str) -> List[Tuple[str, int]]:
 
 
 # A walk's position: ("namespace", "Person") at a record (top level, or
-# across a relationship), or ("field", node) inside its JSON fields.
+# across a relationship), or ("field", node) inside its JSON fields; and for
+# a loop variable over `child_refs`/`event_refs`, ("link", link) at the
+# entry (its fields, plus `referrer`), ("referrers", [namespace, ...]) at
+# `referrer`, and ("any", [context, ...]) at a path that exists on more
+# than one of those types (`referrer.gramps_id`).
 _Context = Tuple[str, Any]
+
+
+def _either(contexts: List[Optional[_Context]]) -> Optional[_Context]:
+    """The contexts that exist, as one: `None` if none does."""
+    found = [context for context in contexts if context is not None]
+    if not found:
+        return None
+    return found[0] if len(found) == 1 else ("any", found)
+
+
+def _alternatives(context: _Context) -> List[_Context]:
+    """The single-type contexts behind a `referrers`/`any` one."""
+    kind, value = context
+    if kind == "referrers":
+        return [("namespace", namespace) for namespace in value]
+    return list(value)
 
 
 def _step(vocabs: Dict[str, Any], context: _Context, name: str) -> Optional[_Context]:
     kind, value = context
+    if kind in ("referrers", "any"):
+        return _either([_step(vocabs, alternative, name) for alternative in _alternatives(context)])
+    if kind == "link":
+        if name == "referrer":
+            return ("referrers", value["referrers"])
+        node = value["entry"].get("fields", {}).get(name)
+        return None if node is None else ("field", node)
     if kind == "namespace":
         vocab = vocabs[value]
         if name in vocab["relationships"]:
@@ -338,6 +365,10 @@ def _step_indexed(
     """`_step` then `_index`, except that an indexed collection on a record
     (`parent_families[0]`) steps to the record that entry links to, the
     way a relationship does."""
+    if context[0] in ("referrers", "any"):
+        return _either(
+            [_step_indexed(vocabs, alternative, name, indexes) for alternative in _alternatives(context)]
+        )
     if context[0] == "namespace" and indexes:
         target = vocabs[context[1]]["collections"].get(name)
         if target is not None:
@@ -349,6 +380,10 @@ def _step_indexed(
 def _indexable_collections(vocabs: Dict[str, Any], context: _Context) -> List[Tuple[str, str, Any]]:
     """The collections an index can follow from a record (`families`,
     `citations`, ...; not `backlinks` or `child_refs`)."""
+    if context[0] in ("referrers", "any"):
+        return [
+            step for alternative in _alternatives(context) for step in _indexable_collections(vocabs, alternative)
+        ]
     if context[0] != "namespace":
         return []
     return [
@@ -393,6 +428,10 @@ def _walk(
     else:
         context = None
         if iterating and not rest and not first_indexes:
+            link = vocabs[root].get("links", {}).get(first)
+            if link is not None:
+                # `for r in event_refs`: `r` is an entry, with `referrer`.
+                return ("link", link)
             target = vocabs[root]["collections"].get(first, False)
             if target is not False:
                 return None if target is None else ("namespace", target)
@@ -464,6 +503,13 @@ def _picked_context(
 def _names_at(vocabs: Dict[str, Any], context: _Context) -> List[Tuple[str, str, Any]]:
     """`(name, kind, detail)` for everything that can follow `context.`."""
     kind, value = context
+    if kind == "link":
+        return [("referrer", "relationship", " or ".join(value["referrers"]))] + [
+            (name, "field", node.get("type")) for name, node in value["entry"].get("fields", {}).items()
+        ]
+    if kind in ("referrers", "any"):
+        # Each type's names; one both have is offered once (`_results`).
+        return [name for alternative in _alternatives(context) for name in _names_at(vocabs, alternative)]
     if kind == "field":
         return [
             (name, "field", node.get("type"))
@@ -538,7 +584,7 @@ def _continuation(
             return "."
         return "[" if _has_type(detail, "array") else ""
     if kind == "variable" and binding is not None:
-        if binding[0] == "namespace" or binding[1].get("fields"):
+        if binding[0] in ("namespace", "link", "referrers", "any") or binding[1].get("fields"):
             return "."
         return "[" if "items" in binding[1] else ""
     return ""

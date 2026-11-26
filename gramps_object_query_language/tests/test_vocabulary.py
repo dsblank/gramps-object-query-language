@@ -111,6 +111,19 @@ def test_relationship_target_detail():
     assert collections["child_refs"] is None
 
 
+def test_links_describe_entries_and_referrers():
+    """A loop variable over child_refs/event_refs is an entry (a ChildRef,
+    an EventRef) with `referrer`, the record holding it."""
+    event_refs = vocabulary("Event")["links"]["event_refs"]
+    assert event_refs["referrers"] == ["Person", "Family"]
+    assert {"role", "private", "attribute_list", "ref"} <= set(event_refs["entry"]["fields"])
+    assert event_refs["entry"]["fields"]["role"]["type_names"] == "EventRoleType"
+    child_refs = vocabulary("Person")["links"]["child_refs"]
+    assert child_refs["referrers"] == ["Family"]
+    assert {"frel", "mrel"} <= set(child_refs["entry"]["fields"])
+    assert vocabulary("Family")["links"] == {}
+
+
 def test_main_prints_json(capsys):
     assert main(["person"]) == 0
     assert json.loads(capsys.readouterr().out)["namespace"] == "Person"
