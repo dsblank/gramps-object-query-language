@@ -1529,7 +1529,9 @@ it" rule).
   `WITH` CTE or binding the subquery's result once), a general
   optimization rather than anything specific to chaining or operand
   ordering.
-- **Reverse relationships, reaching past the referrer's own class** (e.g.
+- ~~**Reverse relationships, reaching past the referrer's own class**~~
+  -- **Done**: `backlinks['Person']` (see `docs/where_expr.md`'s "One kind
+  of referrer") and `Event.event_refs`. Original notes follow. (e.g.
   "a Note referenced by a Person whose surname is Smith") -- basic reverse
   lookup shipped (see "Backlinks" in Done below: `exists(backlinks)`,
   `exists(backlinks, _class == "Person")`), but a condition still can't
@@ -1553,9 +1555,10 @@ it" rule).
   1. **Generalize the type-in-brackets rule -- no new names.**
      *Typed lists done* (`attribute_list`, `urls`: looped over, `len()`,
      `any()`, one- and two-argument forms -- see `docs/where_expr.md`'s
-     "Entries by type"). *`backlinks['Person']` not built yet* -- it needs
-     a join through `reference` into the referrer's table, a new kind of
-     collection rather than a rewrite. Before:
+     "Entries by type"). *`backlinks['Person']` done too*: a collection
+     whose rows come from `reference` (`Collection.backlink_class`), so
+     every collection form works on it; first = byte-wise handle order.
+     Before:
      `attribute_list['Occupation']` means the *first* Occupation attribute
      (desugared to `[...][0]`). Restate it as: `list['Kind']` is *the
      entries of that kind*; a path read straight off it reads the first

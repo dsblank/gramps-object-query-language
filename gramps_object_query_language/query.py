@@ -232,6 +232,12 @@ MEDIA = _spec_for(Media)
 NOTE = _spec_for(Note)
 TAG = _spec_for(Tag)
 
+#: Class name -> spec, for `backlinks['Person']`.
+_SPECS_BY_CLASS = {
+    spec.cls.__name__: spec
+    for spec in (PERSON, FAMILY, EVENT, PLACE, REPOSITORY, SOURCE, CITATION, MEDIA, NOTE, TAG)
+}
+
 
 # --- JSON schema: whitelisting the `json_data` side --------------------------
 
@@ -712,6 +718,11 @@ class Collection:
     #: `target` is the first of them, for the entry's element spec. See
     #: `_referring_bodies`.
     referrers: Tuple[ObjectTypeSpec, ...] = ()
+    #: `backlinks['Person']`: the records of this class that point at the
+    #: current row, found through Gramps' `reference` table (`target` is
+    #: that class's spec; `list_path` is unused). Ordered by handle, byte by
+    #: byte, for `[n]`. See `resolve_collection` and `_collection_subquery_body`.
+    backlink_class: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -1326,6 +1337,34 @@ def _check_no_collection_relationship_name_collisions() -> None:
 _check_no_collection_relationship_name_collisions()
 
 
+#: `backlinks['Person']`, as a collection name (query_lang.py writes the
+#: bracketed form into the name, so the wire format carries it as typed).
+_TYPED_BACKLINKS_RE = re.compile(r"""backlinks\[(?:'([A-Za-z]+)'|"([A-Za-z]+)")\]\Z""")
+
+
+def _typed_backlinks(name: str) -> Optional[Collection]:
+    """The collection `backlinks['<Class>']` names, or `None` when `name`
+    isn't spelled that way. Any of the ten record classes can be named:
+    every one can point at something."""
+    match = _TYPED_BACKLINKS_RE.match(name)
+    if match is None:
+        return None
+    class_name = match.group(1) or match.group(2)
+    target = _SPECS_BY_CLASS.get(class_name)
+    if target is None:
+        raise QueryError(
+            f"backlinks[{class_name!r}]: {class_name!r} isn't a kind of record "
+            f"(known: {', '.join(sorted(_SPECS_BY_CLASS))})"
+        )
+    return Collection(
+        f"backlinks['{class_name}']",
+        target,
+        JsonPath(("handle",)),  # unused, see Collection.backlink_class
+        None,
+        backlink_class=class_name,
+    )
+
+
 def resolve_collection(spec: ObjectTypeSpec, name: str) -> Union[Collection, Backlinks]:
     """Look up a `Collection` (or `Backlinks`) by name on `spec`'s table --
     `exists(...)`'s first argument, resolved the same way
@@ -1336,6 +1375,9 @@ def resolve_collection(spec: ObjectTypeSpec, name: str) -> Union[Collection, Bac
     in this module, and `query_lang.py`'s `_translate_exists_call`/
     `_translate_count_call`/`_node_from_json`/`json_column_to_ref`.
     """
+    typed = _typed_backlinks(name)
+    if typed is not None:
+        return typed
     collections = _COLLECTIONS.get(spec.table, {})
     if name not in collections:
         raise QueryError(
@@ -1372,7 +1414,11 @@ def _resolve_indexed_collection_hop(
     if not isinstance(head, str) or not isinstance(index, int) or isinstance(index, bool):
         return None
     collection = _COLLECTIONS.get(spec.table, {}).get(head)
-    if not isinstance(collection, Collection) or collection.self_link_field is not None:
+    if (
+        not isinstance(collection, Collection)
+        or collection.self_link_field is not None
+        or collection.backlink_class is not None
+    ):
         return None
     if not rest:
         raise QueryError(
@@ -2753,18 +2799,30 @@ def _collection_subquery_body(
     target_table = target.table
     target_alias = _collection_target_alias(collection, outer_spec)
 
-    if dialect == Dialect.SQLITE:
-        source, handle_expr, source_params = _collection_source_sqlite(collection, outer_table)
-    elif dialect == Dialect.POSTGRESQL:
-        source, handle_expr, source_params = _collection_source_postgresql(
-            collection, outer_table, ordered
-        )
-    else:
+    if dialect not in (Dialect.SQLITE, Dialect.POSTGRESQL):
         raise QueryError(f"unsupported dialect: {dialect!r}")
-
-    where_parts = [f"{target_alias}.handle = {handle_expr}"]
-    params = list(source_params)
-    from_parts = [f"{target_table} AS {target_alias}", source]
+    if collection.backlink_class is not None:
+        # `backlinks['Person']`: the rows `reference` says point here.
+        references = (
+            f"SELECT reference.obj_handle FROM reference WHERE reference.ref_handle = "
+            f"{outer_table}.handle AND reference.obj_class = ?"
+        )
+        params = [collection.backlink_class]
+        if treeid is not None:
+            references += " AND reference.treeid = ?"
+            params.append(treeid)
+        where_parts = [f"{target_alias}.handle IN ({references})"]
+        from_parts = [f"{target_table} AS {target_alias}"]
+    else:
+        if dialect == Dialect.SQLITE:
+            source, handle_expr, source_params = _collection_source_sqlite(collection, outer_table)
+        else:
+            source, handle_expr, source_params = _collection_source_postgresql(
+                collection, outer_table, ordered
+            )
+        where_parts = [f"{target_alias}.handle = {handle_expr}"]
+        params = list(source_params)
+        from_parts = [f"{target_table} AS {target_alias}", source]
     if collection.self_link_field:
         if dialect == Dialect.SQLITE:
             link_source, link_correlation = _self_link_source_sqlite(collection, target_alias)
@@ -3341,7 +3399,12 @@ def _render_collection_pick(
     )
     depth = owner.collection_depth
     target_alias = f"{pick.collection.target.table}__target{depth or ''}"
-    order = _entry_order("je", dialect)
+    if pick.collection.backlink_class is not None:
+        # By handle, byte by byte, whatever the database's collation.
+        collate = "BINARY" if dialect == Dialect.SQLITE else '"C"'
+        order = f"{target_alias}.handle COLLATE {collate}"
+    else:
+        order = _entry_order("je", dialect)
     return (
         f"(SELECT {target_alias}.handle FROM {body} "
         f"ORDER BY {order} LIMIT 1 OFFSET {pick.index})",

@@ -469,7 +469,10 @@ def _try_resolve_bare_collection(node: ast.AST, spec: ObjectTypeSpec) -> Optiona
         return None
     try:
         return resolve_collection(spec, node.id)
-    except QueryError:
+    except QueryError as error:
+        if node.id.startswith("backlinks["):
+            # `backlinks['Persn']`: say what's wrong with the class name.
+            raise QueryLangError(str(error)) from error
         return None
 
 
@@ -1725,6 +1728,31 @@ def _builtin_type_values(type_class: type) -> Dict[str, int]:
     return {key: value for value, _label, key in type_class._DATAMAP if value != custom}
 
 
+def _backlinks_lookup(node: ast.AST) -> Optional[ast.Name]:
+    """`backlinks['Person']` as the collection name it stands for (see
+    `query.py`'s `_typed_backlinks`), else `None`."""
+    if (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "backlinks"
+        and isinstance(node.slice, ast.Constant)
+        and isinstance(node.slice.value, str)
+    ):
+        return ast.copy_location(ast.Name(id=f"backlinks['{node.slice.value}']", ctx=ast.Load()), node)
+    return None
+
+
+def _first_of(collection: ast.expr, index: int = 0) -> ast.Subscript:
+    """`[_entry for _entry in <collection>][index]`."""
+    comp = ast.ListComp(
+        elt=ast.Name(id=_LOOKUP_BOUND, ctx=ast.Load()),
+        generators=[
+            ast.comprehension(target=ast.Name(id=_LOOKUP_BOUND, ctx=ast.Store()), iter=collection, ifs=[], is_async=0)
+        ],
+    )
+    return ast.Subscript(value=comp, slice=ast.Constant(value=index), ctx=ast.Load())
+
+
 def _type_lookup(node: ast.AST) -> Optional[Tuple[ast.expr, str, Tuple[type, str]]]:
     """`(list, name, type_class)` when `node` is `list['Name']`, else
     `None`. A string index on any other list is an error: it has no other
@@ -1808,6 +1836,10 @@ class _TypedListLookup(ast.NodeTransformer):
 
     def _loop_over(self, comp: ast.AST) -> ast.AST:
         for generator in comp.generators:  # type: ignore[attr-defined]
+            backlinks = _backlinks_lookup(generator.iter)
+            if backlinks is not None:
+                generator.iter = backlinks
+                continue
             lookup = _type_lookup(generator.iter)
             if lookup is not None and isinstance(generator.target, ast.Name):
                 list_node, name, type_class = lookup
@@ -1820,6 +1852,15 @@ class _TypedListLookup(ast.NodeTransformer):
     visit_GeneratorExp = _loop_over
 
     def visit_Call(self, node: ast.Call) -> ast.AST:
+        backlinks = _backlinks_lookup(node.args[0]) if node.args else None
+        if (
+            backlinks is not None
+            and isinstance(node.func, ast.Name)
+            and node.func.id in ("len", "any", "exists", "count")
+        ):
+            # A collection: counted or tested as any other.
+            node.args = [backlinks] + [self.visit(arg) for arg in node.args[1:]]
+            return node
         lookup = _type_lookup(node.args[0]) if node.args else None
         if (
             lookup is None
@@ -1844,6 +1885,20 @@ class _TypedListLookup(ast.NodeTransformer):
         return node
 
     def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
+        backlinks = _backlinks_lookup(node.value)
+        index = node.slice
+        if (
+            backlinks is not None
+            and isinstance(index, ast.Constant)
+            and isinstance(index.value, int)
+            and not isinstance(index.value, bool)
+        ):
+            # `backlinks['Person'][1]`: the second of them.
+            return ast.copy_location(_first_of(backlinks, index.value), node)
+        backlinks = _backlinks_lookup(node)
+        if backlinks is not None:
+            # Read on (`backlinks['Person'].birth.date`): the first of them.
+            return ast.copy_location(_first_of(backlinks), node)
         self.generic_visit(node)
         lookup = _type_lookup(node)
         if lookup is None:
@@ -2055,6 +2110,12 @@ def _pick_from_json(payload: dict, spec: ObjectTypeSpec) -> ColumnRef:
             where_list_to_ast(payload["where"], collection.target) if "where" in payload else None
         )
         if not field:
+            if collection.backlink_class is not None:
+                raise QueryError(
+                    f"{name} is a {collection.backlink_class} record, not a value on its "
+                    f"own -- add a field after it, e.g. {name}.gramps_id, or test whether "
+                    f"there is one with any({name})"
+                )
             raise QueryError(
                 f"an entry of {name!r} is a {collection.target.table} record, not a "
                 f"value on its own -- add a field after it, e.g. [...][{index}].gramps_id"

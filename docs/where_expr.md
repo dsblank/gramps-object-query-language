@@ -677,11 +677,36 @@ Note "any(bl._class != 'Media' for bl in backlinks)"
 ```
 
 `len(backlinks)` works exactly like `len(...)` above -- `len(backlinks)
-== 0` is another way to spell `not any(bl for bl in backlinks)`. Reaching
-into the referrer's own fields beyond its class (e.g. a Note referenced by
-a Person whose surname is Smith) isn't supported yet -- see `ROADMAP.md`'s
-"Reverse relationships" item. For an event's people and families, see
-[`event_refs`](#who-an-event-belongs-to-eventevent_refs) below.
+== 0` is another way to spell `not any(bl for bl in backlinks)`.
+
+### One kind of referrer: `backlinks['Person']`
+
+Name a kind of record in brackets and `backlinks` becomes those records
+themselves -- every Person (or Family, Event, ...) pointing at this one --
+so a condition can read their own fields:
+
+```python
+Note "any(p.primary_name.first_name == 'Ann' for p in backlinks['Person'])"
+Note "len(backlinks['Family']) > 1"
+Event "any(backlinks['Person'], gender == Person.FEMALE)"
+Note "backlinks['Person'].birth.date.sortval < Date('1900-01-01')"
+```
+
+It is a collection like `children` or `events`: looped over, counted,
+tested with `any(...)`, `exists(...)` or `count(...)`, and counted by a
+field with `distinct([...])`. Read straight off with a path after it, it
+is the first of them, and `backlinks['Person'][1]` the second. "First" is
+by the records' handles, byte by byte, the same in SQL and in Python -- a
+fixed order, not a meaningful one, so it reads as "one of them".
+
+A record pointing here twice is one record: `len(backlinks['Person'])`
+counts people, not references. The kind is one of Citation, Event,
+Family, Media, Note, Person, Place, Repository, Source or Tag, spelled as
+here. Through a privacy proxy, a record you can't see isn't among them.
+
+For an event's people and families *with their roles*, see
+[`event_refs`](#who-an-event-belongs-to-eventevent_refs) below: those are
+the links themselves, which `backlinks` doesn't have.
 
 ## A self-linked collection: `Person.child_refs`
 

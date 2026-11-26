@@ -80,6 +80,8 @@ _CHAIN = rf"{_SEGMENT}(?:\.{_SEGMENT})*"
 _AT_CURSOR_RE = re.compile(rf"(?<![A-Za-z0-9_.\])])(?:({_CHAIN})\.)?({_NAME})?$")
 _SEGMENT_RE = re.compile(rf"({_NAME})((?:{_INDEX})*)")
 _INDEX_RE = re.compile(_INDEX)
+# `backlinks['Person']` starting a path: the Person records pointing here.
+_TYPED_BACKLINKS_RE = re.compile(r"""backlinks\[(?:'([A-Za-z]+)'|"([A-Za-z]+)")\]""")
 _TYPE_INDEX_AT_END_RE = re.compile(r"""\[(?:'[^'\\]*'|"[^"\\]*")\]$""")
 _BINDING_RE = re.compile(rf"\bfor\s+({_NAME})\s+in\s+({_CHAIN})")
 _PARTIAL_OPERATOR_RE = re.compile(r"[=!<>]+$")
@@ -445,6 +447,37 @@ def _walk(
     return context
 
 
+def _typed_backlinks_walk(
+    vocabs: Dict[str, Any], chain: str, bindings: Dict[str, Optional[_Context]], iterating: bool = False
+) -> Tuple[bool, Optional[_Context]]:
+    """`(True, context)` for a path starting `backlinks['Person']`: a
+    Person record (looped over, or the first one read on with `.`, or the
+    n-th with `[n]`), walked on by the rest. `(False, None)` for any other
+    path."""
+    match = _TYPED_BACKLINKS_RE.match(chain)
+    if match is None:
+        return False, None
+    namespace = match.group(1) or match.group(2)
+    if namespace not in vocabs:
+        return True, None
+    rest = chain[match.end():]
+    context: Optional[_Context] = ("namespace", namespace)
+    index = re.match(r"\[[0-9]+\]", rest)
+    if index:
+        rest = rest[index.end():]
+    if not rest:
+        return True, context
+    if not rest.startswith("."):
+        return True, None
+    for name, indexes in _segments(rest[1:]):
+        if context is None:
+            return True, None
+        context = _step_indexed(vocabs, context, name, indexes)
+    if iterating and context and context[0] == "field":
+        context = _index(context, 1)
+    return True, context
+
+
 def _bindings(vocabs: Dict[str, Any], root: str, source: str) -> Dict[str, Optional[_Context]]:
     """Comprehension variables in `source` (`for e in events`) and what each
     iterates over, resolved in source order so a later one can iterate
@@ -455,6 +488,10 @@ def _bindings(vocabs: Dict[str, Any], root: str, source: str) -> Dict[str, Optio
     for match in _BINDING_RE.finditer(source):
         # `for a in attribute_list['Age']` loops over the list's entries of
         # that type, so `a` is an entry, as with `for a in attribute_list`.
+        typed, context = _typed_backlinks_walk(vocabs, match.group(2), bindings, iterating=True)
+        if typed:
+            bindings[match.group(1)] = context
+            continue
         iterated = _TYPE_INDEX_AT_END_RE.sub("", match.group(2))
         bindings[match.group(1)] = _walk(
             vocabs, root, _segments(iterated), bindings, iterating=True
@@ -794,7 +831,9 @@ def complete_from_vocabularies(
             # a string, a bare collection or a list literal belongs.
             chain_start = start - len(chain) - 1
             role = _expected(before[:chain_start])[0]
-            context = _walk(vocabs, namespace, segments, bindings)
+            typed, context = _typed_backlinks_walk(vocabs, chain, bindings)
+            if not typed:
+                context = _walk(vocabs, namespace, segments, bindings)
             candidates = [] if context is None else _names_at(vocabs, context)
             if context is not None and role in ("operand", "value", "is_value", "number"):
                 # `father.families[0]...`: one entry of a collection, across a hop.

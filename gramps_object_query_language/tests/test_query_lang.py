@@ -3167,3 +3167,59 @@ def test_referrer_rejects(namespace, expr, message):
 
     with pytest.raises((QueryLangError, QueryError), match=message):
         compile_expr(namespace, expr)
+
+
+# --- backlinks['Person'] -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "short, long",
+    [
+        ("any(backlinks['Person'])", "any(p for p in backlinks['Person'])"),
+        ("any(backlinks['Person'])", "exists(backlinks['Person'])"),
+        ('any(backlinks["Person"])', "any(backlinks['Person'])"),
+        ("len(backlinks['Person']) > 1", "len([p for p in backlinks['Person']]) > 1"),
+        ("len(backlinks['Person']) > 1", "count(backlinks['Person']) > 1"),
+        ("any(backlinks['Person'], gender == 1)", "any(p.gender == 1 for p in backlinks['Person'])"),
+        ("any(backlinks['Person'], gender == 1)", "any(p for p in backlinks['Person'] if p.gender == 1)"),
+        ("len(backlinks['Person'], gender == 1) > 0", "len([p for p in backlinks['Person'] if p.gender == 1]) > 0"),
+        ("backlinks['Person'].gramps_id == 'I1'", "[p for p in backlinks['Person']][0].gramps_id == 'I1'"),
+        ("backlinks['Person'].gramps_id == 'I1'", "[p.gramps_id for p in backlinks['Person']][0] == 'I1'"),
+        ("backlinks['Person'][2].gramps_id == 'I1'", "[p for p in backlinks['Person']][2].gramps_id == 'I1'"),
+        (
+            "len(distinct([p.gender for p in backlinks['Person']])) > 1",
+            "len(distinct([q.gender for q in backlinks['Person']])) > 1",
+        ),
+    ],
+)
+def test_typed_backlinks_spellings(short, long):
+    from gramps_object_query_language.query import NOTE
+    from gramps_object_query_language.query_lang import parse_expr_for_spec
+
+    assert parse_expr_for_spec(NOTE, short) == parse_expr_for_spec(NOTE, long)
+
+
+@pytest.mark.parametrize(
+    "expr, message",
+    [
+        ("any(backlinks['Persn'])", r"'Persn' isn't a kind of record \(known: Citation, Event"),
+        ("backlinks['Persn'].gramps_id == 'x'", "'Persn' isn't a kind of record"),
+        ("backlinks['Person'] == None", r"backlinks\['Person'\] is a Person record, not a value on its own"),
+        ("any(p.nosuch == 1 for p in backlinks['Person'])", "unknown field 'nosuch' on Person"),
+    ],
+)
+def test_typed_backlinks_rejects(expr, message):
+    from gramps_object_query_language.query_lang import compile_expr
+
+    with pytest.raises((QueryLangError, QueryError), match=message):
+        compile_expr("Note", expr)
+
+
+def test_untyped_backlinks_unchanged():
+    """Plain `backlinks` still only knows `_class`: same wire form as before."""
+    from gramps_object_query_language.query import NOTE
+    from gramps_object_query_language.query_lang import parse_expr_for_spec
+
+    assert parse_expr_for_spec(NOTE, "any(b._class == 'Person' for b in backlinks)") == [
+        {"exists": {"relationship": "backlinks", "where": [{"column": "_class", "op": "eq", "value": "Person"}]}}
+    ]
