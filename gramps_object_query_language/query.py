@@ -877,6 +877,11 @@ class CollectionCount:
     #: `_count_expression`.
     projection: Optional["ColumnRef"] = None
     distinct: bool = False
+    #: `len([c for f in parent_families for c in f.children])`: the
+    #: collections (each with its condition, or `None`) walked before
+    #: `collection`, outermost first -- each one's entries are the rows the
+    #: next one is read from. Empty for an ordinary one-`for` count.
+    via: Tuple[Tuple["Collection", Optional[Any]], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2756,7 +2761,9 @@ class Not:
 # --- EXISTS (one-to-many membership) -----------------------------------------
 
 
-def _collection_source_sqlite(collection: Collection, outer_table: str) -> Tuple[str, str, list]:
+def _collection_source_sqlite(
+    collection: Collection, outer_table: str, alias: str = "je"
+) -> Tuple[str, str, list]:
     """`(from_fragment, handle_expr, params)` for iterating `collection` on
     SQLite, via `json_each` as a table-valued function.
 
@@ -2767,16 +2774,16 @@ def _collection_source_sqlite(collection: Collection, outer_table: str) -> Tuple
     it would against a real `json_data` column.
     """
     (key,) = collection.list_path.segments
-    source = f"json_each({outer_table}.json_data, ?) AS je"
+    source = f"json_each({outer_table}.json_data, ?) AS {alias}"
     if collection.ref_field:
-        handle_expr = f"json_extract(je.value, '$.{collection.ref_field}')"
+        handle_expr = f"json_extract({alias}.value, '$.{collection.ref_field}')"
     else:
-        handle_expr = "je.value"
+        handle_expr = f"{alias}.value"
     return source, handle_expr, [f"$.{key}"]
 
 
 def _collection_source_postgresql(
-    collection: Collection, outer_table: str, ordered: bool = False
+    collection: Collection, outer_table: str, ordered: bool = False, alias: str = "je"
 ) -> Tuple[str, str, list]:
     """`(from_fragment, handle_expr, params)` for iterating `collection` on
     PostgreSQL.
@@ -2789,20 +2796,20 @@ def _collection_source_postgresql(
     """
     (key,) = collection.list_path.segments
     # `ordered`: number the entries (`je.ord`), for picking the n-th.
-    columns = "je(value, ord)" if ordered else "je(value)"
+    columns = f"{alias}(value, ord)" if ordered else f"{alias}(value)"
     ordinality = " WITH ORDINALITY" if ordered else ""
     if collection.ref_field:
         source = (
             f"jsonb_array_elements({outer_table}.json_data::jsonb -> '{key}')"
             f"{ordinality} AS {columns}"
         )
-        handle_expr = f"je.value ->> '{collection.ref_field}'"
+        handle_expr = f"{alias}.value ->> '{collection.ref_field}'"
     else:
         source = (
             f"jsonb_array_elements_text({outer_table}.json_data::jsonb -> '{key}')"
             f"{ordinality} AS {columns}"
         )
-        handle_expr = "je.value"
+        handle_expr = f"{alias}.value"
     return source, handle_expr, []
 
 
@@ -2882,6 +2889,27 @@ def _collection_subquery_body(
     `any(enclosing_places, any(enclosing_places))` would ask whether a
     place encloses itself.
     """
+    from_parts, from_params, where_parts, where_params = _collection_subquery_parts(
+        collection, outer_spec, condition, dialect, treeid, collation, ordered
+    )
+    body = f"{', '.join(from_parts)} WHERE {' AND '.join(where_parts)}"
+    return body, from_params + where_params
+
+
+def _collection_subquery_parts(
+    collection: Collection,
+    outer_spec: ObjectTypeSpec,
+    condition: Optional[Any],
+    dialect: Dialect,
+    treeid: Optional[int],
+    collation: Optional[str] = None,
+    ordered: bool = False,
+    source_alias: str = "je",
+) -> Tuple[List[str], list, List[str], list]:
+    """`_collection_subquery_body`'s pieces, unjoined: `(from_parts,
+    from_params, where_parts, where_params)` -- so a count over several
+    collections in a row (`CollectionCount.via`) can join each level's
+    pieces into one subquery."""
     outer_table = _sql_table(outer_spec)
     depth = outer_spec.collection_depth
     target = collection.target
@@ -2902,15 +2930,19 @@ def _collection_subquery_body(
             params.append(treeid)
         where_parts = [f"{target_alias}.handle IN ({references})"]
         from_parts = [f"{target_table} AS {target_alias}"]
+        from_params: list = []
     else:
         if dialect == Dialect.SQLITE:
-            source, handle_expr, source_params = _collection_source_sqlite(collection, outer_table)
+            source, handle_expr, source_params = _collection_source_sqlite(
+                collection, outer_table, source_alias
+            )
         else:
             source, handle_expr, source_params = _collection_source_postgresql(
-                collection, outer_table, ordered
+                collection, outer_table, ordered, source_alias
             )
         where_parts = [f"{target_alias}.handle = {handle_expr}"]
-        params = list(source_params)
+        from_params = list(source_params)
+        params = []
         from_parts = [f"{target_table} AS {target_alias}", source]
     if collection.self_link_field:
         if dialect == Dialect.SQLITE:
@@ -2937,9 +2969,7 @@ def _collection_subquery_body(
     if treeid is not None:
         where_parts.append(f"{target_alias}.treeid = ?")
         params.append(treeid)
-
-    body = f"{', '.join(from_parts)} WHERE {' AND '.join(where_parts)}"
-    return body, params
+    return from_parts, from_params, where_parts, params
 
 
 def _backlinks_subquery_body(
@@ -3153,6 +3183,8 @@ def _render_collection_count(
         )
     if count.collection.referrers:
         return _render_referring_count(count, outer_spec, dialect, treeid)
+    if count.via:
+        return _render_chained_count(count, outer_spec, dialect, treeid)
     row_spec = replace(
         count.collection.target,
         sql_alias=_collection_target_alias(count.collection, outer_spec),
@@ -3165,6 +3197,42 @@ def _render_collection_count(
         count.collection, outer_spec, count.condition, dialect, treeid
     )
     return f"(SELECT {select} FROM {body})", select_params + params
+
+
+def _render_chained_count(
+    count: "CollectionCount",
+    outer_spec: ObjectTypeSpec,
+    dialect: Dialect,
+    treeid: Optional[int],
+) -> Tuple[str, list]:
+    """A count over several collections in a row (`count.via`, then
+    `count.collection`): one subquery joining every level, each level's
+    rows read from the previous level's aliased row."""
+    from_parts: List[str] = []
+    from_params: list = []
+    where_parts: List[str] = []
+    where_params: list = []
+    level_spec = outer_spec
+    levels = (*count.via, (count.collection, count.condition))
+    for index, (collection, condition) in enumerate(levels):
+        # Every level's unnest is in the same FROM, so each needs its own name.
+        parts = _collection_subquery_parts(
+            collection, level_spec, condition, dialect, treeid, source_alias=f"je_c{index}"
+        )
+        from_parts += parts[0]
+        from_params += parts[1]
+        where_parts += parts[2]
+        where_params += parts[3]
+        level_spec = replace(
+            collection.target,
+            sql_alias=_collection_target_alias(collection, level_spec),
+            collection_depth=level_spec.collection_depth + 1,
+        )
+    select, select_params = _count_expression(
+        count.projection, count.distinct, level_spec, dialect, treeid
+    )
+    sql = f"(SELECT {select} FROM {', '.join(from_parts)} WHERE {' AND '.join(where_parts)})"
+    return sql, select_params + from_params + where_params
 
 
 def _resolve_array_location(

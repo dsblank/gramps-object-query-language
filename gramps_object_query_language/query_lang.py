@@ -853,6 +853,8 @@ def _is_computed(node: ast.AST) -> bool:
         or _is_len_call(node)
         or _is_internal_call(node, _COUNT)
         or _is_internal_call(node, _DISTINCT)
+        or _is_internal_call(node, _CHAIN)
+        or _is_internal_call(node, _DISTINCT_CHAIN)
         or _pick_root(node) is not None
         or _is_arithmetic(node)
     )
@@ -886,7 +888,9 @@ def _translate_column_or_computed(node: ast.AST, spec: ObjectTypeSpec) -> Union[
         return _translate_pick(*picked, spec)
     if _is_internal_call(node, _COUNT):
         return _translate_projected_count(node, spec)  # type: ignore[arg-type]
-    if _is_internal_call(node, _DISTINCT):
+    if _is_internal_call(node, _CHAIN):
+        return _translate_chain_count(node, spec)  # type: ignore[arg-type]
+    if _is_internal_call(node, _DISTINCT) or _is_internal_call(node, _DISTINCT_CHAIN):
         raise QueryLangError(
             "distinct([...]) can only be counted so far -- wrap it in len(...), "
             "e.g. len(distinct([f.father for f in parent_families]))"
@@ -1563,8 +1567,8 @@ def _comprehension_generator(comp: Union[ast.GeneratorExp, ast.ListComp], call: 
     """
     if len(comp.generators) != 1:
         raise QueryLangError(
-            f"{_show(call)}: a loop has one 'for' -- for a second list, nest another any(...): "
-            f"any(any(... for c in f.children) for f in families)"
+            f"{_show(call)}: only any(...), len([...]) and len(distinct([...])) can have "
+            f"more than one 'for' so far"
         )
     generator = comp.generators[0]
     if generator.is_async:
@@ -1670,6 +1674,12 @@ def _count_projection(elt: ast.expr, bound_name: str) -> Optional[ast.expr]:
 #: `distinct([...])` not (yet) inside `len(...)`.
 _COUNT = "_count"
 _DISTINCT = "_distinct"
+#: A count over several `for`s in a row: `_chain(first_list, [later list
+#: names], [each level's condition or None], field or None, distinct)`
+#: (from `len([...])`/`len(distinct([...]))`), and a `distinct([...])` with
+#: several `for`s not (yet) inside `len(...)`.
+_CHAIN = "_chain"
+_DISTINCT_CHAIN = "_distinct_chain"
 
 
 def _is_internal_call(node: ast.AST, name: str) -> bool:
@@ -1719,7 +1729,109 @@ _PICK = "_pick"
 
 #: Calls whose first argument is a list and whose other arguments are read
 #: against that list's entries -- see `_BoundNameStripper.visit_Call`.
-_LIST_CALLS = frozenset({"any", "len", "exists", "count", _COUNT, _DISTINCT, _PICK})
+_LIST_CALLS = frozenset(
+    {"any", "len", "exists", "count", _COUNT, _DISTINCT, _PICK, _CHAIN, _DISTINCT_CHAIN}
+)
+
+
+def _chain_call(comp: ast.ListComp, call: ast.Call, name: str, distinct: bool) -> ast.Call:
+    """`len([c.f for f in A if p for c in f.B if q])` -> `_chain(A, ['B'],
+    [p, q], f, distinct)`, each `if` stripped of its own loop variable."""
+    generators = comp.generators
+    targets: List[str] = []
+    conditions: List[ast.expr] = []
+    for index, generator in enumerate(generators):
+        if generator.is_async or not isinstance(generator.target, ast.Name):
+            raise QueryLangError(f"a loop variable must be a plain name: {_show(call)}")
+        if index == 0:
+            iter_node = generator.iter
+            if not (
+                isinstance(iter_node, ast.Name)
+                or (isinstance(iter_node, ast.Attribute) and isinstance(iter_node.value, ast.Name))
+            ):
+                raise QueryLangError(
+                    f"for ... in {_show(iter_node)}: with several 'for's, the first goes over a "
+                    f"collection, e.g. parent_families"
+                )
+        elif not (
+            isinstance(generator.iter, ast.Attribute)
+            and isinstance(generator.iter.value, ast.Name)
+            and generator.iter.value.id == targets[-1]
+        ):
+            raise QueryLangError(
+                f"{_show(call)}: each 'for' after the first goes over a list of the loop "
+                f"variable just before it, e.g. len([c for f in parent_families for c in f.children])"
+            )
+        own = generator.target.id
+        earlier = set(targets) - {own}
+        for if_node in generator.ifs:
+            for inner in ast.walk(if_node):
+                if isinstance(inner, ast.Name) and inner.id in earlier:
+                    raise QueryLangError(
+                        f"'{inner.id}' can't be used in a later 'for''s condition -- it would be "
+                        f"read from that loop's entries instead. Test '{inner.id}' right after "
+                        f"its own 'for': {_show(call)}"
+                    )
+        stripper = _BoundNameStripper(own)
+        ifs = [stripper.visit(if_node) for if_node in generator.ifs]
+        conditions.append(_and_together(ifs) if ifs else ast.Constant(value=None))
+        targets.append(own)
+    projection = _count_projection(comp.elt, targets[-1])
+    if name == _DISTINCT_CHAIN and projection is None:
+        raise QueryLangError(
+            "distinct([...]) needs a field to compare, e.g. "
+            "distinct([c.handle for f in parent_families for c in f.children])"
+        )
+    return ast.Call(
+        func=ast.Name(id=name, ctx=ast.Load()),
+        args=[
+            generators[0].iter,
+            ast.List(elts=[ast.Constant(value=g.iter.attr) for g in generators[1:]], ctx=ast.Load()),  # type: ignore[attr-defined]
+            ast.List(elts=conditions, ctx=ast.Load()),
+            ast.Constant(value=None) if projection is None else projection,
+            ast.Constant(value=distinct),
+        ],
+        keywords=[],
+    )
+
+
+def _translate_chain_count(call: ast.Call, spec: ObjectTypeSpec) -> dict:
+    """`_chain(...)` (see `_chain_call`) -> `{"count_of": {"chain":
+    [{"relationship": ..., "where": [...]}, ...], "project": ...,
+    "distinct": ...}}`. Every list must be a plain collection of records."""
+    first, names, conditions, projection, distinct = call.args
+    if not isinstance(first, ast.Name):
+        raise QueryLangError(
+            f"for ... in {_show(first)}: with several 'for's, the first goes over a "
+            f"collection of the record, e.g. parent_families"
+        )
+    chain = []
+    level_spec = spec
+    for name, condition in zip(
+        [first.id] + [n.value for n in names.elts],  # type: ignore[attr-defined]
+        conditions.elts,  # type: ignore[attr-defined]
+    ):
+        collection = _try_resolve_bare_collection(ast.Name(id=name, ctx=ast.Load()), level_spec)
+        if (
+            not isinstance(collection, Collection)
+            or collection.self_link_field
+            or collection.referrers
+            or collection.backlink_class
+        ):
+            raise QueryLangError(
+                f"for ... in {name}: with several 'for's, each goes over a collection of records "
+                f"(parent_families, children, events, ...)"
+            )
+        level: dict = {"relationship": name}
+        if not (isinstance(condition, ast.Constant) and condition.value is None):
+            level["where"] = _translate_top_level(condition, collection.target)
+        chain.append(level)
+        level_spec = collection.target
+    payload: dict = {"chain": chain}
+    if not (isinstance(projection, ast.Constant) and projection.value is None):
+        payload["project"] = _translate_path(projection)
+        payload["distinct"] = distinct.value  # type: ignore[attr-defined]
+    return {"count_of": payload}
 
 
 def _pick_projection(elt: ast.expr, bound_name: str) -> Optional[ast.expr]:
@@ -1802,8 +1914,25 @@ class _ComprehensionDesugarer(ast.NodeTransformer):
             generator = _comprehension_generator(comp, node)
             condition = _any_condition(comp, generator.target.id)
             return ast.copy_location(_make_call("any", generator.iter, condition), node)
+        if (
+            name == "distinct"
+            and len(node.args) == 1
+            and isinstance(node.args[0], ast.ListComp)
+            and len(node.args[0].generators) > 1
+        ):
+            return ast.copy_location(_chain_call(node.args[0], node, _DISTINCT_CHAIN, True), node)
         if name == "distinct":
             return ast.copy_location(_distinct_call(node), node)
+        if name == "len" and len(node.args) == 1 and _is_internal_call(node.args[0], _DISTINCT_CHAIN):
+            node.args[0].func.id = _CHAIN  # type: ignore[attr-defined]
+            return ast.copy_location(node.args[0], node)
+        if (
+            name == "len"
+            and len(node.args) == 1
+            and isinstance(node.args[0], ast.ListComp)
+            and len(node.args[0].generators) > 1
+        ):
+            return ast.copy_location(_chain_call(node.args[0], node, _CHAIN, False), node)
         if name == "len" and len(node.args) == 1 and _is_internal_call(node.args[0], _DISTINCT):
             inner = node.args[0]
             return ast.copy_location(_projected_count_call(*inner.args, distinct=True), node)  # type: ignore[attr-defined]
@@ -2386,6 +2515,34 @@ def _pick_from_json(payload: dict, spec: ObjectTypeSpec) -> ColumnRef:
     return JsonArrayPick(array_ref, element_spec, condition, index, field_ref)
 
 
+def _chained_count_from_json(payload: dict, spec: ObjectTypeSpec) -> CollectionCount:
+    """`{"chain": [...], "project"?, "distinct"?}` (see
+    `_translate_chain_count`) -> a `CollectionCount` with `via`."""
+    levels = []
+    level_spec = spec
+    for level in payload["chain"]:
+        collection = resolve_collection(level_spec, level["relationship"])
+        if (
+            not isinstance(collection, Collection)
+            or collection.self_link_field
+            or collection.referrers
+            or collection.backlink_class
+        ):
+            raise QueryError(f"can't count through {level['relationship']!r} in a chain")
+        condition = (
+            where_list_to_ast(level["where"], collection.target) if "where" in level else None
+        )
+        levels.append((collection, condition))
+        level_spec = collection.target
+    projection = (
+        _resolve_projection(level_spec, payload["project"]) if "project" in payload else None
+    )
+    collection, condition = levels[-1]
+    return CollectionCount(
+        collection, condition, projection, bool(payload.get("distinct")), via=tuple(levels[:-1])
+    )
+
+
 def json_column_to_ref(column: Union[str, dict], spec: ObjectTypeSpec) -> ColumnRef:
     """A wire-format column reference (plain string, `{"json_path": [...]}`,
     `{"count_of": {...}}`, or `{"length_of": ...}`), resolved to a
@@ -2426,6 +2583,8 @@ def json_column_to_ref(column: Union[str, dict], spec: ObjectTypeSpec) -> Column
     base_column = spec.element_base_column or "json_data"
     if isinstance(column, str):
         return resolve_ref_string(spec, column, base_column)
+    if "count_of" in column and "chain" in column["count_of"]:
+        return _chained_count_from_json(column["count_of"], spec)
     if "count_of" in column:
         payload = column["count_of"]
         collection = resolve_collection(spec, payload["relationship"])

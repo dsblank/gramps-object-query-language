@@ -3295,9 +3295,34 @@ def test_any_multiple_for_matches_nested_any(multi, nested):
         ("any(c.gender == 1 for f in parent_families for c in children)", "loop variable just before it"),
         ("any(c.gender == 1 for f in parent_families for c in f.father.events)", "loop variable just before it"),
         ("any(c.gender == 1 for f in parent_families for c in f.children if f.private == True)", "inner loop's condition"),
-        ("len([c for f in parent_families for c in f.children]) > 1", "one 'for'"),
     ],
 )
 def test_any_multiple_for_rejected(expr, message):
+    with pytest.raises(QueryLangError, match=message):
+        parse_expr("person", expr)
+
+
+@pytest.mark.parametrize(
+    "expr, message",
+    [
+        ("len([c for f in parent_families for c in children]) > 1", "loop variable just before it"),
+        ("len([c for f in parent_families for c in f.children if f.private == True]) > 1",
+         "later 'for''s condition"),
+        ("len([f for f in parent_families for c in f.children]) > 1", "collects the loop variable"),
+        ("len([c.handle for f in parent_families for c in f.children if c.gender == 1][0]) > 1",
+         "more than one 'for'"),
+        ("[c for f in parent_families for c in f.children][0].gender == 1", "more than one 'for'"),
+        ("len([a for f in parent_families for a in f.attribute_list]) > 1",
+         "each goes over a collection"),
+        ("len([b for a in attribute_list for b in a.citations]) > 1", "each goes over a collection"),
+        ("len([r for f in parent_families for r in f.backlinks]) > 1", "each goes over a collection"),
+        ("len([r for f in families for r in f.child_refs]) > 1", "each goes over a collection"),
+        ("len([c for f in father.families for c in f.children]) > 1", "collection of the record"),
+        ("len(distinct([c for f in parent_families for c in f.children])) > 1", "needs a field"),
+        ("distinct([c.handle for f in parent_families for c in f.children]) == 1",
+         "can only be counted"),
+    ],
+)
+def test_len_multiple_for_rejected(expr, message):
     with pytest.raises(QueryLangError, match=message):
         parse_expr("person", expr)

@@ -3088,6 +3088,138 @@ def test_counting_a_field_and_distinct_values(distinct_db, pg_conn, expr, expect
         assert resolve_column_ref(db, person, ref, PERSON) == value, f"evaluator on {key}"
 
 
+# --- counting across several for clauses: len([c for f in ... for c in f.children]) ---
+
+
+@pytest.fixture(scope="module")
+def sibling_db():
+    """`fam1` (public): children a, b. `fam2` (private): a, b, c -- a and
+    b are in both, so they reach each other twice. `fam3`: solo alone.
+    `lonely` has no parent family. a, b and solo are male, c is female and
+    has one event."""
+    dbman = CLIDbManager(DbState())
+    dirpath, db_name = dbman.create_new_db_cli("_test_evaluator_siblings", dbid="sqlite")
+    db = make_database("sqlite")
+    db.load(dirpath)
+    handles = {}
+    with DbTxn("setup", db) as trans:
+        for key, gender in (("a", Person.MALE), ("b", Person.MALE), ("c", Person.FEMALE),
+                            ("solo", Person.MALE), ("lonely", Person.MALE)):
+            person = Person()
+            person.set_primary_name(_name(key, "Sib"))
+            person.set_gender(gender)
+            if key == "c":
+                ref = EventRef()
+                ref.set_reference_handle(db.add_event(Event(), trans))
+                person.add_event_ref(ref)
+            handles[key] = db.add_person(person, trans)
+        for family_key, private, children in (
+            ("fam1", False, ("a", "b")), ("fam2", True, ("a", "b", "c")), ("fam3", False, ("solo",))
+        ):
+            family = Family()
+            family.set_privacy(private)
+            for child_key in children:
+                child_ref = ChildRef()
+                child_ref.set_reference_handle(handles[child_key])
+                family.add_child_ref(child_ref)
+            handles[family_key] = db.add_family(family, trans)
+            for child_key in children:
+                child = db.get_person_from_handle(handles[child_key])
+                child.add_parent_family_handle(handles[family_key])
+                db.commit_person(child, trans)
+    yield db, handles
+    db.close()
+    dbman.remove_database(db_name)
+
+
+_SIBLING_PEOPLE = ("a", "b", "c", "solo", "lonely")
+
+
+@pytest.mark.parametrize(
+    "expr, expected",
+    [
+        (
+            "len([c for f in parent_families for c in f.children])",
+            {"a": 5, "b": 5, "c": 3, "solo": 1, "lonely": 0},
+        ),
+        (
+            "len([1 for f in parent_families for c in f.children])",
+            {"a": 5, "b": 5, "c": 3, "solo": 1, "lonely": 0},
+        ),
+        (
+            "len([c.handle for f in parent_families for c in f.children])",
+            {"a": 5, "b": 5, "c": 3, "solo": 1, "lonely": 0},
+        ),
+        (
+            "len(distinct([c.handle for f in parent_families for c in f.children]))",
+            {"a": 3, "b": 3, "c": 3, "solo": 1, "lonely": 0},
+        ),
+        (
+            "len(distinct([c.gender for f in parent_families for c in f.children]))",
+            {"a": 2, "b": 2, "c": 2, "solo": 1, "lonely": 0},
+        ),
+        (
+            "len([c for f in parent_families if f.private == False for c in f.children])",
+            {"a": 2, "b": 2, "c": 0, "solo": 1, "lonely": 0},
+        ),
+        (
+            "len([c for f in parent_families for c in f.children if c.gender == Person.FEMALE])",
+            {"a": 1, "b": 1, "c": 1, "solo": 0, "lonely": 0},
+        ),
+        (
+            "len(distinct([c.handle for f in parent_families if f.private == True "
+            "for c in f.children if c.gender == Person.MALE]))",
+            {"a": 2, "b": 2, "c": 2, "solo": 0, "lonely": 0},
+        ),
+        (
+            "len([e for f in parent_families for c in f.children for e in c.events])",
+            {"a": 1, "b": 1, "c": 1, "solo": 0, "lonely": 0},
+        ),
+        (
+            "len(distinct([c.handle for f in parent_families for c in f.children])) - 1",
+            {"a": 2, "b": 2, "c": 2, "solo": 0, "lonely": -1},
+        ),
+    ],
+)
+def test_count_across_several_for_clauses(sibling_db, pg_conn, expr, expected):
+    """A count over several `for`s gives the same numbers on SQLite,
+    PostgreSQL and the evaluator."""
+    from gramps_object_query_language.query import Dialect, Query, compile_query
+    from gramps_object_query_language.query_lang import parse_select
+
+    db, handles = sibling_db
+    [(ref, _key)] = parse_select(PERSON, [f"{expr} as n"])
+    query = Query(select=["handle", ref])
+    want = {handles[key]: value for key, value in expected.items()}
+    sql, params = compile_query(PERSON, query, dialect=Dialect.SQLITE)
+    db.dbapi.execute(sql, params)
+    got = {handle: value for handle, value in db.dbapi.fetchall() if handle in want}
+    assert got == want, "SQLite"
+    if pg_conn is not None:
+        sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
+        rows = _rows_on_postgresql(pg_conn, db, sql, params)
+        assert {handle: value for handle, value in rows if handle in want} == want, "PostgreSQL"
+    for key, value in expected.items():
+        person = db.get_person_from_handle(handles[key])
+        assert resolve_column_ref(db, person, ref, PERSON) == value, f"evaluator on {key}"
+
+
+def test_count_across_several_for_clauses_as_a_filter(sibling_db, pg_conn):
+    db, handles = sibling_db
+    _assert_sql_and_evaluator_agree(
+        db, handles, PERSON, _SIBLING_PEOPLE,
+        "len(distinct([c.handle for f in parent_families for c in f.children])) - 1 > 1",
+        {"a", "b", "c"}, pg_conn,
+    )
+    # Inside another loop: the first list is one of the outer loop variable's.
+    _assert_sql_and_evaluator_agree(
+        db, handles, FAMILY, ("fam1", "fam2", "fam3"),
+        "any(len(distinct([k.handle for g in c.parent_families for k in g.children])) > 2 "
+        "for c in children)",
+        {"fam1", "fam2"}, pg_conn,
+    )
+
+
 def test_distinct_count_as_a_filter(distinct_db, pg_conn):
     db, handles = distinct_db
     _assert_sql_and_evaluator_agree(

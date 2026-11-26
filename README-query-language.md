@@ -505,6 +505,17 @@ Several `for`s in one `any(...)` walk from list to list: each one goes
 over a list of the loop variable just before it -- the person's families,
 each family's children, each child's own families, and their children.
 
+### Goal: Find people with more than two brothers and sisters
+
+```
+Person "len(distinct([c.handle for f in parent_families for c in f.children])) - 1 > 2"
+```
+
+Two `for`s go through every child of every one of the person's parent
+families. `distinct(...)` counts each child once, even one recorded in two
+of those families, and `- 1` leaves out the person themselves. (Someone
+with no parent family at all comes out as -1, which is fine for `> 2`.)
+
 ### Goal: Find people whose events happened in more than one place
 
 ```
