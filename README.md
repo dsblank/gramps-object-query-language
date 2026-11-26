@@ -84,6 +84,19 @@ pip install -e ".[test]"
 pytest
 ```
 
+`tests/test_random_parity.py` writes random queries against a random,
+deliberately awkward tree and checks that the SQL and the evaluator agree
+on every one (and PostgreSQL too, with `GOQL_TEST_POSTGRES_DSN` set). To
+hunt for disagreements at length, on other trees:
+
+```bash
+python -m gramps_object_query_language.tests.random_queries --count 5000 --seed 3
+```
+
+Disagreements that are known but not yet fixed are listed in
+`KNOWN_ISSUES` in `tests/random_queries.py`; the generator steers around
+them until their fix lands.
+
 ## License
 
 GNU Affero General Public License v3 or later (AGPL-3.0-or-later). See
