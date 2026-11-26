@@ -45,7 +45,18 @@ rarely parses -- it only looks at the dotted path ending at the cursor:
   (`birth.` -> the Event's names) and JSON fields
   (`primary_name.surname_list[0].` -> a Surname's fields). A comprehension
   variable starts from what it iterates over (`e.` in `any(... for e in
-  events)` -> an Event's names).
+  events)` -> an Event's names; `c.` in `any(... for f in parent_families
+  for c in f.children)` -> a Person's; `s.` in `any(... for s in [c for c
+  in children if ...])` -> a Person's, like `c`). Only the loop variable
+  GOQL lets that spot read is offered: the last `for`'s in the element, the
+  `for` before it in an `if`, the one just before in a later `for`'s list,
+  and none outside every loop or from an outer loop inside an inner one.
+- A loop's list (`for x in`): collections, lists, `[` for a list
+  comprehension, then on along a path to a list
+  (`father.primary_name.surname_list`, `f.children`); after another
+  `for`, only the variable just before it.
+- `backlinks[`: `"`, then the kinds of record (`backlinks["Pe` ->
+  `Person"]`).
 - A Gramps type compared with a value (`type ==`, `type in [`): `"`, and
   inside that string the type's names, matched ignoring case
   (`type == "cen` -> `Census"`).
@@ -82,6 +93,8 @@ _SEGMENT_RE = re.compile(rf"({_NAME})((?:{_INDEX})*)")
 _INDEX_RE = re.compile(_INDEX)
 # `backlinks['Person']` starting a path: the Person records pointing here.
 _TYPED_BACKLINKS_RE = re.compile(r"""backlinks\[(?:'([A-Za-z]+)'|"([A-Za-z]+)")\]""")
+# `backlinks[` (not after a `.`) just before a string: a kind of record.
+_BACKLINKS_KIND_RE = re.compile(r"(?<![A-Za-z0-9_.\])])backlinks\[$")
 _TYPE_INDEX_AT_END_RE = re.compile(r"""\[(?:'[^'\\]*'|"[^"\\]*")\]$""")
 _BINDING_RE = re.compile(rf"\bfor\s+({_NAME})\s+in\s+({_CHAIN})")
 _PARTIAL_OPERATOR_RE = re.compile(r"[=!<>]+$")
@@ -209,11 +222,13 @@ def _open_frames(tokens: List[Tuple[str, str]]) -> List[_Frame]:
             function = previous[1] if previous and previous[0] == "name" and previous[1] not in _NON_OPERAND_WORDS else None
             frames.append(_Frame("(", function, False))
         elif text == "[":
-            # `path[` indexes a list; `in [` starts a list of values; any
-            # other `[` starts a comprehension (`len([... for ...])`).
-            frames.append(
-                _Frame("[", None, _is_word(previous, "in"), subscript=_ends_operand(previous))
+            # `path[` indexes a list; `in [` starts a list of values, except
+            # in `for x in [`; any other `[` starts a comprehension
+            # (`len([... for ...])`, `for x in [... for ...]`).
+            values = _is_word(previous, "in") and not (
+                index >= 3 and _is_word(tokens[index - 3], "for")
             )
+            frames.append(_Frame("[", None, values, subscript=_ends_operand(previous)))
         elif text in ")]" and frames:
             frames.pop()
         elif text == "," and frames:
@@ -427,6 +442,12 @@ def _walk(
     (first, first_indexes), rest = segments[0], segments[1:]
     if first in bindings:
         context = _index(bindings[first], first_indexes) if bindings[first] else None
+        if iterating and context is not None and context[0] == "namespace" and len(rest) == 1:
+            (name, indexes), owner = rest[0], vocabs[context[1]]
+            target = owner["collections"].get(name, False)
+            if not indexes and target is not False and name not in owner.get("links", {}):
+                # `for c in f.children`: a collection off the loop variable.
+                return None if target is None else ("namespace", target)
     else:
         context = None
         if iterating and not rest and not first_indexes:
@@ -478,31 +499,187 @@ def _typed_backlinks_walk(
     return True, context
 
 
-def _bindings(vocabs: Dict[str, Any], root: str, source: str) -> Dict[str, Optional[_Context]]:
-    """Comprehension variables in `source` (`for e in events`) and what each
-    iterates over, resolved in source order so a later one can iterate
-    over an earlier one's list field (`for s in n.surname_list`). `None` for a variable
-    whose source can't be followed (`backlinks`, a typo) -- still a
-    variable, but with nothing to offer after its dot."""
-    bindings: Dict[str, Optional[_Context]] = {}
-    for match in _BINDING_RE.finditer(source):
-        # `for a in attribute_list['Age']` loops over the list's entries of
-        # that type, so `a` is an entry, as with `for a in attribute_list`.
-        typed, context = _typed_backlinks_walk(vocabs, match.group(2), bindings, iterating=True)
-        if typed:
-            bindings[match.group(1)] = context
+class _Loop:
+    """One `for name in list` clause of a comprehension: where it starts,
+    where its list is written (`iter_start` is `None` until `in` is), and
+    the `if` conditions that belong to it."""
+
+    def __init__(self, comprehension: "_Comprehension", index: int, name: Optional[str], start: int):
+        self.comprehension = comprehension
+        self.index = index
+        self.name = name
+        self.start = start
+        self.iter_start: Optional[int] = None
+        self.iter_end = 0
+        self.conditions: List[Tuple[int, int]] = []
+
+
+class _Comprehension:
+    """A `(`/`[` with a `for` directly inside it: `any(E for ...)`,
+    `[E for ...]`. `first_for` is where its element `E` ends."""
+
+    def __init__(self, open_: int, close: int):
+        self.open = open_
+        self.close = close
+        self.first_for = close
+        self.loops: List[_Loop] = []
+
+
+def _comprehensions(source: str) -> List[_Comprehension]:
+    """Every comprehension in `source`, an unclosed one running to the end."""
+    tokens = [
+        (match.lastgroup, match.group(), match.start(), match.end())
+        for match in _TOKEN_RE.finditer(source)
+        if match.lastgroup is not None
+    ]
+    stack: List[Tuple[int, List[int]]] = []
+    frames: List[Tuple[int, int, List[int]]] = []
+    for index, (kind, text, start, _end) in enumerate(tokens):
+        if kind == "other" and text in "([":
+            if stack:
+                stack[-1][1].append(index)
+            stack.append((start, []))
+        elif kind == "other" and text in ")]" and stack:
+            open_, inside = stack.pop()
+            frames.append((open_, start, inside))
+            if stack:
+                stack[-1][1].append(index)
+        elif stack:
+            stack[-1][1].append(index)
+    while stack:
+        open_, inside = stack.pop()
+        frames.append((open_, len(source), inside))
+    comprehensions = []
+    for open_, close, inside in frames:
+        direct = [tokens[index] for index in inside]
+        if not any(kind == "name" and text == "for" for kind, text, _s, _e in direct):
             continue
-        iterated = _TYPE_INDEX_AT_END_RE.sub("", match.group(2))
-        bindings[match.group(1)] = _walk(
-            vocabs, root, _segments(iterated), bindings, iterating=True
+        comprehension = _Comprehension(open_, close)
+        loop: Optional[_Loop] = None
+        # Each `for`/`if` ends the part before it: the element, a list, a condition.
+        boundaries = [
+            start for kind, text, start, _e in direct if kind == "name" and text in ("for", "if")
+        ] + [close]
+        comprehension.first_for = next(
+            start for kind, text, start, _e in direct if kind == "name" and text == "for"
         )
-    return bindings
+        for position, (kind, text, start, end) in enumerate(direct):
+            if kind != "name" or text not in ("for", "if"):
+                continue
+            following = next(boundary for boundary in boundaries if boundary > start)
+            if text == "for":
+                name_token = direct[position + 1] if position + 1 < len(direct) else None
+                in_token = direct[position + 2] if position + 2 < len(direct) else None
+                name = name_token[1] if name_token and name_token[0] == "name" else None
+                loop = _Loop(comprehension, len(comprehension.loops), name, start)
+                comprehension.loops.append(loop)
+                if in_token is not None and in_token[:2] == ("name", "in"):
+                    loop.iter_start = in_token[3]
+                    loop.iter_end = following
+            elif loop is not None:
+                loop.conditions.append((end, following))
+        comprehensions.append(comprehension)
+    return comprehensions
 
 
-def _comprehension_ending(text: str) -> Optional[str]:
-    """What a list comprehension ending at `text`'s final `]` collects
-    (`a.value` in `[a.value for a in attribute_list if ...]`), or `None`
-    if that `]` doesn't close one."""
+def _innermost(comprehensions: List[_Comprehension], position: int) -> Optional[_Comprehension]:
+    found = None
+    for comprehension in comprehensions:
+        if comprehension.open < position <= comprehension.close and (
+            found is None or comprehension.open > found.open
+        ):
+            found = comprehension
+    return found
+
+
+def _visible_loop(
+    comprehensions: List[_Comprehension], position: int
+) -> Tuple[Optional[_Loop], bool]:
+    """The one loop whose variable GOQL lets the text at `position` use,
+    and whether `position` is in the list of a `for` after the first.
+
+    In `any(E for f in A if p for c in f.B if q)`, `E` and `q` read `c`, `p`
+    reads `f`, and `f.B` reads `f` (the list of a later `for` goes over the
+    loop variable just before it). The first `for`'s list `A` is read where
+    the comprehension is -- the enclosing loop's variable, in an inner
+    loop. An outer loop's variable is never usable inside an inner loop's
+    element or conditions, and none is outside every loop."""
+    while True:
+        comprehension = _innermost(comprehensions, position)
+        if comprehension is None:
+            return None, False
+        if position <= comprehension.first_for:
+            return comprehension.loops[-1], False
+        loop = [loop for loop in comprehension.loops if loop.start < position][-1]
+        if loop.iter_start is not None and loop.iter_start <= position <= loop.iter_end:
+            if loop.index == 0:
+                position = comprehension.open
+                continue
+            return comprehension.loops[loop.index - 1], True
+        if any(start <= position <= end for start, end in loop.conditions):
+            return loop, False
+        return None, False
+
+
+def _loop_context(
+    vocabs: Dict[str, Any],
+    root: str,
+    source: str,
+    comprehensions: List[_Comprehension],
+    loop: _Loop,
+    resolving: Tuple[int, ...] = (),
+) -> Optional[_Context]:
+    """What `loop`'s variable is an element of, from the list it goes over:
+    a collection (`events`), a list field (`attribute_list`, or
+    `attribute_list['Age']`, its entries of that type), a list off the
+    variable visible there (`f.children`), `backlinks['Person']`, or a list
+    comprehension collecting its own variable (`[c for c in children if
+    ...]`, the same as that variable). `None` for one that can't be
+    followed (`backlinks`, a typo)."""
+    if loop.iter_start is None or loop.start in resolving:
+        return None
+    resolving = resolving + (loop.start,)
+    raw = source[loop.iter_start : loop.iter_end]
+    text = raw.strip()
+    if not text:
+        return None
+    if text.startswith("["):
+        opened = loop.iter_start + len(raw) - len(raw.lstrip())
+        inner = next((c for c in comprehensions if c.open == opened), None)
+        if inner is None or source[inner.open + 1 : inner.first_for].strip() != inner.loops[-1].name:
+            return None
+        return _loop_context(vocabs, root, source, comprehensions, inner.loops[-1], resolving)
+    visible, _later = _visible_loop(comprehensions, loop.iter_start)
+    bindings: Dict[str, Optional[_Context]] = {}
+    if visible is not None and visible.name is not None:
+        bindings[visible.name] = _loop_context(vocabs, root, source, comprehensions, visible, resolving)
+    typed, context = _typed_backlinks_walk(vocabs, text, bindings, iterating=True)
+    if typed:
+        return context
+    iterated = _TYPE_INDEX_AT_END_RE.sub("", text)
+    if not re.fullmatch(_CHAIN, iterated):
+        return None
+    return _walk(vocabs, root, _segments(iterated), bindings, iterating=True)
+
+
+def _bindings(
+    vocabs: Dict[str, Any], root: str, source: str, position: int
+) -> Tuple[Dict[str, Optional[_Context]], bool]:
+    """The comprehension variable usable at `position` (see
+    `_visible_loop`) and what it iterates over -- `None` for one whose list
+    can't be followed (`backlinks`), still a variable but with nothing to
+    offer after its dot -- and whether `position` is the list of a `for`
+    after the first, where only that variable can start the list."""
+    comprehensions = _comprehensions(source)
+    loop, later = _visible_loop(comprehensions, position)
+    if loop is None or loop.name is None:
+        return {}, later
+    return {loop.name: _loop_context(vocabs, root, source, comprehensions, loop)}, later
+
+
+def _comprehension_start(text: str) -> Optional[int]:
+    """Where the list comprehension ending at `text`'s final `]` opens (the
+    offset of its `[`), or `None` if that `]` doesn't close one."""
     depth = 0
     for position in range(len(text) - 1, -1, -1):
         char = text[position]
@@ -511,30 +688,31 @@ def _comprehension_ending(text: str) -> Optional[str]:
         elif char == "[":
             depth -= 1
             if depth == 0:
-                match = _COMPREHENSION_RE.match(text[position + 1 : -1])
-                return match.group(1) if match else None
+                return position if _COMPREHENSION_RE.match(text[position + 1 : -1]) else None
     return None
 
 
 def _picked_context(
     vocabs: Dict[str, Any],
     namespace: str,
+    source: str,
     text: str,
     rest: str,
-    bindings: Dict[str, Optional[_Context]],
-) -> Optional[_Context]:
+) -> Tuple[Optional[_Context], Dict[str, Optional[_Context]]]:
     """Where `[x.f for x in rel if ...][n]<rest>` leads: what the
     comprehension collects (`text` ends at its `]`), walked on by `rest`
-    (`.mother`)."""
-    collected = _comprehension_ending(text)
-    if collected is None:
-        return None
+    (`.mother`) -- and the bindings it was read with."""
+    opened = _comprehension_start(text)
+    if opened is None:
+        return None, {}
+    collected = _COMPREHENSION_RE.match(text[opened + 1 : -1]).group(1)
+    bindings, _later = _bindings(vocabs, namespace, source, opened + 1)
     context = _walk(vocabs, namespace, _segments(collected), bindings)
     for name, indexes in _segments(rest):
         if context is None:
-            return None
+            return None, bindings
         context = _step_indexed(vocabs, context, name, indexes)
-    return context
+    return context, bindings
 
 
 def _names_at(vocabs: Dict[str, Any], context: _Context) -> List[Tuple[str, str, Any]]:
@@ -627,6 +805,70 @@ def _continuation(
     return ""
 
 
+def _ends_with_in(text: str) -> bool:
+    """Whether `text` ends with `in` -- a loop's list comes next."""
+    tokens = _tokens(text)
+    return bool(tokens) and tokens[-1] == ("name", "in")
+
+
+def _holds_lists(node: Optional[Dict[str, Any]]) -> bool:
+    """Whether a JSON object field has a list somewhere inside it
+    (`primary_name` has `surname_list`)."""
+    return node is not None and any(
+        _is_array(field.get("type")) or _holds_lists(field)
+        for field in node.get("fields", {}).values()
+    )
+
+
+def _list_steps(
+    vocabs: Dict[str, Any],
+    context: Optional[_Context],
+    candidates: List[Tuple[str, str, Any]],
+    segments: List[Tuple[str, int]],
+    bindings: Dict[str, Optional[_Context]],
+    later_loop: bool,
+) -> List[Tuple[str, str, Any]]:
+    """Of the names after `segments.` (which lead to `context`), those that
+    lead toward a list: lists, relationships, objects holding lists
+    (`father.primary_name.surname_list`), and a loop variable's collections
+    (`f.children`). A `for` after the first goes over a list of the loop
+    variable just before it."""
+    first, first_indexes = segments[0]
+    variable = first in bindings and not first_indexes
+    if later_loop and not variable:
+        return []
+    binding = bindings.get(first) if variable else None
+    collections: List[Tuple[str, str, Any]] = []
+    if variable and len(segments) == 1 and binding is not None and binding[0] == "namespace":
+        owner = vocabs[binding[1]]
+        collections = [
+            (name, "collection", target)
+            for name, target in owner["collections"].items()
+            if name not in owner.get("links", {})
+        ]
+    holders = set(_list_holders(vocabs, context)) if context is not None else set()
+    return [
+        (name, kind, detail)
+        for name, kind, detail in candidates
+        if kind == "relationship" or _is_array(detail) or (kind == "field" and name in holders)
+    ] + collections
+
+
+def _list_holders(vocabs: Dict[str, Any], context: _Context) -> List[str]:
+    """The JSON object fields at `context` that hold a list somewhere
+    inside (`primary_name` -> `surname_list`)."""
+    kind, value = context
+    if kind in ("referrers", "any"):
+        return [name for alternative in _alternatives(context) for name in _list_holders(vocabs, alternative)]
+    if kind == "namespace":
+        fields = vocabs[value]["fields"]
+    elif kind == "link":
+        fields = value["entry"].get("fields", {})
+    else:
+        fields = value.get("fields", {})
+    return [name for name, node in fields.items() if _holds_lists(node)]
+
+
 def complete_from_vocabularies(
     vocabs: Dict[str, Any],
     namespace: str,
@@ -644,7 +886,8 @@ def complete_from_vocabularies(
     `variable`, `punctuation` (`"` to start a string, `[` to start a
     list), `index` (`0` inside a list field's `[`), `type_name` (a Gramps
     type's name inside the string it's compared with, `type == "Cen` ->
-    `Census"`, closing quote included unless already there); `detail` is a
+    `Census"`, closing quote included unless already there; or a kind of
+    record inside `backlinks["`, `Person"]`, detail `"record"`); `detail` is a
     field's JSON type, a relationship's or
     collection's target namespace, `"text"`/`"list"` for punctuation,
     `"first item"` for an index, the type class for a type name, or `None`.
@@ -682,19 +925,18 @@ def complete_from_vocabularies(
             if name.startswith(typed)
         ]
     picked = _PICKED_RE.search(before)
-    if picked is not None and _comprehension_ending(before[: picked.start() + 1]) is not None:
+    if picked is not None and _comprehension_start(before[: picked.start() + 1]) is not None:
         # `[a for a in attribute_list if ...][0].`: the entry's own names.
         prefix = picked.group(2) or ""
-        bindings = _bindings(vocabs, namespace, source)
-        context = _picked_context(
-            vocabs, namespace, before[: picked.start() + 1], picked.group(1), bindings
+        context, bindings = _picked_context(
+            vocabs, namespace, source, before[: picked.start() + 1], picked.group(1)
         )
         candidates = (
             [] if context is None
             else _names_at(vocabs, context) + _indexed_steps(vocabs, context)
         )
         return _results(candidates, prefix, cursor - len(prefix), bindings, env)
-    if _PICK_INDEX_RE.search(before) and _comprehension_ending(before[:-1]) is not None:
+    if _PICK_INDEX_RE.search(before) and _comprehension_start(before[:-1]) is not None:
         # `[a for a in attribute_list if ...][`: which matching entry.
         return [{"name": "0", "kind": "index", "detail": "first item", "start": cursor}]
     match = _AT_CURSOR_RE.search(before)
@@ -702,7 +944,10 @@ def complete_from_vocabularies(
         return []
     chain, prefix = match.group(1), match.group(2) or ""
     start = cursor - len(prefix)
-    bindings = _bindings(vocabs, namespace, source)
+    # The loop variable usable where the path begins (`c` in `any(c.` ...).
+    bindings, later_loop = _bindings(
+        vocabs, namespace, source, start - len(chain) - 1 if chain else start
+    )
 
     candidates: List[Tuple[str, str, Any]]
     if chain is None:
@@ -771,11 +1016,21 @@ def complete_from_vocabularies(
             iterables = [
                 (name, kind, detail)
                 for name, kind, detail in paths
-                if kind in ("relationship", "variable") or _is_array(detail)
+                if kind in ("relationship", "variable")
+                or _is_array(detail)
+                # `primary_name`, toward `primary_name.surname_list`.
+                or (kind == "field" and _holds_lists(vocab["fields"].get(name)))
             ]
             candidates = iterables + collections
             opened = before[:start].rstrip()
-            if opened.endswith("distinct("):
+            if later_loop:
+                # `for c in` after another `for`: a list of the loop variable
+                # just before it (`f.children`).
+                candidates = [(name, "variable", None) for name in bindings]
+            elif _ends_with_in(opened):
+                # A loop can also go over a list comprehension.
+                candidates.append(("[", "punctuation", "list"))
+            elif opened.endswith("distinct("):
                 # `distinct(...)` only takes a list of fields: `[f.father for ...]`.
                 candidates = [("[", "punctuation", "list")]
             elif opened.endswith("len("):
@@ -790,6 +1045,9 @@ def complete_from_vocabularies(
                 context = _walk(vocabs, namespace, listed, bindings)
                 if context is not None and context[0] == "field" and "items" in context[1]:
                     candidates = [("0", "index", "first item")]
+                elif listed == [("backlinks", 0)] and "backlinks" in vocab["collections"]:
+                    # `backlinks['Person']`: a kind of record, named in a string.
+                    candidates = [('"', "punctuation", "text")]
                 elif not listed[-1][1]:
                     # `parent_families[`: a collection's first entry.
                     owner = (
@@ -839,11 +1097,7 @@ def complete_from_vocabularies(
                 # `father.families[0]...`: one entry of a collection, across a hop.
                 candidates += _indexed_steps(vocabs, context)
             if role == "iterable":
-                candidates = [
-                    (name, kind, detail)
-                    for name, kind, detail in candidates
-                    if kind == "relationship" or _is_array(detail)
-                ]
+                candidates = _list_steps(vocabs, context, candidates, segments, bindings, later_loop)
             elif role not in ("operand", "value", "is_value", "path", "number"):
                 candidates = []
 
@@ -858,9 +1112,11 @@ def _type_name_results(
     the way GOQL matches them, each closing the string unless the quote is
     already there. Nothing when the string isn't a type's value."""
     before = source[:cursor]
+    if _BACKLINKS_KIND_RE.search(before[:opened]) and "backlinks" in vocabs[namespace]["collections"]:
+        return _record_kind_results(vocabs, source, cursor, opened)
     if _expected(before[:opened])[0] not in ("value", "literal"):
         return []
-    bindings = _bindings(vocabs, namespace, source)
+    bindings, _later = _bindings(vocabs, namespace, source, opened)
     compared = _compared_field(vocabs, namespace, before[:opened], bindings)
     class_name = None if compared is None else compared.get("type_names")
     if class_name is None:
@@ -875,6 +1131,25 @@ def _type_name_results(
     ]
     results.sort(key=lambda item: (item["name"].lower(), item["name"]))
     return results
+
+
+def _record_kind_results(
+    vocabs: Dict[str, Any], source: str, cursor: int, opened: int
+) -> List[Dict[str, Any]]:
+    """Inside `backlinks["`: the kinds of record (`backlinks["Pe` ->
+    `Person"]`), closing the string and the bracket unless already there."""
+    quote = source[opened]
+    after = source[cursor:]
+    if after.startswith(quote):
+        closing = ""
+    else:
+        closing = quote + ("" if after.startswith("]") else "]")
+    typed = source[opened + 1 : cursor].casefold()
+    return [
+        {"name": name + closing, "kind": "type_name", "detail": "record", "start": opened + 1}
+        for name in sorted(vocabs)
+        if name.casefold().startswith(typed)
+    ]
 
 
 def _results(
