@@ -1984,12 +1984,18 @@ def _guarded_handle_ref_sql(
 
 
 def _handle_ref_sql_and_params(
-    handle_ref: ColumnRef, outer_table: str, dialect: Dialect, treeid: Optional[int]
+    handle_ref: ColumnRef,
+    outer_table: str,
+    dialect: Dialect,
+    treeid: Optional[int],
+    collection_depth: int = 0,
 ) -> Tuple[str, list]:
     """`_guarded_handle_ref_sql`, plus a `CollectionPick`'s subquery, which
-    (unlike every other handle reference) binds parameters."""
+    (unlike every other handle reference) binds parameters.
+    `collection_depth`: how many collection loops enclose it (see
+    `_render_collection_pick`)."""
     if isinstance(handle_ref, CollectionPick):
-        return _render_collection_pick(handle_ref, outer_table, dialect, treeid)
+        return _render_collection_pick(handle_ref, outer_table, dialect, treeid, collection_depth)
     return _guarded_handle_ref_sql(handle_ref, outer_table, dialect), []
 
 
@@ -2000,6 +2006,7 @@ def _render_related_object(
     treeid: Optional[int],
     value: Any = None,
     _depth: int = 0,
+    collection_depth: int = 0,
 ) -> Tuple[str, list]:
     """Render a `RelatedObject` as a correlated scalar subquery.
 
@@ -2064,12 +2071,13 @@ def _render_related_object(
     target_alias = f"{target_table}__hop{_depth}"
 
     handle_sql, handle_params = _handle_ref_sql_and_params(
-        related.handle_ref, outer_table, dialect, treeid
+        related.handle_ref, outer_table, dialect, treeid, collection_depth
     )
 
     if isinstance(related.field, RelatedObject):
         field_sql, field_params = _render_related_object(
-            related.field, target_alias, dialect, treeid, value, _depth=_depth + 1
+            related.field, target_alias, dialect, treeid, value, _depth=_depth + 1,
+            collection_depth=collection_depth,
         )
     elif isinstance(related.field, JsonPath):
         field = related.field
@@ -2163,7 +2171,10 @@ def _render_column(
     tree-scoping independent of the outer query's.
     """
     if isinstance(column, RelatedObject):
-        sql, params = _render_related_object(column, _sql_table(spec), dialect, treeid, value)
+        sql, params = _render_related_object(
+            column, _sql_table(spec), dialect, treeid, value,
+            collection_depth=spec.collection_depth,
+        )
     elif isinstance(column, JsonPath):
         column = _qualify_json_path(column, spec)
         sql, params = _render_json_path(column, _require_dialect(dialect, column), value)
@@ -3542,7 +3553,11 @@ def _check_pick_index(index: int) -> None:
 
 
 def _render_collection_pick(
-    pick: CollectionPick, outer_table: str, dialect: Dialect, treeid: Optional[int]
+    pick: CollectionPick,
+    outer_table: str,
+    dialect: Dialect,
+    treeid: Optional[int],
+    collection_depth: int = 0,
 ) -> Tuple[str, list]:
     """`(SELECT <target>.handle FROM <collection body> ORDER BY <entry
     position> LIMIT 1 OFFSET <index>)` -- `CollectionPick`'s handle, the
@@ -3550,7 +3565,10 @@ def _render_collection_pick(
     (the owner's own name, or a hop's alias when the pick is reached
     through one)."""
     _check_pick_index(pick.index)
-    owner = replace(pick.owner, sql_alias=outer_table)
+    # At the enclosing loops' depth, so the picked row's alias can't hide
+    # theirs (`[q for q in p.enclosing_places][0]` in a loop over
+    # `enclosing_places`).
+    owner = replace(pick.owner, sql_alias=outer_table, collection_depth=collection_depth)
     body, params = _collection_subquery_body(
         pick.collection, owner, pick.condition, dialect, treeid, ordered=True
     )
