@@ -3220,3 +3220,33 @@ def test_untyped_backlinks_unchanged():
     assert parse_expr_for_spec(NOTE, "any(b._class == 'Person' for b in backlinks)") == [
         {"exists": {"relationship": "backlinks", "where": [{"column": "_class", "op": "eq", "value": "Person"}]}}
     ]
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        # Without the check, f.gramps_id became the *child's* gramps_id.
+        "any(any(f.gramps_id == 'F0001' for c in f.children) for f in parent_families)",
+        "any(any(c.gender == 1 for c in f.children if f.private == True) for f in parent_families)",
+        "any(len([c for c in f.children if f.private == True]) > 1 for f in parent_families)",
+        "any(len([c.handle for c in f.children if f.private == True]) > 1 for f in parent_families)",
+        "any(len(distinct([c.surname for c in f.children if f.private == True])) > 1 for f in parent_families)",
+        "any([c for c in f.children if f.private == True][0].gender == 1 for f in parent_families)",
+        "any(exists(children, f.private == True) for f in parent_families)",
+        "len([f for f in parent_families if any(f.private == True for c in f.children)]) > 0",
+    ],
+)
+def test_outer_loop_variable_in_inner_condition_rejected(expr):
+    with pytest.raises(QueryLangError, match="inner loop's condition"):
+        parse_expr("person", expr)
+
+
+def test_outer_loop_variable_in_own_condition_still_allowed():
+    sugar = parse_expr(
+        "person",
+        "any(f.private == True and any(c.gender == 1 for c in f.children) for f in parent_families)",
+    )
+    plain = parse_expr(
+        "person", "exists(parent_families, private == True and exists(children, gender == 1))"
+    )
+    assert sugar == plain

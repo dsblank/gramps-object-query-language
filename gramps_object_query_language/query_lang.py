@@ -1506,6 +1506,29 @@ class _BoundNameStripper(ast.NodeTransformer):
             )
         return node
 
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        # A list-carrying call (an inner loop, already desugared): only its
+        # list (`f.children`) is in this loop's scope. Everything after it
+        # is read against the inner list's entries, so `f.gramps_id` there
+        # would silently become the *entry's* gramps_id once `f.` is
+        # stripped -- reject it instead.
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id in _LIST_CALLS
+            and node.args
+        ):
+            for arg in node.args[1:]:
+                for inner in ast.walk(arg):
+                    if self._is_own_root(inner):
+                        raise QueryLangError(
+                            f"'{self.bound_name}' can't be used inside an inner loop's condition "
+                            f"-- it would be read from the inner loop's entries instead. Test "
+                            f"'{self.bound_name}' in its own loop's condition: {_show(node)}"
+                        )
+            node.args[0] = self.visit(node.args[0])
+            return node
+        return self.generic_visit(node)
+
     def _reject_nested_comprehension(self, node: ast.AST) -> ast.AST:
         # By the time a condition reaches this stripper, any comprehension
         # nested inside it should already have been rewritten into an
@@ -1693,6 +1716,10 @@ def _make_call(name: str, iter_node: ast.expr, condition: Union[ast.expr, None])
 #: What `_ComprehensionDesugarer` rewrites `[x.f for x in rel if c][n]` into:
 #: `_pick(rel, c or None, n, f or None)`, read back by `_pick_root`.
 _PICK = "_pick"
+
+#: Calls whose first argument is a list and whose other arguments are read
+#: against that list's entries -- see `_BoundNameStripper.visit_Call`.
+_LIST_CALLS = frozenset({"any", "len", "exists", "count", _COUNT, _DISTINCT, _PICK})
 
 
 def _pick_projection(elt: ast.expr, bound_name: str) -> Optional[ast.expr]:
