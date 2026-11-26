@@ -113,8 +113,11 @@ supports today:
 from __future__ import annotations
 
 import ast
+import re
+import contextlib
+import contextvars
 from dataclasses import replace
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
 
 from gramps.gen.datehandler import parser as _date_parser
 from gramps.gen.lib import (
@@ -186,6 +189,7 @@ from .query import (
     Regex,
     SelectRef,
     default_ref_key,
+    _did_you_mean,
     ref_value_type,
     relationship_link,
     relationship_target,
@@ -286,6 +290,52 @@ _CONSTANTS: dict[str, dict[str, Any]] = {
 }
 
 
+#: The text being parsed, so an error can quote what the user wrote (see
+#: `_show`) rather than the rewritten form the parser works on.
+_SOURCE: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("goql_source", default=None)
+
+
+@contextlib.contextmanager
+def _quoting(source: str) -> Iterator[None]:
+    token = _SOURCE.set(source)
+    try:
+        yield
+    finally:
+        _SOURCE.reset(token)
+
+
+def _show(node: ast.AST) -> str:
+    """The text the user wrote for `node`, for an error message. Rewritten
+    nodes keep the position of what they replace (`attribute_list['Age']`
+    becomes a pick, `Env.X` a value), so this quotes the original; a node
+    with no position of its own falls back to Python's spelling of it."""
+    source = _SOURCE.get()
+    if source is not None and getattr(node, "end_col_offset", None) is not None:
+        segment = ast.get_source_segment(source, node)
+        if segment:
+            return segment
+    return ast.unparse(node)
+
+
+def _syntax_error(kind: str, text: str, error: SyntaxError) -> "QueryLangError":
+    """`<kind> at column N (<what>): <text>` with a marker under the spot,
+    and a hint for the usual slips."""
+    if not text.strip():
+        return QueryLangError(f"{kind}: the expression is empty")
+    column = error.offset or 0
+    where = f" at column {column}" if column and column <= len(text) else ""
+    reason = "" if error.msg == "invalid syntax" else f" ({error.msg})"
+    # Hints go before any " -- ": clients may show only that first part.
+    if re.search(r"(?<![=!<>])=(?!=)", text):
+        hint = ", a single = isn't a comparison; write =="
+    elif not where:
+        hint = ", it ends too early; something is missing at the end"
+    else:
+        hint = ""
+    pointer = f"\n  {text}\n  {' ' * max(column - 1, 0)}^" if where and "\n" not in text else ""
+    return QueryLangError(f"{kind}{where}{reason}{hint}: {text!r}{pointer}")
+
+
 class QueryLangError(ValueError):
     """Raised when an expression doesn't parse or uses unsupported syntax."""
 
@@ -303,15 +353,15 @@ def _translate_constant(class_name: str, const_name: str) -> Any:
         constants = _CONSTANTS[class_name]
     except KeyError:
         raise QueryLangError(
-            f"unknown constant namespace: {class_name!r} "
-            f"(known: {', '.join(sorted(_CONSTANTS))})"
+            f"unknown name {class_name!r}{_did_you_mean(class_name, _CONSTANTS)} -- "
+            f"named values come from: {', '.join(sorted(_CONSTANTS))}"
         ) from None
     try:
         return constants[const_name]
     except KeyError:
         raise QueryLangError(
-            f"unknown constant: {class_name}.{const_name} "
-            f"(known: {', '.join(class_name + '.' + n for n in constants)})"
+            f"{class_name} has no {const_name}{_did_you_mean(const_name, constants)}; "
+            f"its values: {', '.join(class_name + '.' + n for n in constants)}"
         ) from None
 
 
@@ -357,6 +407,12 @@ def _translate_path(node: ast.AST) -> List[Union[str, int]]:
     `Name` first, then build the list root-to-leaf.
     """
     if isinstance(node, ast.Name):
+        if node.id[:1].isupper() and node.id != ENV_NAME:
+            # No field starts with a capital: a misspelled `Person.MALE`.
+            raise QueryLangError(
+                f"unknown name {node.id!r}{_did_you_mean(node.id, _CONSTANTS)} -- fields start "
+                f"with a small letter; named values come from: {', '.join(sorted(_CONSTANTS))}"
+            )
         return [node.id]
     if isinstance(node, ast.Attribute):
         return _translate_path(node.value) + [node.attr]
@@ -366,10 +422,21 @@ def _translate_path(node: ast.AST) -> List[Union[str, int]]:
             index_node.value, int
         ) or isinstance(index_node.value, bool):
             raise QueryLangError(
-                f"subscript index must be a plain integer literal: {ast.dump(node)}"
+                f"{_show(node)}: an index is a number from 0, e.g. [0] for the first -- "
+                f"[-1], slices ([0:2]) and names in brackets don't work here"
+            )
+        if index_node.value < 0:
+            raise QueryLangError(
+                f"{_show(node)}: an index is a number from 0, e.g. [0] for the first -- "
+                f"counting from the end ([-1]) isn't supported"
             )
         return _translate_path(node.value) + [index_node.value]
-    raise QueryLangError(f"invalid path expression: {ast.dump(node)}")
+    unsupported = _unsupported_call(node)
+    if unsupported is not None:
+        raise QueryLangError(unsupported)
+    raise QueryLangError(
+        f"expected a field here, such as surname or birth.date.sortval -- got: {_show(node)}"
+    )
 
 
 def _translate_column(node: ast.AST, spec: ObjectTypeSpec) -> Union[str, dict]:
@@ -412,13 +479,14 @@ def _translate_count_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:
     """
     if not 1 <= len(node.args) <= 2 or node.keywords:
         raise QueryLangError(
-            "count(relationship[, condition]) takes 1 or 2 positional arguments"
+            f"count() takes a collection and, optionally, a condition on its entries: count(events) > 2, count(events, type == 'Census') > 0 -- got: {_show(node)}"
         )
     name_node = node.args[0]
     if not isinstance(name_node, ast.Name):
         raise QueryLangError(
-            f"count(...)'s first argument must be a bare relationship name: "
-            f"{ast.dump(name_node)}"
+            f"count()'s first argument is a collection of this record, such as events or notes "
+            f"(one reached through a link, like father.events, isn't supported) -- got: "
+            f"{_show(name_node)}"
         )
     try:
         collection = resolve_collection(spec, name_node.id)
@@ -577,18 +645,23 @@ def _translate_len_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:
       reaches `query.py`.
     """
     if not 1 <= len(node.args) <= 2 or node.keywords:
-        raise QueryLangError("len(name_or_path[, condition]) takes 1 or 2 positional arguments")
+        raise QueryLangError(
+            f"len() takes a list or collection and, optionally, a condition: len(events) > 2, "
+            f"len(events, type == 'Census') > 0, len([e for e in events if ...]) -- got: {_show(node)}"
+        )
     first = node.args[0]
     if not _is_path_node(first):
-        raise QueryLangError(f"len(...)'s first argument must be a field path: {ast.dump(node)}")
+        raise QueryLangError(
+            f"len()'s first argument is a list or collection, such as events or attribute_list -- got: {_show(node.args[0])}"
+        )
     collection = _try_resolve_bare_collection(first, spec)
     if collection is not None:
         return {"count_of": _translate_collection_payload(node, collection, spec)}
     if _collection_reached_via_relationship_hop(first, spec):
         raise QueryLangError(
             f"len(...)'s first argument can't reach a collection through a "
-            f"relationship hop yet -- {ast.dump(first)} names a real "
-            f"collection, just not directly on the type being queried: {ast.dump(node)}"
+            f"relationship hop yet -- {_show(first)} names a real "
+            f"collection, just not directly on the type being queried: {_show(node)}"
         )
     if len(node.args) == 1:
         return {"length_of": _translate_column(first, spec)}
@@ -691,7 +764,7 @@ def _translate_projected_count(call: ast.Call, spec: ObjectTypeSpec) -> dict:
     if _collection_reached_via_relationship_hop(source, spec):
         raise QueryLangError(
             f"len(...) can't count a collection reached through a relationship "
-            f"hop yet: {ast.dump(source)}"
+            f"hop yet: {_show(source)}"
         )
     segments = _translate_path(source)
     try:
@@ -746,7 +819,7 @@ def _translate_arithmetic(node: ast.AST, spec: ObjectTypeSpec) -> dict:
 
     if not isinstance(node, ast.BinOp) or type(node.op) not in _ARITHMETIC_AST_OPS:
         raise QueryLangError(
-            f"unsupported arithmetic operator (supported: + - * / //): {ast.dump(node)}"
+            f"unsupported arithmetic operator (supported: + - * / //): {_show(node)}"
         )
     result = {
         "arithmetic": {
@@ -757,7 +830,7 @@ def _translate_arithmetic(node: ast.AST, spec: ObjectTypeSpec) -> dict:
     }
     if not _reads_a_column(result):
         raise QueryLangError(
-            f"arithmetic needs at least one field, not only numbers: {ast.dump(node)}"
+            f"arithmetic needs at least one field, not only numbers: {_show(node)}"
         )
     return result
 
@@ -833,10 +906,15 @@ def _translate_date_call(node: ast.Call) -> int:
         raise QueryLangError("Date(...) takes exactly 1 positional string argument")
     text = _translate_value(node.args[0])
     if not isinstance(text, str):
-        raise QueryLangError("Date(...)'s argument must be a string literal")
+        raise QueryLangError(
+            "Date(...) takes the date as text in quotes, e.g. Date('1900-01-31') or Date('about 1850')"
+        )
     parsed = _date_parser.parse(text)
     if not parsed.is_valid():
-        raise QueryLangError(f"could not parse {text!r} as a date")
+        raise QueryLangError(
+            f"Date({text!r}): not a date Gramps can read -- try Date('1900-01-31'), "
+            f"Date('31 January 1900'), Date('1900'), Date('about 1850') or Date('today')"
+        )
     return parsed.sortval
 
 
@@ -850,7 +928,7 @@ def _translate_value(node: ast.AST) -> Any:
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
         inner = _translate_value(node.operand)
         if not isinstance(inner, (int, float)) or isinstance(inner, bool):
-            raise QueryLangError(f"unary '-' only supported on numeric literals: {ast.dump(node)}")
+            raise QueryLangError(f"{_show(node)}: '-' only goes before a number")
         return -inner
     if isinstance(node, ast.Constant):
         return node.value
@@ -862,12 +940,20 @@ def _translate_value(node: ast.AST) -> Any:
         and node.func.id == "Date"
     ):
         return _translate_date_call(node)
-    raise QueryLangError(f"invalid literal: {ast.dump(node)}")
+    unsupported = _unsupported_call(node)
+    if unsupported is not None:
+        raise QueryLangError(unsupported)
+    if isinstance(node, ast.JoinedStr):
+        raise QueryLangError(f"{_show(node)}: f-strings aren't supported -- write plain text in quotes")
+    raise QueryLangError(
+        f"{_show(node)} isn't a value GOQL understands -- write text in quotes, a number, "
+        f"True, False, None, a named value such as EventType.BIRTH, or Date('1900-01-31')"
+    )
 
 
 def _translate_list(node: ast.AST) -> List[Any]:
     if not isinstance(node, ast.List):
-        raise QueryLangError(f"expected a list literal, e.g. [1, 2, 3]: {ast.dump(node)}")
+        raise QueryLangError(f"expected a list literal, e.g. [1, 2, 3]: {_show(node)}")
     return [_translate_value(elt) for elt in node.elts]
 
 
@@ -958,13 +1044,13 @@ def _translate_compare(node: ast.Compare, spec: ObjectTypeSpec) -> dict:
                     raise QueryLangError(
                         "'... in path' (substring test) requires a string literal "
                         "or a field path on the left, e.g. \"'Jan' in given_name\" "
-                        f"or \"nickname in given_name\": {ast.dump(node)}"
+                        f"or \"nickname in given_name\": {_show(node)}"
                     )
                 leaf = {"column": column, "op": "contains", "value": substring}
         else:
             raise QueryLangError(
                 "'in' requires either a list literal ('field in [1, 2]') or a "
-                f"field path on the right ('... in field', a substring test): {ast.dump(node)}"
+                f"field path on the right ('... in field', a substring test): {_show(node)}"
             )
     else:
         left = node.left
@@ -989,20 +1075,31 @@ def _translate_compare(node: ast.Compare, spec: ObjectTypeSpec) -> dict:
             column = _translate_column_or_computed(rhs, spec)
             leaf = {"column": column, "op": _FLIP_OP[op], "value": value}
         else:
+            unsupported = _unsupported_call(node)
+            if unsupported is not None:
+                raise QueryLangError(unsupported)
             raise QueryLangError(
                 "a comparison needs a field, a count (len(...)), a list entry "
-                f"([...][0]) or a calculation on at least one side: {ast.dump(node)}"
+                f"([...][0]) or a calculation on at least one side: {_show(node)}"
             )
     return {"not": leaf} if negate else leaf
 
 
 def _translate_like_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:
     if len(node.args) != 2 or node.keywords:
-        raise QueryLangError("like(path, 'pattern') takes exactly 2 positional arguments")
+        raise QueryLangError(
+            f"like() takes a field and a pattern, e.g. like(surname, 'Sm%') -- got: {_show(node)}"
+        )
+    if not _is_path_node(node.args[0]):
+        raise QueryLangError(
+            f"like()'s first argument is the field to match, e.g. like(surname, ...) -- got: {_show(node.args[0])}"
+        )
     column = _translate_column(node.args[0], spec)
     pattern = _translate_value(node.args[1])
     if not isinstance(pattern, str):
-        raise QueryLangError("like(...)'s second argument must be a string literal")
+        raise QueryLangError(
+            f"like()'s pattern is text in quotes, e.g. like(surname, 'Sm%') -- got: {_show(node.args[1])}"
+        )
     # The pattern's escaping is validated by `query.py`'s `Like` constructor,
     # not here -- see `_validate_like_pattern`.
     return {"column": column, "op": "like", "value": pattern}
@@ -1010,11 +1107,19 @@ def _translate_like_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:
 
 def _translate_regex_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:
     if len(node.args) != 2 or node.keywords:
-        raise QueryLangError("regex(path, 'pattern') takes exactly 2 positional arguments")
+        raise QueryLangError(
+            f"regex() takes a field and a pattern, e.g. regex(surname, '^Sm') -- got: {_show(node)}"
+        )
+    if not _is_path_node(node.args[0]):
+        raise QueryLangError(
+            f"regex()'s first argument is the field to match, e.g. regex(surname, ...) -- got: {_show(node.args[0])}"
+        )
     column = _translate_column(node.args[0], spec)
     pattern = _translate_value(node.args[1])
     if not isinstance(pattern, str):
-        raise QueryLangError("regex(...)'s second argument must be a string literal")
+        raise QueryLangError(
+            f"regex()'s pattern is text in quotes, e.g. regex(surname, '^Sm') -- got: {_show(node.args[1])}"
+        )
     return {"column": column, "op": "regex", "value": pattern}
 
 
@@ -1036,13 +1141,13 @@ def _translate_backlinks_condition(node: ast.AST) -> dict:
     if not isinstance(node, ast.Compare) or len(node.ops) != 1 or len(node.comparators) != 1:
         raise QueryLangError(
             f"exists(backlinks, ...)'s condition must be a single comparison "
-            f"against _class, e.g. _class == \"Person\": {ast.dump(node)}"
+            f"against _class, e.g. _class == \"Person\": {_show(node)}"
         )
     op = _COMPARE_OPS.get(type(node.ops[0]))
     if op not in ("eq", "ne", "in"):
         raise QueryLangError(
             f"_class only supports ==, !=, is, 'is not', in -- not "
-            f"{type(node.ops[0]).__name__!r}: {ast.dump(node)}"
+            f"{type(node.ops[0]).__name__!r}: {_show(node)}"
         )
 
     def _is_class_name(candidate: ast.AST) -> bool:
@@ -1053,12 +1158,12 @@ def _translate_backlinks_condition(node: ast.AST) -> dict:
         if not _is_class_name(left):
             raise QueryLangError(
                 f"'in' needs _class on the left, e.g. "
-                f"_class in [\"Person\", \"Family\"]: {ast.dump(node)}"
+                f"_class in [\"Person\", \"Family\"]: {_show(node)}"
             )
         values = _translate_list(rhs)
         if not values or not all(isinstance(v, str) for v in values):
             raise QueryLangError(
-                f"_class in [...] needs a non-empty list of string literals: {ast.dump(node)}"
+                f"_class in [...] needs a non-empty list of string literals: {_show(node)}"
             )
         return {"column": "_class", "op": "in", "value": values}
     if _is_class_name(left):
@@ -1068,13 +1173,14 @@ def _translate_backlinks_condition(node: ast.AST) -> dict:
         op = _FLIP_OP[op]  # eq/ne flip to themselves -- kept for consistency with every other comparison
     else:
         raise QueryLangError(
-            f"exists(backlinks, ...)'s condition must compare _class, the "
-            f"referring object's own type: {ast.dump(node)}"
+            f"{_show(node)}: plain backlinks only knows each referrer's kind (_class == 'Person') -- "
+            f"to test a referrer's own fields, name the kind: "
+            f"any(p.primary_name.first_name == 'Ann' for p in backlinks['Person'])"
         )
     value = _translate_value(value_node)
     if not isinstance(value, str):
         raise QueryLangError(
-            f"_class must be compared against a string literal: {ast.dump(node)}"
+            f"_class must be compared against a string literal: {_show(node)}"
         )
     return {"column": "_class", "op": op, "value": value}
 
@@ -1098,13 +1204,14 @@ def _translate_exists_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:
     """
     if not 1 <= len(node.args) <= 2 or node.keywords:
         raise QueryLangError(
-            "exists(relationship[, condition]) takes 1 or 2 positional arguments"
+            f"exists() takes a collection and, optionally, a condition on its entries: exists(events), exists(events, type == 'Census') -- got: {_show(node)}"
         )
     name_node = node.args[0]
     if not isinstance(name_node, ast.Name):
         raise QueryLangError(
-            f"exists(...)'s first argument must be a bare relationship name: "
-            f"{ast.dump(name_node)}"
+            f"exists()'s first argument is a collection of this record, such as events or notes "
+            f"(one reached through a link, like father.events, isn't supported) -- got: "
+            f"{_show(name_node)}"
         )
     try:
         collection = resolve_collection(spec, name_node.id)
@@ -1137,18 +1244,23 @@ def _translate_any_call(node: ast.Call, spec: ObjectTypeSpec) -> dict:
       array: new -- `{"any": {"path": [...], "where": [...]}}`.
     """
     if not 1 <= len(node.args) <= 2 or node.keywords:
-        raise QueryLangError("any(name_or_path[, condition]) takes 1 or 2 positional arguments")
+        raise QueryLangError(
+            f"any() takes a list or collection and, optionally, a condition: any(events), "
+            f"any(events, type == 'Census'), any(e for e in events if ...) -- got: {_show(node)}"
+        )
     first = node.args[0]
     if not _is_path_node(first):
-        raise QueryLangError(f"any(...)'s first argument must be a field path: {ast.dump(node)}")
+        raise QueryLangError(
+            f"any()'s first argument is a list or collection, such as events or attribute_list -- got: {_show(node.args[0])}"
+        )
     collection = _try_resolve_bare_collection(first, spec)
     if collection is not None:
         return {"exists": _translate_collection_payload(node, collection, spec)}
     if _collection_reached_via_relationship_hop(first, spec):
         raise QueryLangError(
             f"any(...)'s first argument can't reach a collection through a "
-            f"relationship hop yet -- {ast.dump(first)} names a real "
-            f"collection, just not directly on the type being queried: {ast.dump(node)}"
+            f"relationship hop yet -- {_show(first)} names a real "
+            f"collection, just not directly on the type being queried: {_show(node)}"
         )
     if len(node.args) == 1:
         return {"column": {"length_of": _translate_column(first, spec)}, "op": "gt", "value": 0}
@@ -1173,17 +1285,17 @@ def _bare_path_leaf_message(node: ast.AST, spec: ObjectTypeSpec) -> str:
     - a bare collection (`events`, `children`): point at `any(...)`;
     - anything else: it's a value, so it needs a comparison.
     """
-    text = ast.unparse(node)
+    text = _show(node)
     if isinstance(node, ast.Name):
         if relationship_target(spec, node.id) is not None:
             return (
-                f"{text!r} is a relationship on {spec.table!r}, not a condition "
+                f"{text!r} is a link from {spec.cls.__name__}, not a condition "
                 f"on its own -- to test that it's set, use {text}.handle != None; "
                 f"to test one of its fields, use e.g. {text}.gramps_id == ..."
             )
         if _try_resolve_bare_collection(node, spec) is not None:
             return (
-                f"{text!r} is a collection on {spec.table!r}, not a condition "
+                f"{text!r} is one of {spec.cls.__name__}'s collections, not a condition "
                 f"on its own -- use any({text}) to test that it's non-empty, or "
                 f"any(x for x in {text} if <condition on x>)"
             )
@@ -1191,6 +1303,49 @@ def _bare_path_leaf_message(node: ast.AST, spec: ObjectTypeSpec) -> str:
         f"{text!r} is a value, not a condition -- compare it to something, "
         f"e.g. {text} == ... or {text} != None"
     )
+
+
+#: The functions an expression can call, as a user writes them.
+_FUNCTION_NAMES = ("any", "len", "like", "regex", "Date", "distinct", "exists", "count")
+_INTERNAL_CALLS = {"_pick", "_count", "_distinct"}  # see _PICK, _COUNT, _DISTINCT
+#: Python functions people reach for, and what to write instead.
+_INSTEAD_OF = {
+    "all": "not any(x for x in <list> if not <condition>)",
+    "upper": "a plain comparison -- text already compares ignoring case",
+    "lower": "a plain comparison -- text already compares ignoring case",
+    "startswith": "like(<field>, 'Sm%')",
+    "endswith": "like(<field>, '%son')",
+    "contains": "'text' in <field>",
+    "sum": "len(...) to count; there are no other totals",
+    "min": "a comparison on each entry inside any(...)",
+    "max": "a comparison on each entry inside any(...)",
+    "str": "the field itself",
+    "int": "the field itself",
+}
+
+
+def _unsupported_call(node: ast.AST) -> Optional[str]:
+    """What's wrong with the first call in `node` GOQL doesn't have --
+    `surname.upper()`, `sum(...)`, `f(x)` -- or `None` if there isn't one."""
+    for sub in ast.walk(node):
+        if not isinstance(sub, ast.Call):
+            continue
+        func = sub.func
+        if isinstance(func, ast.Attribute):
+            instead = _INSTEAD_OF.get(func.attr)
+            hint = f"; use {instead}" if instead else ""
+            return (
+                f"{_show(sub)} calls a method, and GOQL has none{hint} "
+                f"(its functions: {', '.join(_FUNCTION_NAMES)})"
+            )
+        if isinstance(func, ast.Name) and func.id not in _FUNCTION_NAMES and func.id not in _INTERNAL_CALLS:
+            instead = _INSTEAD_OF.get(func.id)
+            hint = f"; use {instead}" if instead else ""
+            return (
+                f"{func.id}() isn't a GOQL function{hint} "
+                f"(its functions: {', '.join(_FUNCTION_NAMES)})"
+            )
+    return None
 
 
 def _translate_comparison_like_node(node: ast.AST, spec: ObjectTypeSpec) -> dict:
@@ -1209,9 +1364,30 @@ def _translate_comparison_like_node(node: ast.AST, spec: ObjectTypeSpec) -> dict
             return _translate_any_call(node, spec)
     if _is_path_node(node):
         raise QueryLangError(_bare_path_leaf_message(node, spec))
+    unsupported = _unsupported_call(node)
+    if unsupported is not None:
+        raise QueryLangError(unsupported)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("len", "count"):
+        if not 1 <= len(node.args) <= 2 or node.keywords:
+            # Its own message for the arguments it takes.
+            (_translate_len_call if node.func.id == "len" else _translate_count_call)(node, spec)
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in ("len", "count", _COUNT)
+    ):
+        raise QueryLangError(
+            f"{_show(node)} is a number, not a condition -- compare it, e.g. "
+            f"{_show(node)} > 0"
+        )
+    if isinstance(node, (ast.ListComp, ast.GeneratorExp, ast.SetComp, ast.DictComp)):
+        raise QueryLangError(
+            f"{_show(node)} is a list, not a condition -- wrap it: any(...) tests that "
+            f"something matches, len([...]) > 0 counts"
+        )
     raise QueryLangError(
-        f"expected a comparison (a == b, a in [...], like(a, 'pat'), "
-        f"regex(a, 'pat'), exists(rel, cond), any(rel_or_path, cond)), got: {ast.unparse(node)}"
+        f"expected a condition, such as surname == 'Smith', any(events), "
+        f"like(surname, 'Sm%') or len(children) > 2 -- got: {_show(node)}"
     )
 
 
@@ -1316,7 +1492,7 @@ class _BoundNameStripper(ast.NodeTransformer):
     def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
         if self._is_own_root(node.value):
             raise QueryLangError(
-                f"can't index the loop variable directly: {ast.dump(node)}"
+                f"can't index the loop variable directly: {_show(node)}"
             )
         node.value = self.visit(node.value)
         return node
@@ -1326,7 +1502,7 @@ class _BoundNameStripper(ast.NodeTransformer):
             raise QueryLangError(
                 f"'{self.bound_name}' can only be used as '{self.bound_name}.field', "
                 f"never compared directly (there's no whole-object comparison in "
-                f"where_expr, only field paths): {ast.dump(node)}"
+                f"where_expr, only field paths): {_show(node)}"
             )
         return node
 
@@ -1339,7 +1515,7 @@ class _BoundNameStripper(ast.NodeTransformer):
         # form, the same "not a whitelisted shape" rejection every other
         # unrecognized node gets.
         raise QueryLangError(
-            f"comprehension must be wrapped in any(...) or len([...]): {ast.dump(node)}"
+            f"comprehension must be wrapped in any(...) or len([...]): {_show(node)}"
         )
 
     visit_GeneratorExp = _reject_nested_comprehension
@@ -1364,14 +1540,15 @@ def _comprehension_generator(comp: Union[ast.GeneratorExp, ast.ListComp], call: 
     """
     if len(comp.generators) != 1:
         raise QueryLangError(
-            f"comprehension must have exactly one 'for' clause: {ast.dump(call)}"
+            f"{_show(call)}: a loop has one 'for' -- for a second list, nest another any(...): "
+            f"any(any(... for c in f.children) for f in families)"
         )
     generator = comp.generators[0]
     if generator.is_async:
-        raise QueryLangError(f"async comprehensions aren't supported: {ast.dump(call)}")
+        raise QueryLangError(f"async comprehensions aren't supported: {_show(call)}")
     if not isinstance(generator.target, ast.Name):
         raise QueryLangError(
-            f"comprehension's loop variable must be a plain name: {ast.dump(call)}"
+            f"comprehension's loop variable must be a plain name: {_show(call)}"
         )
     iter_node = generator.iter
     is_bare_name = isinstance(iter_node, ast.Name)
@@ -1380,8 +1557,9 @@ def _comprehension_generator(comp: Union[ast.GeneratorExp, ast.ListComp], call: 
     )
     if not (is_bare_name or is_one_attr_off_a_name):
         raise QueryLangError(
-            "comprehension's 'in ...' must be a bare collection name, or exactly "
-            f"one attribute off an enclosing loop variable: {ast.dump(call)}"
+            f"for ... in {_show(iter_node)}: a loop can go over a collection (events), a list "
+            f"on the record (attribute_list), or a list one step away (father.attribute_list, "
+            f"or e.attribute_list in a loop over e) -- not further yet"
         )
     return generator
 
@@ -1425,7 +1603,7 @@ def _len_condition(comp: ast.ListComp, bound_name: str) -> Union[ast.expr, None]
     ):
         raise QueryLangError(
             "len([...])'s projection must be the loop variable or a plain "
-            f"literal (e.g. 'len([1 for x in rel if ...])'): {ast.dump(elt)}"
+            f"literal (e.g. 'len([1 for x in rel if ...])'): {_show(elt)}"
         )
     stripper = _BoundNameStripper(bound_name)
     ifs = [stripper.visit(if_node) for if_node in comp.generators[0].ifs]
@@ -1450,10 +1628,15 @@ def _count_projection(elt: ast.expr, bound_name: str) -> Optional[ast.expr]:
     root = elt
     while isinstance(root, ast.Attribute):
         root = root.value
+    if isinstance(root, ast.Subscript):
+        raise QueryLangError(
+            f"{_show(elt)}: a field to count can't go through an index ([0]) yet -- "
+            f"count a field without one, e.g. [n.surname for n in ...]"
+        )
     if not (isinstance(root, ast.Name) and root.id == bound_name and root is not elt):
         raise QueryLangError(
-            f"a list to count must collect the loop variable or a field of it "
-            f"(e.g. '[f.father for f in parent_families]'): {ast.dump(elt)}"
+            f"{_show(elt)}: a list to count collects the loop variable or a field of it, "
+            f"e.g. [f.father for f in parent_families]"
         )
     return _BoundNameStripper(bound_name).visit(elt)
 
@@ -1525,7 +1708,7 @@ def _pick_projection(elt: ast.expr, bound_name: str) -> Optional[ast.expr]:
         raise QueryLangError(
             f"a list comprehension taken by index must collect the loop variable "
             f"or a field of it (e.g. '[a.value for a in attribute_list if ...][0]'): "
-            f"{ast.dump(elt)}"
+            f"{_show(elt)}"
         )
     return _BoundNameStripper(bound_name).visit(elt)
 
@@ -1605,8 +1788,8 @@ class _ComprehensionDesugarer(ast.NodeTransformer):
             and not isinstance(index.value, bool)
         ):
             raise QueryLangError(
-                f"a list comprehension can only be indexed by a plain number, "
-                f"e.g. [...][0]: {ast.dump(node)}"
+                f"an index is a number from 0 (counting from the end isn't supported), "
+                f"e.g. [...][0]: {_show(node)}"
             )
         comp = node.value
         generator = _comprehension_generator(comp, node)
@@ -1685,8 +1868,17 @@ class _EnvSubstituter(ast.NodeTransformer):
             return self.generic_visit(node)
         name = node.attr
         if self.env is None or name not in self.env:
-            known = ", ".join(f"{ENV_NAME}.{n}" for n in sorted(self.env or {})) or "none"
-            raise QueryLangError(f"unknown {ENV_NAME} value: {ENV_NAME}.{name} (known: {known})")
+            if not self.env:
+                raise QueryLangError(
+                    f"unknown {ENV_NAME} value {ENV_NAME}.{name}: no {ENV_NAME} values were "
+                    f"passed in with this query"
+                )
+            known = ", ".join(f"{ENV_NAME}.{n}" for n in sorted(self.env))
+            raise QueryLangError(
+                f"unknown {ENV_NAME} value {ENV_NAME}.{name}"
+                f"{_did_you_mean(f'{ENV_NAME}.{name}', [f'{ENV_NAME}.{n}' for n in self.env])} "
+                f"(passed in: {known})"
+            )
         value = self.env[name]
         if isinstance(value, (list, tuple)):
             env_list = _EnvList(elts=[_env_scalar_node(name, v) for v in value], ctx=ast.Load())
@@ -1771,8 +1963,9 @@ def _type_lookup(node: ast.AST) -> Optional[Tuple[ast.expr, str, Tuple[type, str
     if kind is None:
         lists = ", ".join(sorted(_LOOKUP_LISTS))
         raise QueryLangError(
-            f"a name in [...] picks entries by type, which only works on {lists}: "
-            f"{ast.unparse(node)}"
+            f"a name in brackets picks entries by type (or role, for event_refs), which works on "
+            f"{lists} -- not on "
+            f"{_show(node)}"
         )
     return node.value, key.value, kind
 
@@ -1931,9 +2124,10 @@ def parse_expr_for_spec(
     try:
         tree = ast.parse(expr, mode="eval")
     except SyntaxError as error:
-        raise QueryLangError(f"invalid syntax: {error}") from error
-    body = _desugar_comprehensions(_substitute_env(tree.body, env))
-    return _translate_top_level(body, spec)
+        raise _syntax_error("invalid syntax", expr, error) from error
+    with _quoting(expr):
+        body = _desugar_comprehensions(_substitute_env(tree.body, env))
+        return _translate_top_level(body, spec)
 
 
 def parse_expr(namespace: str, expr: str, env: Optional[Mapping[str, EnvValue]] = None) -> List[dict]:
@@ -2117,8 +2311,9 @@ def _pick_from_json(payload: dict, spec: ObjectTypeSpec) -> ColumnRef:
                     f"there is one with any({name})"
                 )
             raise QueryError(
-                f"an entry of {name!r} is a {collection.target.table} record, not a "
-                f"value on its own -- add a field after it, e.g. [...][{index}].gramps_id"
+                f"an entry of {name} is {'an' if collection.target.cls.__name__[0] in 'AEIOU' else 'a'} "
+                f"{collection.target.cls.__name__} record, not a value on its own -- "
+                f"add a field after it, e.g. [...][{index}].gramps_id"
             )
         return RelatedObject(
             name=f"{name}[...]",
@@ -2271,9 +2466,33 @@ def _check_literal_kind(column: ColumnRef, value: Any, spec: ObjectTypeSpec) -> 
     kind = _value_kind(column, spec)
     if kind is None or value is None or isinstance(value, _KIND_ACCEPTS[kind]):
         return
-    raise QueryError(
-        f"cannot compare a {kind} field with {value!r} ({type(value).__name__})"
-    )
+    try:
+        name = default_ref_key(column)
+    except QueryError:
+        counted = (CollectionCount, JsonArrayCount, Length)
+        name = "this count" if isinstance(column, counted) else "this value"
+    example = {"string": "text in quotes ('Smith')", "number": "a number (3)", "boolean": "True or False"}[kind]
+    holds = {"string": "text", "number": "a number", "boolean": "True or False"}[kind]
+    raise QueryError(f"cannot compare {name} with {value!r}: it holds {holds}, so compare it with {example}")
+
+
+def _check_ordering(column: ColumnRef, op: str, spec: ObjectTypeSpec) -> None:
+    """`<`/`>` on a whole object or list (`birth.date > 5`) has no meaning:
+    SQLite would order its JSON text, and the evaluator can't compare it."""
+    if op not in ("lt", "lte", "gt", "gte"):
+        return
+    types = _schema_types(column, spec)
+    if not types or not types <= {"object", "array"}:
+        return
+    try:
+        name = default_ref_key(column)
+    except QueryError:
+        name = "this value"
+    if name.endswith("date"):
+        hint = f" -- for a date, compare {name}.sortval (with Date('1900-01-31')) or {name}.dateval[2] (its year)"
+    else:
+        hint = " -- compare one of its fields instead"
+    raise QueryError(f"{name} is {'a list' if 'array' in types else 'an object'}, so it can't be put in order{hint}")
 
 
 def _check_number_vs_field(column: ColumnRef, value: ColumnRef, spec: ObjectTypeSpec) -> None:
@@ -2399,6 +2618,8 @@ def _condition_from_json(condition: dict, spec: ObjectTypeSpec) -> Any:
         rewritten = _type_name_condition(condition, type_cls)
         if rewritten is not None:
             return _node_from_json(rewritten, spec)
+    if op in _OP_CLASSES:
+        _check_ordering(column, op, spec)
     if op in _OP_CLASSES and "value_column" not in condition:
         _check_literal_kind(column, condition["value"], spec)
     if op == "in":
@@ -2614,15 +2835,16 @@ def parse_select_entry(
     try:
         node = ast.parse(text, mode="eval").body
     except SyntaxError as error:
-        raise QueryLangError(f"could not parse select entry {entry!r}: {error}") from error
+        raise _syntax_error(f"could not parse select entry", text, error) from error
 
     try:
-        ref = json_column_to_ref(
-            _translate_column_or_computed(
-                _desugar_comprehensions(_substitute_env(node, env)), spec
-            ),
-            spec,
-        )
+        with _quoting(text):
+            ref = json_column_to_ref(
+                _translate_column_or_computed(
+                    _desugar_comprehensions(_substitute_env(node, env)), spec
+                ),
+                spec,
+            )
     except (QueryLangError, QueryError) as error:
         raise QueryLangError(f"invalid select entry {entry!r}: {error}") from error
 
@@ -2669,14 +2891,15 @@ def parse_order_by_entry(
     try:
         node = ast.parse(text, mode="eval").body
     except SyntaxError as error:
-        raise QueryLangError(f"could not parse order_by entry {entry!r}: {error}") from error
+        raise _syntax_error(f"could not parse order_by entry", text, error) from error
     try:
-        ref = json_column_to_ref(
-            _translate_column_or_computed(
-                _desugar_comprehensions(_substitute_env(node, env)), spec
-            ),
-            spec,
-        )
+        with _quoting(text):
+            ref = json_column_to_ref(
+                _translate_column_or_computed(
+                    _desugar_comprehensions(_substitute_env(node, env)), spec
+                ),
+                spec,
+            )
     except (QueryLangError, QueryError) as error:
         raise QueryLangError(f"invalid order_by entry {entry!r}: {error}") from error
     return OrderBy(ref, direction)
