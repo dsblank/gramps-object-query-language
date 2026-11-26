@@ -2136,9 +2136,7 @@ class Comparison:
         fold = ordering_ignores_case(self, spec)
 
         def text(sql: str) -> str:
-            if fold:
-                sql = f"translate({sql}, '{_UPPER}', '{_LOWER}')"
-            return f'{sql} COLLATE "C"'
+            return _fold_postgresql(sql) if fold else f'{sql} COLLATE "C"'
 
         if isinstance(self.value, _FIELD_VALUE_TYPES):
             value_sql, value_params = _render_column(
@@ -3349,8 +3347,17 @@ def _is_text_ref(ref: "ColumnRef", spec: ObjectTypeSpec) -> bool:
     checked against the schema type it lands on -- which is exactly what
     used to be unavailable, and why `JsonPath` sort columns were previously
     out of scope for collation.
+
+    A `RelatedObject` is text when the field it ends in is
+    (`father.surname`), and a field that may be empty is text when it's
+    text whenever it's there (`["string", "null"]`).
     """
+    if isinstance(ref, RelatedObject):
+        return _is_text_ref(ref.field, ref.target)
     value_type = ref_value_type(spec, ref)
+    if isinstance(value_type, list):
+        present = [kind for kind in value_type if kind != "null"]
+        return bool(present) and all(kind == "string" for kind in present)
     if value_type is not None:
         return value_type == "string"
     if isinstance(ref, FlatColumnRef):
@@ -3463,7 +3470,28 @@ def _column_expr(
     sql, params = _render_column(
         column, spec, dialect, value=_cast_hint(ref_value_type(spec, column)), treeid=treeid
     )
+    if _folds_on_postgresql(column, spec, collation, dialect):
+        return _fold_postgresql(sql), params
     return sql + _collate_suffix(_is_text_ref(column, spec), collation, dialect), params
+
+
+def _folds_on_postgresql(
+    column: "ColumnRef", spec: ObjectTypeSpec, collation: Optional[str], dialect: Optional[Dialect]
+) -> bool:
+    """Does sorting (or seeking past) `column` on PostgreSQL spell out
+    SQLite's `NOCASE` (`_fold_postgresql`)? For text, unless a `collation`
+    was asked for. Not for `handle`, the tiebreak every query sorts by:
+    handles hold no capital letters, so folding wouldn't change their
+    order, only stop PostgreSQL using the primary key's index."""
+    if dialect != Dialect.POSTGRESQL or collation or column in ("handle", FlatColumnRef("handle")):
+        return False
+    return _is_text_ref(column, spec)
+
+
+def _fold_postgresql(sql: str) -> str:
+    """SQLite's `NOCASE` on PostgreSQL: the ASCII letters lower-cased, then
+    compared in byte order."""
+    return f"translate({sql}, '{_UPPER}', '{_LOWER}') COLLATE \"C\""
 
 
 def _keyset_tie_sql(
@@ -3572,6 +3600,11 @@ def _compile_keyset(
     # A cursor taken on the evaluator path holds `True`/`False` for a flat
     # bool column, which PostgreSQL won't compare to its INTEGER column.
     after = [_coerce_bool_literal(ob.column, v, spec) for ob, v in zip(effective_order_by, after)]
+    # A text cursor value is folded where the column is (`_column_expr`).
+    after = [
+        nocase_key(v) if _folds_on_postgresql(ob.column, spec, collation, dialect) else v
+        for ob, v in zip(effective_order_by, after)
+    ]
     or_terms = []
     params: list = []
     for i, ob in enumerate(effective_order_by):

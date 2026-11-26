@@ -846,8 +846,12 @@ Implemented -- `compile_query`'s `_column_expr` (query.py) now falls back to
 `COLLATE "NOCASE"` on text `ORDER BY`/keyset columns when the caller passes
 no explicit `collation`, but only on SQLite (`dialect` is `Dialect.SQLITE`
 or omitted, since SQLite is the default target). PostgreSQL has no built-in
-`NOCASE` collation, so that dialect is unaffected -- an explicit `collation`
-is still required there.
+`NOCASE` collation, so it spells out the same fold, `translate(x, 'A..Z',
+'a..z') COLLATE "C"` (`_fold_postgresql`), on sort and keyset columns and
+on `<`/`>` against text -- except the `handle` tiebreak, whose order folding
+can't change. An explicit `collation` replaces it on both backends. Since
+then, text reached through a relationship (`father.surname`) counts as text
+too (`_is_text_ref`); it used to sort, and compare with `<`, case and all.
 
 **Motivation:** without any `COLLATE` clause, SQLite compares text by raw
 codepoint, so every lowercase letter sorts after every uppercase one. A
@@ -1533,12 +1537,73 @@ it" rule).
   an ordinary `Collection`'s condition reaches into its target type's
   fields. The physical `reference` table (`obj_handle, obj_class,
   ref_handle, ref_class`) has no such fields to offer directly -- doing
-  this would mean a genuine two-hop join (confirm the class via
-  `reference`, then join again into that class's own table), and probably
-  wants to be per-class (`person_backlinks`, `family_backlinks`, ...)
-  rather than one polymorphic `backlinks`, so each has a single fixed
-  target type the same way every ordinary `Collection` already does. No
-  concrete consumer yet -- left as a separate, bigger design effort.
+  this means a genuine two-hop join (confirm the class via `reference`,
+  then join again into that class's own table), with a single fixed
+  target type the way every ordinary `Collection` already has one.
+
+  **Consumers (2026-11-25, gramps-connect):** list columns users asked
+  for -- Events view "Main Participants" (Gramps' own column, from
+  `get_participant_from_event`: Primary people, else the Family for family
+  events) and "Age at death" on the Events view. Both need the *role* of
+  the link, not just the referrer.
+
+  **Design (settled in discussion, not built).** Goal: add as few new names
+  as possible; reuse patterns GOQL already has. Two steps:
+
+  1. **Generalize the type-in-brackets rule -- no new names.** Today
+     `attribute_list['Occupation']` means the *first* Occupation attribute
+     (desugared to `[...][0]`). Restate it as: `list['Kind']` is *the
+     entries of that kind*; a path read straight off it reads the first
+     one. Existing uses are unchanged; new uses fall out:
+     - `[a.value for a in attribute_list['Occupation']]` -- all of them.
+     - `urls['Web Home'].path` -- brackets match the entry's `type`.
+     - `backlinks['Person'].birth.date`, `len(backlinks['Person'])`,
+       `any(p.primary_name.surname == 'Smith' for p in
+       backlinks['Person'])` -- the bracket fixes the referrer's type, so
+       its fields resolve against that type. This *replaces* the
+       per-class `person_backlinks`/`family_backlinks` idea (ten names)
+       and is the answer to this item's original example.
+
+     Each list has one obvious bracket field (its `type`; for `backlinks`,
+     `_class`). Desugaring: in iteration position, `X['K']` becomes a
+     filtered comprehension; with a path after it, `[...][0]`. `[0]` over
+     backlinks needs a stable order (`ORDER BY obj_handle`); document that
+     it means "any one". Tab completion offers the kind names after `['`
+     and the narrowed type's fields after the loop variable.
+
+  2. **Roles: `event_refs` on Event, following `child_refs`.** `child_refs`
+     (on Person) is already a reverse collection whose entries are the
+     *links* pointing here (`frel`/`mrel`), not records. `event_refs` is
+     the same for Event: the `EventRef` entries in people's and families'
+     `event_ref_list` whose `ref` is this event, each with its `role`.
+     Brackets select by role (`event_refs['Primary']`, rule 1). Add **one
+     shared field** on both `event_refs` and `child_refs` for the record
+     holding the link (name open; `owner` for now) -- which also gives
+     `child_refs` its missing "which family". Targets:
+
+     ```
+     Main Participants:  event_refs['Primary'].owner.primary_name
+     Age at death:       (date.sortval - event_refs['Primary'].owner.birth.date.sortval) // 365.25
+     ```
+
+     Open points: `owner` can be a Person or a Family, so a path after it
+     must be checked against both and yield no value where it doesn't
+     exist (SQL: one branch per class, `COALESCE`d). Gramps' full Main
+     Participants also needs "Primary person, else Family" -- an
+     either/or GOQL can't express yet -- so the first version covers
+     people's events only. SQL: `reference` (by `ref_handle`, class
+     Person/Family) -> owner row -> `json_each` over its `event_ref_list`
+     matching `ref` = outer handle (this is the "condition referencing the
+     outer row" gap above, but fixed inside the compiler rather than
+     exposed as syntax). Evaluator: `find_backlink_handles(handle,
+     include_classes=["Person", "Family"])`, then scan each owner's
+     `event_ref_list`, privacy via the proxy as for `backlinks` today.
+
+  Rejected: a polymorphic narrowing via `if p._class == 'Person'` inside
+  the comprehension (harder to compile and complete than brackets); an
+  Event-only `participants` with new `person`/`family` fields (three new
+  names, one record type); splitting a family into father/mother
+  participants (invents roles, makes `[0]` silently mean "father").
 
 ### Rough difficulty survey of unsupported `where_expr` shapes
 

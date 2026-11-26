@@ -452,6 +452,21 @@ class QueryGenerator:
     def generate(self, depth: int = 3) -> str:
         return self.condition(self._scope(depth), depth)
 
+    def order_by(self) -> List[Tuple[str, str]]:
+        """One or two sort columns, `(path, "asc" | "desc")`: text more
+        often than not, since that's where backends sort differently."""
+        self._selecting = True
+        try:
+            leaves = [l for l in self._leaves_in(self._scope(0)) if l[1] in ("string", "integer", "boolean")]
+        finally:
+            self._selecting = False
+        text = [l for l in leaves if l[1] == "string"]
+        columns = []
+        for _ in range(self.pick([1, 1, 2])):
+            path = self.pick_leaf(text if text and self.chance(0.7) else leaves)[0]
+            columns.append((path, self.pick(["asc", "desc"])))
+        return columns
+
     def value(self, depth: int = 2) -> str:
         """Something to `select`: a field, a count, a pick or arithmetic."""
         scope = self._scope(depth)

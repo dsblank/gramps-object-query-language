@@ -60,10 +60,10 @@ that a comparison agrees with how text [sorts](#sorting-the-same-paths-in-order_
 `surname < 'b'` is true for "Adams" and "adams" alike. Only the letters
 `A`-`Z` are folded, and text is otherwise compared character by
 character, the same on SQLite, PostgreSQL and under privacy filtering. A
-`collation` passed in (a locale's) decides `<`/`>` instead. One
-exception: a field reached through a relationship (`father.surname <
-'b'`) compares case and all, as it always has. For a case-insensitive
-match, use [`like(...)`](#in-contains-and-like).
+`collation` passed in (a locale's) decides `<`/`>` instead. This holds
+for every text field, on the record itself or through a relationship
+(`father.surname < 'b'`). For a case-insensitive match, use
+[`like(...)`](#in-contains-and-like).
 
 ## Combining conditions with `and`, `or`, and `not`
 

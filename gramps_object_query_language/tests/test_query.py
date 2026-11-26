@@ -1498,7 +1498,7 @@ def test_compile_query_maps_legacy_postgresql_column_in_order_by_and_keyset():
         Query(select=["handle"], order_by=[OrderBy("desc", "asc")]),
         dialect=Dialect.POSTGRESQL,
     )
-    assert "ORDER BY desc_" in sql
+    assert f"ORDER BY {_fold('desc_')}" in sql
     assert '"desc"' not in sql
 
     sql, _ = compile_query(
@@ -1510,7 +1510,7 @@ def test_compile_query_maps_legacy_postgresql_column_in_order_by_and_keyset():
         ),
         dialect=Dialect.POSTGRESQL,
     )
-    assert "desc_ > ?" in sql
+    assert f"{_fold('desc_')} > ?" in sql
     assert '"desc"' not in sql
 
 
@@ -1541,13 +1541,25 @@ def test_no_default_collation_for_non_text_order_by_columns():
     assert "gender ASC" in sql
 
 
-def test_no_nocase_default_collation_on_postgresql():
-    # PostgreSQL has no built-in NOCASE collation -- the SQLite-only
-    # default fallback doesn't apply there, so an explicit `collation` is
-    # still required to fix the same case-ordering issue.
+def _fold(sql: str) -> str:
+    """How PostgreSQL spells SQLite's NOCASE for `sql`."""
+    return f"translate({sql}, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') COLLATE \"C\""
+
+
+def test_nocase_default_on_postgresql_is_spelled_out():
+    # PostgreSQL has no built-in NOCASE collation, so text sorts by the same
+    # ASCII fold in byte order -- the order SQLite and the evaluator use.
+    # The handle tiebreak stays bare: folding can't change its order.
     query = Query(select=["handle"], order_by=[OrderBy("surname", "asc")])
     sql, _ = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
-    assert "COLLATE" not in sql
+    assert f"ORDER BY {_fold('surname')} ASC NULLS FIRST, handle ASC" in sql
+
+
+def test_postgresql_order_by_keeps_explicit_collation():
+    query = Query(select=["handle"], order_by=[OrderBy("surname", "asc")])
+    sql, _ = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL, collation="de_DE")
+    assert 'ORDER BY surname COLLATE "de_DE" ASC' in sql
+    assert "translate" not in sql
 
 
 def test_explicit_collation_overrides_nocase_default():
@@ -1783,7 +1795,7 @@ def test_order_by_gets_trailing_handle_tiebreaker():
     # which isn't what this test is about.
     query = Query(select=["handle"], order_by=[OrderBy("surname", "asc")])
     sql, _ = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
-    assert "ORDER BY surname ASC NULLS FIRST, handle ASC" in sql
+    assert f"ORDER BY {_fold('surname')} ASC NULLS FIRST, handle ASC" in sql
 
 
 def test_order_by_does_not_duplicate_explicit_handle():
@@ -1793,7 +1805,7 @@ def test_order_by_does_not_duplicate_explicit_handle():
     )
     sql, _ = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
     order_by_clause = sql.split("ORDER BY", 1)[1]
-    assert order_by_clause.startswith(" surname ASC NULLS FIRST, handle DESC")
+    assert order_by_clause.startswith(f" {_fold('surname')} ASC NULLS FIRST, handle DESC")
     assert order_by_clause.count("handle") == 1  # not duplicated
 
 
@@ -1810,7 +1822,7 @@ def test_postgresql_order_by_pins_null_is_smallest():
     sql, _ = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
     order_by_clause = sql.split("ORDER BY", 1)[1]
     assert order_by_clause.count("DESC NULLS LAST") == 1
-    assert "surname ASC NULLS FIRST" in order_by_clause
+    assert f"{_fold('surname')} ASC NULLS FIRST" in order_by_clause
     # The NOT NULL primary-key tiebreaker stays bare (index-friendly).
     assert "handle ASC NULLS" not in order_by_clause
 
@@ -1866,8 +1878,8 @@ def test_keyset_pagination_single_column_asc():
         after=("Smith", "h123"),
     )
     sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
-    assert "surname > ?" in sql
-    assert "Smith" in params
+    assert f"{_fold('surname')} > ?" in sql
+    assert "smith" in params  # folded, as the column is
     assert "h123" in params
 
 
@@ -1890,8 +1902,8 @@ def test_keyset_pagination_mixed_directions_seek_expansion():
     sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
     # OR-of-ANDs seek expansion, not a row-constructor comparison, so mixed
     # asc/desc directions stay correct.
-    assert "surname < ?" in sql
-    assert "given_name > ?" in sql
+    assert f"{_fold('surname')} < ?" in sql
+    assert f"{_fold('given_name')} > ?" in sql
     assert "handle > ?" in sql
     assert sql.index("OR") > 0
 
@@ -1914,7 +1926,7 @@ def test_keyset_asc_null_cursor_uses_is_not_null_not_bound_comparison():
         after=(None, "h123"),
     )
     sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
-    assert "surname IS NOT NULL" in sql
+    assert f"{_fold('surname')} IS NOT NULL" in sql
     # The `NULL` cursor value itself is never bound as a `?` param for this
     # leg -- `col > ?` against a bound `NULL` would just be `UNKNOWN` again.
     assert None not in params
@@ -1952,8 +1964,8 @@ def test_keyset_desc_non_null_cursor_still_includes_null_rows():
         after=("Smith", "h123"),
     )
     sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
-    assert "surname IS NULL OR" in sql
-    assert "surname < ?" in sql
+    assert f"{_fold('surname')} IS NULL OR" in sql
+    assert f"{_fold('surname')} < ?" in sql
 
 
 def test_keyset_null_safety_end_to_end_sqlite():
