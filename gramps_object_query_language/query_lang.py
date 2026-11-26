@@ -1902,6 +1902,8 @@ def _holds_numbers(ref: ColumnRef, spec: ObjectTypeSpec) -> bool:
 def _whole_number(ref: ColumnRef, spec: ObjectTypeSpec) -> bool:
     """Whether a numeric column holds whole numbers (the schema says
     `integer`, or it's a count)."""
+    while isinstance(ref, RelatedObject):
+        spec, ref = ref.target, ref.field
     if isinstance(ref, (CollectionCount, JsonArrayCount, Length)):
         return True
     return _schema_types(ref, spec) - {"boolean"} == {"integer"}
@@ -2064,6 +2066,10 @@ def _value_kind(column: ColumnRef, spec: ObjectTypeSpec) -> Optional[str]:
     while isinstance(column, RelatedObject):
         spec = column.target
         column = column.field
+    # A count reached through a hop (`len(parent_families[0].child_ref_list)`)
+    # is as much a number as one on the record itself.
+    if isinstance(column, (CollectionCount, JsonArrayCount, Length, Arithmetic)):
+        return "number"
     if isinstance(column, FlatColumnRef):
         column = column.name
     if isinstance(column, str):

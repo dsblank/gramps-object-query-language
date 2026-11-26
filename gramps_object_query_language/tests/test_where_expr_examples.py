@@ -732,6 +732,31 @@ def test_distinct_fathers_doc_examples():
     assert conn.execute(sql, params).fetchall() == [("none", -1), ("twice", 0), ("two", 1)]
 
 
+def test_count_through_a_hop_takes_arithmetic():
+    # Siblings = the first parent family's children, less the person.
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE person (handle TEXT, json_data TEXT)")
+    conn.execute(
+        "CREATE TABLE family (handle TEXT, father_handle TEXT, mother_handle TEXT, json_data TEXT)"
+    )
+    for handle, families in (("only", ["f1"]), ("three", ["f2"])):
+        conn.execute(
+            "INSERT INTO person VALUES (?, ?)",
+            (handle, json.dumps({"parent_family_list": families})),
+        )
+    conn.execute("INSERT INTO family VALUES ('f1', NULL, NULL, ?)", (json.dumps({"child_ref_list": [{"ref": "only"}]}),))
+    conn.execute(
+        "INSERT INTO family VALUES ('f2', NULL, NULL, ?)",
+        (json.dumps({"child_ref_list": [{"ref": "three"}, {"ref": "b"}, {"ref": "c"}]}),),
+    )
+    spec = resolve_namespace("Person")
+    [(ref, _)] = parse_select(spec, ["len(parent_families[0].child_ref_list) - 1 as siblings"])
+    assert ref.integral
+    sql, params = compile_query(spec, Query(select=["handle", ref]), dialect=Dialect.SQLITE)
+    assert sorted(conn.execute(sql, params).fetchall()) == [("only", 0), ("three", 2)]
+    assert run(conn, "Person", "len(parent_families[0].child_ref_list) - 1 >= 2") == [("three",)]
+
+
 # --- Collections registered on other types, and self-reference ---------------
 
 
