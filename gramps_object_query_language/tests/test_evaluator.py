@@ -1497,6 +1497,13 @@ def self_nested_db():
         ("any(enclosing_places, any(enclosing_places, gramps_id == 'E'))", {"C"}),
         ("any(enclosing_places, any(enclosing_places, name.value == 'Place D'))", {"B"}),
         ("any(enclosing_places, gramps_id == 'C' and any(enclosing_places))", {"B"}),
+        # A picked entry inside the loop: its alias mustn't hide the loop's row.
+        ("any([q for q in p.enclosing_places][0].gramps_id == 'E' for p in enclosing_places)", {"C"}),
+        (
+            "any([q for q in p.enclosing_places if q.gramps_id != 'X'][0].gramps_id == 'D' "
+            "for p in enclosing_places)",
+            {"B"},
+        ),
     ],
 )
 def test_sql_and_evaluator_agree_on_nested_same_table_places(
