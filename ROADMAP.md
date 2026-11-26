@@ -1547,10 +1547,15 @@ it" rule).
   events) and "Age at death" on the Events view. Both need the *role* of
   the link, not just the referrer.
 
-  **Design (settled in discussion, not built).** Goal: add as few new names
+  **Design (settled in discussion; step 2 and step 1's typed lists built).** Goal: add as few new names
   as possible; reuse patterns GOQL already has. Two steps:
 
-  1. **Generalize the type-in-brackets rule -- no new names.** Today
+  1. **Generalize the type-in-brackets rule -- no new names.**
+     *Typed lists done* (`attribute_list`, `urls`: looped over, `len()`,
+     `any()`, one- and two-argument forms -- see `docs/where_expr.md`'s
+     "Entries by type"). *`backlinks['Person']` not built yet* -- it needs
+     a join through `reference` into the referrer's table, a new kind of
+     collection rather than a rewrite. Before:
      `attribute_list['Occupation']` means the *first* Occupation attribute
      (desugared to `[...][0]`). Restate it as: `list['Kind']` is *the
      entries of that kind*; a path read straight off it reads the first
@@ -1571,7 +1576,12 @@ it" rule).
      it means "any one". Tab completion offers the kind names after `['`
      and the narrowed type's fields after the loop variable.
 
-  2. **Roles: `event_refs` on Event, following `child_refs`.** `child_refs`
+  2. **Roles: `event_refs` on Event, following `child_refs`.** *Done*,
+     people and families both, with the shared field named `referrer`
+     (see `docs/where_expr.md`'s "Who an event belongs to"). Still open:
+     "Primary person, else Family" (an either/or), and offering
+     `referrer`/EventRef fields in completion after `for r in event_refs`.
+     The original design: `child_refs`
      (on Person) is already a reverse collection whose entries are the
      *links* pointing here (`frel`/`mrel`), not records. `event_refs` is
      the same for Event: the `EventRef` entries in people's and families'

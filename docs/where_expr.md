@@ -339,34 +339,59 @@ birth event. The index is a plain number, 0 or more. `backlinks` and
 `child_refs` can't be picked from, for the same reasons they can't be
 indexed.
 
-### An attribute by type: `attribute_list['Age']`
+### Entries by type: `attribute_list['Age']`
 
-Picking an attribute by its type is common enough to have a shorthand:
-put the type's name in the brackets instead of a number.
+Picking entries of a list by their type is common enough to have a
+shorthand: put the type's name in the brackets instead of a number.
+`attribute_list['Occupation']` is a person's Occupation attributes.
+
+Read straight off, with a path after it or compared on its own, it is the
+first one:
 
 ```python
 Person "attribute_list['Occupation'].value == 'Farmer'"
 Citation "source.attribute_list['Film'].value"
+Person "urls['Web Home'].path != None"
 ```
 
-`attribute_list['Occupation']` is the person's first Occupation attribute,
-the same as `[a for a in attribute_list if a.type.string == 'Occupation'
-or a.type.value == AttributeType.OCCUPATION][0]`, which it is turned
-into before anything else happens. So it works everywhere that does, in
-`where_expr`, `select` and `order_by`, and reaches just as far: on the
-record itself, or on a record one link away (`source.attribute_list`,
-`father.attribute_list`), inside `any(...)` too.
+Looped over, counted or tested with `any(...)`, it is all of them:
+
+```python
+Person "len(attribute_list['Occupation']) > 1"
+Person "any(a.value == 'Miller' for a in attribute_list['Occupation'])"
+Person "[a.value for a in attribute_list['Occupation']][1] == 'Miller'"
+Person "any(attribute_list['Nickname'])"
+Person "len(urls['E-mail'], path != '') > 1"
+```
+
+Each is turned into its long form before anything else happens:
+
+| Shorthand | Long form |
+|-----------|-----------|
+| `attribute_list['Occupation'].value` | `[a for a in attribute_list if <a is an Occupation>][0].value` |
+| `for a in attribute_list['Occupation'] if c` | `for a in attribute_list if <a is an Occupation> and c` |
+| `len(attribute_list['Occupation'])` | `len([a for a in attribute_list if <a is an Occupation>])` |
+| `any(attribute_list['Occupation'], c)` | `any(attribute_list, <is an Occupation> and c)` |
+
+where `<a is an Occupation>` is `a.type.string == 'Occupation' or
+a.type.value == AttributeType.OCCUPATION`. So the shorthand works
+everywhere the long form does, in `where_expr`, `select` and `order_by`,
+and reaches just as far: on the record itself, or on a record one link
+away (`source.attribute_list`, `father.attribute_list`), inside `any(...)`
+too.
 
 The name is matched two ways because Gramps stores them two ways. A type
 you made up yourself ("Film", "Hair color") is stored by its name. A
 built-in type (Age, Nickname, Occupation, ...) is stored by number only,
 with an empty name, so its English name is looked up and matched by
 number. Names match exactly, so `'hair color'` doesn't find "Hair color".
-When there's no attribute of that type, there's no value, and
+When there's no entry of that type, there's no value, and
 `attribute_list['Film'] == None` is true.
 
-A name in brackets only works on `attribute_list`. Other lists are
-indexed by number, or by a comprehension.
+A name in brackets works on `attribute_list` (by `AttributeType`) and
+`urls` (by `UrlType`:
+`'E-mail'`, `'Web Home'`, `'Web Search'`, `'FTP'`, or your own). Other
+lists are indexed by number, or by a comprehension.
 
 ### Field-vs-field comparisons
 
@@ -655,8 +680,8 @@ Note "any(bl._class != 'Media' for bl in backlinks)"
 == 0` is another way to spell `not any(bl for bl in backlinks)`. Reaching
 into the referrer's own fields beyond its class (e.g. a Note referenced by
 a Person whose surname is Smith) isn't supported yet -- see `ROADMAP.md`'s
-"Reverse relationships" item for why that needs a genuinely different,
-per-class construct rather than a straightforward extension of this one.
+"Reverse relationships" item. For an event's people and families, see
+[`event_refs`](#who-an-event-belongs-to-eventevent_refs) below.
 
 ## A self-linked collection: `Person.child_refs`
 
@@ -685,6 +710,55 @@ those two fields to the loop variable, the `ChildRef` link itself.
 `child_refs` works with `any(...)` and `len([...])` like any other
 collection; it can't be indexed or picked from (`child_refs[0]`), since its
 entries are about this person, not records to go to.
+
+`ref.referrer` is the family the entry is stored in, read like any other
+link:
+
+```python
+Person "any(ref.referrer.father.surname == 'Smith' for ref in child_refs if ref.frel.value == ChildRefType.ADOPTED)"
+Person "len(distinct([ref.referrer.father for ref in child_refs])) > 1"
+```
+
+## Who an event belongs to: `Event.event_refs`
+
+An event doesn't list the people it belongs to: each person (or family)
+lists the event in its own `event_ref_list`, each with a role -- Primary,
+Witness, Family, ... `event_refs` turns that around: on an Event, it is
+every one of those links pointing at this event, from people and families
+alike. Each entry is the link itself (an EventRef: `role`, `private`,
+`attribute_list`, ...), and `referrer` is the person or family it is
+stored in:
+
+```python
+Event "any(event_refs['Primary'])"
+Event "len(event_refs['Witness']) > 2"
+Event "any(r.referrer.primary_name.surname == 'Smith' for r in event_refs['Primary'])"
+Event "event_refs['Primary'].referrer.gender == Person.FEMALE"
+Event "(date.sortval - event_refs['Primary'].referrer.birth.date.sortval) // 365 > 90"
+```
+
+A role in brackets picks the entries with that role, the way a type does on
+`attribute_list` (see [Entries by type](#entries-by-type-attribute_listage)).
+So `event_refs['Primary'].referrer.primary_name` is the event's first
+Primary person's name -- in `select` it is the "Main Participants" column
+-- and the last example finds deaths at over 90.
+
+`referrer` can be a Person or a Family. A path after it is checked against
+both and needs to exist on at least one of them; where the referrer is the
+other kind, there's no value, as for a missing birth event. So
+`referrer.father.surname` is the family's father's surname, and nothing
+for a person's link; `referrer.gramps_id` is either one's ID.
+
+The first entry (`[0]`, or a path read straight off `event_refs['Primary']`)
+is the first in a fixed order: people before families, then by the
+record's handle, then by position in its list. With several Primary people
+that is just "one of them" rather than the most important one, but the
+same one every time, in SQL and in Python alike.
+
+`event_refs` finds the records through Gramps' own `reference` table, as
+`backlinks` does, so it costs an index lookup per event rather than a scan
+of every person. Through a privacy proxy, a link from a record you can't
+see isn't there.
 
 ## Comprehension rules
 

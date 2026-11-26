@@ -111,6 +111,10 @@ class ObjectTypeSpec:
     element_depth: int = 0
     sql_alias: Optional[str] = None
     collection_depth: int = 0
+    #: Set only on the element spec of a self-linked collection's condition
+    #: (`child_refs`, `event_refs`): the types of record the link entry is
+    #: stored in, which `referrer.<path>` resolves against (see `Referrer`).
+    referrers: Tuple["ObjectTypeSpec", ...] = ()
 
 
 def _sql_table(spec: ObjectTypeSpec) -> str:
@@ -363,6 +367,12 @@ def ref_value_type(spec: ObjectTypeSpec, ref: "ColumnRef") -> Any:
     """
     if isinstance(ref, RelatedObject):
         return ref_value_type(ref.target, ref.field)
+    if isinstance(ref, Referrer):
+        return ref_value_type(*ref.first())
+    if isinstance(ref, LinkPick):
+        if ref.field is None:
+            return "object"
+        return ref_value_type(ref.element_spec, ref.field)
     if isinstance(ref, JsonPath):
         return path_value_type(spec, ref.segments)
     if isinstance(ref, CollectionCount):
@@ -374,6 +384,22 @@ def ref_value_type(spec: ObjectTypeSpec, ref: "ColumnRef") -> Any:
     if isinstance(ref, Arithmetic):
         return "integer" if ref.integral else "number"
     return None
+
+
+def unwrap_ref(column: "ColumnRef", spec: ObjectTypeSpec) -> Tuple["ColumnRef", ObjectTypeSpec]:
+    """The field `column` ends in and the type it's on, following links
+    (`father.surname`), `referrer.<path>` (its first type that has the
+    path) and an entry picked from `event_refs` -- for the checks that only
+    care what kind of value comes out."""
+    while True:
+        if isinstance(column, RelatedObject):
+            column, spec = column.field, column.target
+        elif isinstance(column, Referrer):
+            spec, column = column.first()
+        elif isinstance(column, LinkPick) and column.field is not None:
+            column, spec = column.field, column.element_spec
+        else:
+            return column, spec
 
 
 def is_composite_type(value_type: Any) -> bool:
@@ -678,6 +704,72 @@ class Collection:
     ref_field: Optional[str]
     self_link_field: Optional[str] = None
     self_link_ref_field: Optional[str] = None
+    #: A *reverse* self-linked collection (`Event.event_refs`): the entries
+    #: are in these types' own `self_link_field` arrays, in records that
+    #: point at the current row, found through Gramps' `reference` table
+    #: rather than a list on the current row (`list_path` is unused, and
+    #: set to the referrers' own list name only because it can't be empty).
+    #: `target` is the first of them, for the entry's element spec. See
+    #: `_referring_bodies`.
+    referrers: Tuple[ObjectTypeSpec, ...] = ()
+
+
+@dataclass(frozen=True)
+class Referrer:
+    """`referrer.<path>` inside a self-linked collection's condition: the
+    path read from the record the link entry is stored in -- the Family
+    holding a `child_refs` ChildRef, the Person or Family holding an
+    `event_refs` EventRef.
+
+    `fields` has one `(type, ColumnRef or None)` per type the record can
+    be, `None` where the path doesn't exist on that type (a Family has no
+    `primary_name`), which gives no value. In SQL each type is its own
+    branch, whose row is the spec it's compiled against; see
+    `field_for`.
+    """
+
+    fields: Tuple[Tuple[ObjectTypeSpec, Optional["ColumnRef"]], ...]
+
+    def field_for(self, table: str) -> Optional["ColumnRef"]:
+        for spec, field in self.fields:
+            if spec.table == table:
+                return field
+        return None
+
+    def first(self) -> Tuple[ObjectTypeSpec, "ColumnRef"]:
+        """The first type the path exists on, and the path there -- what
+        the type checks (`ref_value_type`, ...) read."""
+        for spec, field in self.fields:
+            if field is not None:
+                return spec, field
+        raise QueryError("referrer path resolves on no type")
+
+    def __repr__(self) -> str:
+        return "Referrer(" + ", ".join(f"{s.table}: {f!r}" for s, f in self.fields) + ")"
+
+
+@dataclass(frozen=True)
+class LinkPick:
+    """`[r.<field> for r in event_refs if <condition>][<index>]` -- one
+    entry of a reverse self-linked collection (see `Collection.referrers`),
+    `field` read from it (an entry field against `link.value`, or a
+    `Referrer`), or the entry itself when `field` is `None`. NULL when
+    fewer match.
+
+    Entries are ordered by referrer type (as listed in `referrers`, so
+    people before families), then the referrer's handle, then position in
+    its list -- the same order on SQLite, PostgreSQL and the evaluator.
+    """
+
+    collection: Collection
+    owner: ObjectTypeSpec
+    element_spec: ObjectTypeSpec
+    condition: Optional[Any]
+    index: int
+    field: Optional["ColumnRef"] = None
+
+    def __repr__(self) -> str:
+        return f"LinkPick({self.collection.name!r}, {self.condition!r}, {self.index}, {self.field!r})"
 
 
 @dataclass(frozen=True)
@@ -1166,6 +1258,19 @@ _COLLECTIONS: dict[str, dict[str, Collection]] = {
     },
     EVENT.table: {
         **_generic_collections(notes=True, citations=True, media=True, tags=True),
+        # Reverse self-linked: the EventRef entries in people's and
+        # families' own event_ref_list that point at this event, each with
+        # its role; `referrer` is the person or family. See
+        # Collection.referrers.
+        "event_refs": Collection(
+            "event_refs",
+            PERSON,
+            JsonPath(("event_ref_list",)),  # unused, see Collection.referrers
+            None,
+            self_link_field="event_ref_list",
+            self_link_ref_field="ref",
+            referrers=(PERSON, FAMILY),
+        ),
     },
     PLACE.table: {
         **_generic_collections(notes=True, citations=True, media=True, tags=True),
@@ -1318,6 +1423,8 @@ def resolve_column_path(
     if not segments:
         raise QueryError("empty column path")
     head, *rest = segments
+    if head == "referrer" and spec.referrers:
+        return _resolve_referrer(spec, rest)
     # Checked before the relationship branch below: a handful of names
     # (`event.place`, `place.enclosed_by`) are *both* a real flat column
     # (the raw handle, stored under that exact name -- see `_spec_for`'s
@@ -1350,6 +1457,32 @@ def resolve_column_path(
     # covers all of them at once.
     walk_schema(spec, segments)
     return JsonPath(tuple(segments), base_column)
+
+
+def _resolve_referrer(spec: ObjectTypeSpec, rest: Sequence[Union[str, int]]) -> Referrer:
+    """`referrer.<rest>`, resolved on each type the link entry can be
+    stored in (see `Referrer`). An error only when it exists on none."""
+    names = " or ".join(referrer.cls.__name__ for referrer in spec.referrers)
+    if not rest:
+        raise QueryError(
+            f"referrer is the {names} holding this entry, not a value on its own -- "
+            f"use referrer.<field>, e.g. referrer.gramps_id"
+        )
+    fields: List[Tuple[ObjectTypeSpec, Optional[ColumnRef]]] = []
+    first_error: Optional[QueryError] = None
+    for referrer in spec.referrers:
+        try:
+            fields.append((referrer, resolve_column_path(referrer, rest)))
+        except QueryError as error:
+            fields.append((referrer, None))
+            first_error = first_error or error
+    if all(field is None for _, field in fields):
+        assert first_error is not None
+        if len(spec.referrers) == 1:
+            raise first_error
+        path = ".".join(map(str, rest))
+        raise QueryError(f"referrer.{path} isn't a field of a {names}: {first_error}")
+    return Referrer(tuple(fields))
 
 
 _PATH_SEGMENT_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)((?:\[[0-9]+\])*)\Z")
@@ -1443,6 +1576,10 @@ def default_ref_key(ref: "ColumnRef") -> str:
         if isinstance(ref.handle_ref, CollectionPick):
             raise QueryError("a picked entry has no path spelling -- supply a key")
         return f"{ref.name}.{default_ref_key(ref.field)}"
+    if isinstance(ref, Referrer):
+        return f"referrer.{default_ref_key(ref.first()[1])}"
+    if isinstance(ref, LinkPick):
+        raise QueryError("a picked entry has no path spelling -- supply a key")
     if isinstance(ref, JsonPath):
         parts: List[str] = []
         for segment in ref.segments:
@@ -1491,7 +1628,7 @@ class FlatColumnRef:
 # like `birth.place.title` is itself a valid `ColumnRef`.
 ColumnRef = Union[
     str, JsonPath, RelatedObject, CollectionCount, FlatColumnRef, Length, JsonArrayCount, JsonArrayPick,
-    Arithmetic,
+    Arithmetic, Referrer, LinkPick,
 ]
 SelectRef = ColumnRef
 
@@ -1900,6 +2037,15 @@ def _render_column(
         sql, params = _render_json_array_count(column, spec, dialect, treeid)
     elif isinstance(column, JsonArrayPick):
         sql, params = _render_json_array_pick(column, spec, dialect, treeid, value)
+    elif isinstance(column, Referrer):
+        # `spec` is the branch's referrer row (see `_referring_bodies`).
+        field = column.field_for(spec.table)
+        if field is None:
+            sql, params = "NULL", []
+        else:
+            sql, params = _render_column(field, spec, dialect, value, treeid)
+    elif isinstance(column, LinkPick):
+        sql, params = _render_link_pick(column, spec, dialect, treeid, value)
     elif isinstance(column, Arithmetic):
         sql, params = _render_arithmetic(column, spec, dialect, treeid)
     else:
@@ -2007,8 +2153,7 @@ def _coerce_bool_literal(column: ColumnRef, value: Any, spec: ObjectTypeSpec) ->
     """
     if not isinstance(value, bool):
         return value
-    while isinstance(column, RelatedObject):
-        column, spec = column.field, column.target
+    column, spec = unwrap_ref(column, spec)
     name = column.name if isinstance(column, FlatColumnRef) else column
     if isinstance(name, str) and name in spec.bool_columns:
         return int(value)
@@ -2019,7 +2164,7 @@ def _coerce_bool_literal(column: ColumnRef, value: Any, spec: ObjectTypeSpec) ->
 #: field, or a computed value -- compared field-vs-field.
 _FIELD_VALUE_TYPES = (
     JsonPath, RelatedObject, FlatColumnRef, Arithmetic, CollectionCount, JsonArrayCount, Length,
-    JsonArrayPick,
+    JsonArrayPick, Referrer, LinkPick,
 )
 
 #: Computed values that are always numbers, so the other side of a
@@ -2542,11 +2687,16 @@ def _self_link_source_sqlite(collection: Collection, target_alias: str) -> Tuple
     )
 
 
-def _self_link_source_postgresql(collection: Collection, target_alias: str) -> Tuple[str, str]:
-    """`_self_link_source_sqlite`'s PostgreSQL counterpart."""
+def _self_link_source_postgresql(
+    collection: Collection, target_alias: str, ordered: bool = False
+) -> Tuple[str, str]:
+    """`_self_link_source_sqlite`'s PostgreSQL counterpart. `ordered`
+    numbers the entries (`link.ord`), for picking the n-th."""
+    columns = "link(value, ord)" if ordered else "link(value)"
+    ordinality = " WITH ORDINALITY" if ordered else ""
     return (
         f"jsonb_array_elements({target_alias}.json_data::jsonb -> "
-        f"'{collection.self_link_field}') AS link(value)",
+        f"'{collection.self_link_field}'){ordinality} AS {columns}",
         f"link.value ->> '{collection.self_link_ref_field}'",
     )
 
@@ -2685,6 +2835,122 @@ def _backlinks_subquery_body(
     return body, params
 
 
+def _referring_bodies(
+    collection: Collection,
+    outer_spec: ObjectTypeSpec,
+    condition: Optional[Any],
+    dialect: Dialect,
+    treeid: Optional[int],
+    collation: Optional[str] = None,
+    ordered: bool = False,
+) -> List[Tuple[str, list, ObjectTypeSpec]]:
+    """One `(body, params, row_spec)` per referrer type of a reverse
+    self-linked collection (`Event.event_refs`, see `Collection.referrers`):
+
+    `person AS person__target, <unnest of its event_ref_list> AS link
+    WHERE person__target.handle IN (SELECT reference.obj_handle FROM
+    reference WHERE reference.ref_handle = event.handle AND
+    reference.obj_class = 'Person') AND link.ref = event.handle [AND
+    (<condition>)] [AND person__target.treeid = ?]`
+
+    `reference` finds the records pointing here (indexed, unlike a scan of
+    every person's list); `IN` keeps a record listed twice there from
+    being counted twice. `condition` is compiled against `row_spec`, the
+    referrer row's alias, so a `Referrer` in it renders that type's path.
+    The caller combines the bodies (`EXISTS ... OR EXISTS ...`, a
+    `UNION ALL`)."""
+    outer_table = _sql_table(outer_spec)
+    depth = outer_spec.collection_depth
+    bodies = []
+    for referrer in collection.referrers:
+        alias = f"{referrer.table}__target{depth or ''}"
+        if dialect == Dialect.SQLITE:
+            link_source, link_ref = _self_link_source_sqlite(collection, alias)
+        elif dialect == Dialect.POSTGRESQL:
+            link_source, link_ref = _self_link_source_postgresql(collection, alias, ordered)
+        else:
+            raise QueryError(f"unsupported dialect: {dialect!r}")
+        references = (
+            f"SELECT reference.obj_handle FROM reference WHERE reference.ref_handle = "
+            f"{outer_table}.handle AND reference.obj_class = ?"
+        )
+        params: list = [referrer.cls.__name__]
+        if treeid is not None:
+            references += " AND reference.treeid = ?"
+            params.append(treeid)
+        where_parts = [f"{alias}.handle IN ({references})", f"{link_ref} = {outer_table}.handle"]
+        row_spec = replace(referrer, sql_alias=alias, collection_depth=depth + 1)
+        if condition is not None:
+            cond_sql, cond_params = condition.compile(row_spec, dialect, treeid, collation)
+            where_parts.append(f"({cond_sql})")
+            params.extend(cond_params)
+        if treeid is not None:
+            where_parts.append(f"{alias}.treeid = ?")
+            params.append(treeid)
+        body = f"{referrer.table} AS {alias}, {link_source} WHERE {' AND '.join(where_parts)}"
+        bodies.append((body, params, row_spec))
+    return bodies
+
+
+def _render_referring_count(
+    count: "CollectionCount", outer_spec: ObjectTypeSpec, dialect: Dialect, treeid: Optional[int]
+) -> Tuple[str, list]:
+    """`len(event_refs[, ...])`: the entries of every referrer type, counted
+    together (`COUNT` over a `UNION ALL`, so `distinct` sees them all)."""
+    parts, params = [], []
+    for body, body_params, row_spec in _referring_bodies(
+        count.collection, outer_spec, count.condition, dialect, treeid
+    ):
+        if count.projection is None:
+            value_sql, value_params = "1", []
+        else:
+            value_sql, value_params = _render_column(count.projection, row_spec, dialect, None, treeid)
+            if dialect == Dialect.POSTGRESQL:
+                value_sql = f"CAST({value_sql} AS TEXT)"
+            value_sql = f"NULLIF({value_sql}, '')"
+        parts.append(f"SELECT {value_sql} AS v FROM {body}")
+        params += value_params + body_params
+    keyword = "DISTINCT " if count.distinct else ""
+    counted = "*" if count.projection is None else f"{keyword}goql_entries.v"
+    return f"(SELECT COUNT({counted}) FROM ({' UNION ALL '.join(parts)}) AS goql_entries)", params
+
+
+def _render_link_pick(
+    pick: "LinkPick",
+    outer_spec: ObjectTypeSpec,
+    dialect: Optional[Dialect],
+    treeid: Optional[int],
+    value: Any = None,
+) -> Tuple[str, list]:
+    """`(SELECT v FROM (<one branch per referrer type> UNION ALL ...) ORDER
+    BY <type>, <referrer handle>, <position> LIMIT 1 OFFSET <index>)` --
+    `LinkPick`'s rendering. Handles sort byte-wise on both dialects (and
+    in Python), whatever the database's collation."""
+    if dialect is None:
+        raise QueryError("a dialect is required to compile an entry of a list, but none was given")
+    _check_pick_index(pick.index)
+    collate = "BINARY" if dialect == Dialect.SQLITE else '"C"'
+    parts, params = [], []
+    for rank, (body, body_params, row_spec) in enumerate(
+        _referring_bodies(pick.collection, outer_spec, pick.condition, dialect, treeid, ordered=True)
+    ):
+        if pick.field is None:
+            field_sql, field_params = "link.value", []
+        else:
+            field_sql, field_params = _render_column(pick.field, row_spec, dialect, value, treeid)
+        parts.append(
+            f"SELECT {field_sql} AS v, {rank} AS goql_rank, {row_spec.sql_alias}.handle AS goql_handle, "
+            f"{_entry_order('link', dialect)} AS goql_position FROM {body}"
+        )
+        params += field_params + body_params
+    return (
+        f"(SELECT goql_entries.v FROM ({' UNION ALL '.join(parts)}) AS goql_entries "
+        f"ORDER BY goql_entries.goql_rank, goql_entries.goql_handle COLLATE {collate}, "
+        f"goql_entries.goql_position LIMIT 1 OFFSET {pick.index})",
+        params,
+    )
+
+
 def _collection_target_alias(collection: Collection, outer_spec: ObjectTypeSpec) -> str:
     """The alias `_collection_subquery_body` gives `collection`'s target
     row (see its docstring for the depth suffix)."""
@@ -2738,6 +3004,8 @@ def _render_collection_count(
             f"a dialect is required to compile count({count.collection.name!r}, ...), "
             "but none was given"
         )
+    if count.collection.referrers:
+        return _render_referring_count(count, outer_spec, dialect, treeid)
     row_spec = replace(
         count.collection.target,
         sql_alias=_collection_target_alias(count.collection, outer_spec),
@@ -2956,6 +3224,19 @@ def undated_guard(ref: Any, spec: ObjectTypeSpec) -> Optional["ColumnRef"]:
     if isinstance(ref, RelatedObject):
         inner = undated_guard(ref.field, ref.target)
         return None if inner is None else replace(ref, field=inner)
+    if isinstance(ref, Referrer):
+        guards = tuple(
+            (target, None if field is None else undated_guard(field, target))
+            for target, field in ref.fields
+        )
+        if all(guard is None for _, guard in guards):
+            return None
+        return Referrer(guards)
+    if isinstance(ref, LinkPick):
+        if ref.field is None:
+            return None
+        inner = undated_guard(ref.field, ref.element_spec)
+        return None if inner is None else replace(ref, field=inner)
     if isinstance(ref, JsonArrayPick):
         if ref.field is None:
             return None
@@ -3148,6 +3429,14 @@ class Exists:
                 f"a dialect is required to compile exists({self.collection.name!r}, ...), "
                 "but none was given"
             )
+        if self.collection.referrers:
+            parts, params = [], []
+            for body, body_params, _row_spec in _referring_bodies(
+                self.collection, spec, self.condition, dialect, treeid, collation
+            ):
+                parts.append(f"SELECT 1 FROM {body}")
+                params += body_params
+            return f"EXISTS ({' UNION ALL '.join(parts)})", params
         body, params = _collection_subquery_body(
             self.collection, spec, self.condition, dialect, treeid, collation
         )
@@ -3352,8 +3641,10 @@ def _is_text_ref(ref: "ColumnRef", spec: ObjectTypeSpec) -> bool:
     (`father.surname`), and a field that may be empty is text when it's
     text whenever it's there (`["string", "null"]`).
     """
-    if isinstance(ref, RelatedObject):
-        return _is_text_ref(ref.field, ref.target)
+    if isinstance(ref, (RelatedObject, Referrer, LinkPick)):
+        inner, inner_spec = unwrap_ref(ref, spec)
+        if inner is not ref:
+            return _is_text_ref(inner, inner_spec)
     value_type = ref_value_type(spec, ref)
     if isinstance(value_type, list):
         present = [kind for kind in value_type if kind != "null"]
@@ -3391,8 +3682,10 @@ def ordering_ignores_case(expr: Any, spec: ObjectTypeSpec) -> bool:
 
 def _may_hold_text(ref: Any, spec: ObjectTypeSpec) -> bool:
     """Can `ref` hold a string, by its schema or column type?"""
-    if isinstance(ref, RelatedObject):
-        return _may_hold_text(ref.field, ref.target)
+    if isinstance(ref, (RelatedObject, Referrer, LinkPick)):
+        inner, inner_spec = unwrap_ref(ref, spec)
+        if inner is not ref:
+            return _may_hold_text(inner, inner_spec)
     value_type = ref_value_type(spec, ref)
     if isinstance(value_type, list):
         return "string" in value_type
@@ -3989,8 +4282,7 @@ def _parse_json_text(value: Any) -> Any:
 def _select_converter(column: "ColumnRef", spec: ObjectTypeSpec) -> Optional[Any]:
     """How to turn one `select` column's database value into its schema
     type, or `None` when it already arrives as one."""
-    while isinstance(column, RelatedObject):
-        column, spec = column.field, column.target
+    column, spec = unwrap_ref(column, spec)
     name = column.name if isinstance(column, FlatColumnRef) else column
     if isinstance(name, str):
         return _to_bool if name in spec.bool_columns else None
