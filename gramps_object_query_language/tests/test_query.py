@@ -1608,11 +1608,31 @@ def test_ordering_comparison_gets_nocase_default_collation_on_sqlite():
     assert 'surname COLLATE "NOCASE" < ?' in sql
 
 
-def test_ordering_comparison_gets_no_default_collation_on_postgresql():
-    # No built-in NOCASE on PostgreSQL -- same fallback rule ORDER BY uses.
+def test_ordering_comparison_ignores_case_on_postgresql():
+    # No built-in NOCASE on PostgreSQL: the same ASCII-only fold, compared
+    # in byte order, so `<` means what it does on SQLite and in the evaluator.
     query = Query(select=["handle"], where=Lt(FlatColumnRef("surname"), "Smith"))
-    sql, _ = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
-    assert "COLLATE" not in sql
+    sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
+    assert (
+        "translate(surname, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') "
+        'COLLATE "C" < ?'
+    ) in sql
+    assert params[0] == "smith"
+
+
+def test_ordering_two_text_fields_compares_text_on_postgresql():
+    # Used to cast both sides to NUMERIC, an error for any real text.
+    spec, where = compile_expr("Person", "primary_name.first_name < primary_name.call")
+    sql, _ = compile_query(spec, Query(select=["handle"], where=where), dialect=Dialect.POSTGRESQL)
+    assert "NUMERIC" not in sql
+    assert sql.count('COLLATE "C"') == 2
+
+
+def test_ordering_comparison_postgresql_keeps_explicit_collation():
+    query = Query(select=["handle"], where=Lt(FlatColumnRef("surname"), "Smith"))
+    sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL, collation="de_DE")
+    assert 'surname COLLATE "de_DE" < ?' in sql
+    assert params[0] == "Smith"
 
 
 def test_ordering_comparison_uses_explicit_collation():

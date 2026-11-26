@@ -52,9 +52,6 @@ COMPARE = ["==", "!=", "<", "<=", ">", ">="]
 #: steers around so that new ones stand out. Remove an entry once its fix
 #: lands, and the generator writes those expressions again.
 KNOWN_ISSUES = {
-    # `<`/`>` on strings: SQLite's SQL compares them with `COLLATE NOCASE`,
-    # the evaluator case-sensitively (and PostgreSQL by its collation).
-    "string-ordering",
     # PostgreSQL only, from here down.
     # A number field that can hold JSON `null` (`date.format`): "cannot
     # cast jsonb null to type numeric".
@@ -220,7 +217,11 @@ class QueryGenerator:
 
     def _string(self, path: Optional[str] = None) -> str:
         value = self._field_value(path, str)
-        return repr(self.pick(self.pools.strings) if value is None else value)
+        if value is None:
+            value = self.pick(self.pools.strings)
+        if self.chance(0.25):  # `==` is exact, `<` ignores case: test both
+            value = self.pick([value.upper(), value.lower(), value.swapcase()])
+        return repr(value)
 
     def _integer(self, path: Optional[str] = None) -> str:
         value = self._field_value(path, int)

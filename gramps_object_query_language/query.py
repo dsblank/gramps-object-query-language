@@ -2073,8 +2073,16 @@ class Comparison:
         # still renders as TEXT on both sides via the existing type checks).
         # A computed side (`a + b`) is always a number, so the other side
         # is read as one too, for `==` as much as for `<`.
+        # On PostgreSQL two text fields (`given_name < surname`) compare as
+        # text: cast to numbers, they'd fail. (SQLite needs no cast either way.)
+        pg_text_pair = (
+            dialect == Dialect.POSTGRESQL
+            and is_field_comparison
+            and _may_hold_text(self.column, spec)
+            and _may_hold_text(self.value, spec)
+        )
         numeric = (
-            self.op in _ORDERING_OPS
+            (self.op in _ORDERING_OPS and not pg_text_pair)
             or isinstance(self.value, _NUMBER_TYPES)
             or isinstance(self.column, _NUMBER_TYPES)
         )
@@ -2083,6 +2091,15 @@ class Comparison:
         column_sql, column_params = _render_column(
             self.column, spec, dialect, value=cast_hint, treeid=treeid
         )
+        if (
+            dialect == Dialect.POSTGRESQL
+            and self.op in _ORDERING_OPS
+            and not collation
+            and (pg_text_pair or (not is_field_comparison and isinstance(self.value, str)))
+        ):
+            return self._compile_postgresql_text_order(
+                spec, column_sql, column_params, dialect, treeid, cast_hint
+            )
         # `<`/`<=`/`>`/`>=` against a text column only means what it says
         # about that column's `ORDER BY` position if it's evaluated under
         # the exact same collation `ORDER BY` itself would use -- see
@@ -2108,6 +2125,28 @@ class Comparison:
             literal = _coerce_bool_literal(self.column, self.value, spec)
             comparison_params = column_params + [literal]
         return comparison_sql, comparison_params
+
+    def _compile_postgresql_text_order(
+        self, spec, column_sql, column_params, dialect, treeid, cast_hint
+    ) -> Tuple[str, list]:
+        """`<`/`>`/... on text on PostgreSQL, meaning what it means on SQLite
+        and in the evaluator: ignoring case where SQLite's `NOCASE` applies
+        (`ordering_ignores_case`, the same ASCII-only fold), and in byte
+        order (`COLLATE "C"`), not the database's own collation."""
+        fold = ordering_ignores_case(self, spec)
+
+        def text(sql: str) -> str:
+            if fold:
+                sql = f"translate({sql}, '{_UPPER}', '{_LOWER}')"
+            return f'{sql} COLLATE "C"'
+
+        if isinstance(self.value, _FIELD_VALUE_TYPES):
+            value_sql, value_params = _render_column(
+                self.value, spec, dialect, value=cast_hint, treeid=treeid
+            )
+            return f"{text(column_sql)} {self.op} {text(value_sql)}", column_params + value_params
+        literal = nocase_key(self.value) if fold else self.value
+        return f"{text(column_sql)} {self.op} ?", column_params + [literal]
 
     def _sql_op(self, dialect: Optional[Dialect]) -> str:
         return _NULL_SAFE_OPS.get(self.op, self.op)
@@ -3317,6 +3356,42 @@ def _is_text_ref(ref: "ColumnRef", spec: ObjectTypeSpec) -> bool:
     if isinstance(ref, FlatColumnRef):
         ref = ref.name
     return isinstance(ref, str) and ref in spec.text_columns
+
+
+_UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_LOWER = "abcdefghijklmnopqrstuvwxyz"
+_ASCII_FOLD = str.maketrans(_UPPER, _LOWER)
+
+
+def nocase_key(value: Any) -> Any:
+    """`value` with its ASCII letters lower-cased, if it's a string: the
+    folding SQLite's built-in `NOCASE` collation does."""
+    return value.translate(_ASCII_FOLD) if isinstance(value, str) else value
+
+
+def ordering_ignores_case(expr: Any, spec: ObjectTypeSpec) -> bool:
+    """Does `<`/`<=`/`>`/`>=` in `expr` compare text ignoring case? It does
+    wherever SQLite's SQL adds `COLLATE NOCASE` (`_collate_suffix`): when
+    the field on either side is text (`_is_text_ref`). PostgreSQL
+    (`Comparison._compile_postgresql_text_order`) and the evaluator ask
+    this too, so all three agree. `==`/`!=`/`in` compare exactly."""
+    if not isinstance(expr, Comparison) or expr.op not in _ORDERING_OPS:
+        return False
+    if _is_text_ref(expr.column, spec):
+        return True
+    return isinstance(expr.value, _FIELD_VALUE_TYPES) and _is_text_ref(expr.value, spec)
+
+
+def _may_hold_text(ref: Any, spec: ObjectTypeSpec) -> bool:
+    """Can `ref` hold a string, by its schema or column type?"""
+    if isinstance(ref, RelatedObject):
+        return _may_hold_text(ref.field, ref.target)
+    value_type = ref_value_type(spec, ref)
+    if isinstance(value_type, list):
+        return "string" in value_type
+    if value_type is not None:
+        return value_type == "string"
+    return _is_text_ref(ref, spec)
 
 
 def _collate_suffix(
