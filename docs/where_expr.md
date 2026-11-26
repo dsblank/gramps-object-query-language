@@ -801,11 +801,18 @@ Python itself:
   [Counting a field](#counting-a-field-and-different-values-distinct).
 - `[x.<path> for x in <list> if <condition>][n]` -- one matching entry,
   see [One entry chosen by a condition](#one-entry-chosen-by-a-condition-0).
-- Only one `for` clause, except in `any(...)`: there each `for` after the
-  first goes over a list of the loop variable just before it,
-  `any(c.gender == Person.FEMALE for f in parent_families for c in
-  f.children)`, the same as nesting one `any(...)` per `for`. An `if`
+- Only one `for` clause, except in `any(...)`, `len([...])` and
+  `len(distinct([...]))`: there each `for` after the first goes over a
+  list of the loop variable just before it, `any(c.gender ==
+  Person.FEMALE for f in parent_families for c in f.children)`. An `if`
   belongs to the `for` before it and can only test that loop variable.
+  `any(...)` means the same as nesting one `any(...)` per `for`. A
+  `len(...)` counts every entry of the last list, reached through every
+  entry of the ones before it -- here each list must be a collection of
+  records (`parent_families`, `children`, `events`, ...), not a list
+  inside a record or `backlinks`/`child_refs`/`event_refs`. A person in
+  two of the same families is reached twice; `len(distinct([c.handle
+  for ...]))` counts them once.
 - The loop variable is a plain name (no tuple-unpacking).
 - `<list>` is a collection name, a list inside the record (optionally
   across a relationship, `father.attribute_list`), or -- inside another

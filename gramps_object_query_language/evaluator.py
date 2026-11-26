@@ -571,11 +571,14 @@ def _collection_count(reader: RecordReader, data: Any, count: CollectionCount) -
     """
     if isinstance(count.collection, Backlinks):
         return sum(1 for _ in _backlink_handles(reader, data, count.condition))
-    rows = [
-        (row, row_spec)
-        for row, row_spec in _collection_rows(reader, data, count.collection)
-        if count.condition is None or _matches(reader, row, count.condition, row_spec)
-    ]
+    rows = [(data, None)]
+    for collection, condition in (*count.via, (count.collection, count.condition)):
+        rows = [
+            (row, row_spec)
+            for parent, _ in rows
+            for row, row_spec in _collection_rows(reader, parent, collection)
+            if condition is None or _matches(reader, row, condition, row_spec)
+        ]
     if count.projection is None:
         return len(rows)
     return _count_values(
