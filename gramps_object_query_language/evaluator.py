@@ -439,6 +439,19 @@ def _collection_handles(data: Any, collection: Collection, reader: Optional[Reco
                 if class_name == collection.backlink_class
             }
         )
+    if collection.via_chain:
+        # `siblings`: walk each collection in turn, then each record once,
+        # in handle order as the SQL picks them, never `data` itself.
+        assert reader is not None
+        rows = [data]
+        for link in collection.via_chain:
+            rows = [
+                related
+                for row in rows
+                for handle in _collection_handles(row, link, reader)
+                if (related := reader.get(link.target.table, handle)) is not None
+            ]
+        return sorted({_handle(row) for row in rows} - {_handle(data)})
     items = get_json_path(data, collection.list_path) or []
     if collection.ref_field:
         return [item.get(collection.ref_field) for item in items if item]
