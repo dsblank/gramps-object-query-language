@@ -92,6 +92,8 @@ from .query import (
     ObjectTypeSpec,
     Or,
     RelatedObject,
+    comparison_ignores_case,
+    nocase_key,
     undated_guard,
     _FIELD_VALUE_TYPES,
 )
@@ -739,6 +741,15 @@ def _compare(op: str, left: Any, right: Any) -> Optional[bool]:
     raise ValueError(f"unsupported operator: {op!r}")
 
 
+def _ignores_case(expr: Any, spec: ObjectTypeSpec) -> bool:
+    """`comparison_ignores_case`, worked out once per expression and type
+    rather than once per record."""
+    cache = expr.__dict__.setdefault("_ignores_case", {})
+    if spec.table not in cache:
+        cache[spec.table] = comparison_ignores_case(expr, spec)
+    return cache[spec.table]
+
+
 def _evaluate_tri(reader: RecordReader, data: Any, expr: Any, spec: ObjectTypeSpec) -> Optional[bool]:
     """`evaluate_where`'s actual recursion, in SQL's three-valued logic
     (`True`/`False`/`None` for `UNKNOWN`) rather than a plain `bool`.
@@ -806,6 +817,8 @@ def _evaluate_tri(reader: RecordReader, data: Any, expr: Any, spec: ObjectTypeSp
         value = _resolve(reader, data, expr.column, spec)
         if value is None:
             return None
+        if _ignores_case(expr, spec):
+            return nocase_key(value) in [nocase_key(v) for v in expr.values]
         return value in expr.values
     if isinstance(expr, Contains):
         # A plain substring test -- unlike `Like`'s SQL-pattern matching
@@ -834,6 +847,8 @@ def _evaluate_tri(reader: RecordReader, data: Any, expr: Any, spec: ObjectTypeSp
             right = _resolve(reader, data, expr.value, spec)
         else:
             right = expr.value
+        if _ignores_case(expr, spec):
+            left, right = nocase_key(left), nocase_key(right)
         return _compare(expr.op, left, right)
     raise TypeError(f"unsupported where expression: {expr!r}")
 

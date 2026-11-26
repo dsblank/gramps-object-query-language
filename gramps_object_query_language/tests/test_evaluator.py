@@ -2589,7 +2589,9 @@ def test_picked_entry_where(indexed_hop_db, pg_conn, where_expr, expected):
         # A custom type matches by its stored name.
         ("attribute_list['Hair color'].value", {"father": "Brown"}),
         ("attribute_list['Caste'].value", {}),
-        ("attribute_list['hair color'].value", {}),
+        # Names ignore case, like every text comparison.
+        ("attribute_list['hair color'].value", {"father": "Brown"}),
+        ("attribute_list['occupation'].value", {"father": "Farmer"}),
     ],
 )
 def test_attribute_lookup_select(indexed_hop_db, pg_conn, entry, expected):

@@ -191,6 +191,18 @@ def test_flat_column_equality(db):
     ]
 
 
+def test_text_comparison_ignores_case(db):
+    # "surname == 'smith'" finds the Smiths as 'Smith' does; `in [...]` and
+    # `<` ignore case too. regex(...) is the case-sensitive way to match.
+    smiths = [("dad1",), ("granddad1",), ("kid1",), ("mom1",)]
+    assert run(db, "Person", "surname == 'smith'") == smiths
+    assert run(db, "Person", "surname != 'SMITH'") == [("grandma1",), ("other1",)]
+    assert run(db, "Person", "given_name in ['john', 'JANE']") == [("dad1",), ("mom1",)]
+    assert run(db, "Person", "surname < 'e'") == [("grandma1",)]
+    assert run(db, "Person", "regex(surname, '^smith')") == []
+    assert run(db, "Person", "regex(surname, '^S[a-z]+$')") == smiths
+
+
 def test_class_constant(db):
     # gender == Person.MALE reads the real value off Person.MALE (1) --
     # gender == 1 compiles identically. Matches every male across both

@@ -54,6 +54,20 @@ only ever recognized as the left-hand operand -- see
 [Counting a collection](#counting-a-collection-len) and
 [Array length](#array-length-lenpath).)
 
+Text is compared ignoring case, with every operator above and with `in
+[...]`: `surname == 'smith'`
+finds "Smith" and "SMITH" too, and `surname < 'b'` is true for "Adams"
+and "adams" alike, matching how text sorts (see
+[Sorting](#sorting-the-same-paths-in-order_by)). Only the letters `A`-`Z`
+are folded, the same on every backend, so `'élise'` doesn't find
+"Élise". To match case exactly, use [`regex(...)`](#regex), which is
+case-sensitive. Handles (`handle`, `father_handle`, entries of
+`note_list`, ...) are identifiers, not text, and are compared exactly.
+
+```python
+Person "surname == 'smith'"
+```
+
 ## Combining conditions with `and`, `or`, and `not`
 
 Multiple comparisons can be joined with `and`:
@@ -350,7 +364,8 @@ The name is matched two ways because Gramps stores them two ways. A type
 you made up yourself ("Film", "Hair color") is stored by its name. A
 built-in type (Age, Nickname, Occupation, ...) is stored by number only,
 with an empty name, so its English name is looked up and matched by
-number. Names match exactly, so `'hair color'` doesn't find "Hair color".
+number. Names ignore case, like any text, so `'hair color'` finds "Hair
+color" and `'occupation'` finds Occupation.
 When there's no attribute of that type, there's no value, and
 `attribute_list['Film'] == None` is true.
 
@@ -897,7 +912,7 @@ A name is looked up on the type's own class, in this order:
 2. the built-in type's name in the language Gramps is running in, ignoring
    case;
 3. otherwise it is a custom type's name: `value` is that class's `CUSTOM`
-   number and `string` is exactly the name. The `CUSTOM` number is read off
+   number and `string` is the name, ignoring case like any text. The `CUSTOM` number is read off
    the class, since it isn't the same for all of them (`FamilyRelType` uses
    4, `ChildRefType` 7, most others 0). `StyledTextTagType` has no custom
    types, so an unknown name there is an error.

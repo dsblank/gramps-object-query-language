@@ -1923,6 +1923,7 @@ def _render_column(
 #: Operators for which a field-vs-field comparison gets a numeric-cast hint
 #: (see `Comparison.compile`) -- ordering only, not equality.
 _ORDERING_OPS = frozenset({"<", "<=", ">", ">="})
+_CASE_FOLDING_OPS = _ORDERING_OPS | {"=", "!="}
 
 #: `=`/`!=` render as `IS [NOT] DISTINCT FROM` instead -- NULL-safe
 #: equality, so a missing value is treated as a distinct, comparable value
@@ -2073,8 +2074,14 @@ class Comparison:
         # still renders as TEXT on both sides via the existing type checks).
         # A computed side (`a + b`) is always a number, so the other side
         # is read as one too, for `==` as much as for `<`.
+        # Two text fields (`given_name < surname`) compare as text.
+        both_text = (
+            is_field_comparison
+            and _holds_text(self.column, spec)
+            and _holds_text(self.value, spec)
+        )
         numeric = (
-            self.op in _ORDERING_OPS
+            (self.op in _ORDERING_OPS and not both_text)
             or isinstance(self.value, _NUMBER_TYPES)
             or isinstance(self.column, _NUMBER_TYPES)
         )
@@ -2083,29 +2090,35 @@ class Comparison:
         column_sql, column_params = _render_column(
             self.column, spec, dialect, value=cast_hint, treeid=treeid
         )
-        # `<`/`<=`/`>`/`>=` against a text column only means what it says
-        # about that column's `ORDER BY` position if it's evaluated under
-        # the exact same collation `ORDER BY` itself would use -- see
-        # `_collate_suffix`'s own docstring for the bug this fixes (a
-        # client-computed "rows before this one" rank, used to know which
-        # row to highlight, silently landing on a different row than the
-        # one actually selected). `=`/`!=` are deliberately left alone: a
-        # case-insensitive equality would change *matching* semantics, not
-        # just ordering, which nothing here asks for.
-        if self.op in _ORDERING_OPS and not is_field_comparison:
-            column_sql += _collate_suffix(_is_text_ref(self.column, spec), collation, dialect)
+        ordering = self.op in _ORDERING_OPS
+        # Text compares ignoring case (`ignores_case`), for `==`/`!=` as
+        # much as for `<`. An explicit `collation` (a locale's) still
+        # decides ordering comparisons, so that `surname < ?` agrees with
+        # the `ORDER BY surname` it was asked under -- see
+        # `_collate_suffix` for the bug that agreement fixed (a client-
+        # computed "rows before this one" rank landing on the wrong row).
+        fold = comparison_ignores_case(self, spec) and not (ordering and collation)
+        # Rendered as text, not cast to a number for a numeric literal.
+        as_text = both_text if is_field_comparison else isinstance(self.value, str)
+        if fold:
+            column_sql = _fold_case_sql(column_sql, dialect, ordering)
+        elif ordering and as_text:
+            column_sql = _exact_order_sql(column_sql, self.column, spec, collation, dialect)
         if is_field_comparison:
             value_sql, value_params = _render_column(
                 self.value, spec, dialect, value=cast_hint, treeid=treeid
             )
-            if self.op in _ORDERING_OPS:
-                column_sql += _collate_suffix(_is_text_ref(self.column, spec), collation, dialect)
-                value_sql += _collate_suffix(_is_text_ref(self.value, spec), collation, dialect)
+            if fold:
+                value_sql = _fold_case_sql(value_sql, dialect, ordering)
+            elif ordering and as_text:
+                value_sql = _exact_order_sql(value_sql, self.value, spec, collation, dialect)
             comparison_sql = f"{column_sql} {sql_op} {value_sql}"
             comparison_params = column_params + value_params
         else:
             comparison_sql = f"{column_sql} {sql_op} ?"
             literal = _coerce_bool_literal(self.column, self.value, spec)
+            if fold and dialect == Dialect.POSTGRESQL:  # SQLite's NOCASE folds it
+                literal = nocase_key(literal)
             comparison_params = column_params + [literal]
         return comparison_sql, comparison_params
 
@@ -2342,9 +2355,9 @@ class In:
         treeid: Optional[int] = None,
         collation: Optional[str] = None,
     ) -> Tuple[str, list]:
-        # `collation` is accepted, not used -- `IN` is exact-match
-        # membership, not an ordering comparison; see Regex.compile's own
-        # note on why every leaf still has to accept it.
+        # `collation` is accepted, not used -- `IN` is membership, not an
+        # ordering comparison; see Regex.compile's own note on why every
+        # leaf still has to accept it. Text ignores case, as for `==`.
         if not self.values:
             return "1 = 0", []
         column_sql, column_params = _render_column(
@@ -2352,6 +2365,10 @@ class In:
         )
         placeholders = ", ".join(["?"] * len(self.values))
         literals = [_coerce_bool_literal(self.column, v, spec) for v in self.values]
+        if comparison_ignores_case(self, spec):
+            column_sql = _fold_case_sql(column_sql, dialect, ordering=False)
+            if dialect == Dialect.POSTGRESQL:  # SQLite's NOCASE folds them
+                literals = [nocase_key(v) for v in literals]
         return f"{column_sql} IN ({placeholders})", column_params + literals
 
     def __eq__(self, other: object) -> bool:
@@ -3317,6 +3334,111 @@ def _is_text_ref(ref: "ColumnRef", spec: ObjectTypeSpec) -> bool:
     if isinstance(ref, FlatColumnRef):
         ref = ref.name
     return isinstance(ref, str) and ref in spec.text_columns
+
+
+#: Gramps' schema gives every handle (`handle`, `father_handle`, `ref`,
+#: `note_list[0]`, ...) and nothing else this `maxLength`.
+_HANDLE_MAX_LENGTH = 50
+
+
+def _schema_node(ref: Any, spec: ObjectTypeSpec) -> Optional[dict]:
+    """The JSON Schema node `ref` lands on, or `None` when it isn't a plain
+    field (a count, arithmetic, a whole entry) or the schema can't say."""
+    if isinstance(ref, RelatedObject):
+        return _schema_node(ref.field, ref.target)
+    if isinstance(ref, JsonPath):
+        try:
+            return walk_schema(spec, ref.segments)
+        except QueryError:
+            return None
+    if isinstance(ref, JsonArrayPick):
+        return None if ref.field is None else _schema_node(ref.field, ref.element_spec)
+    if isinstance(ref, FlatColumnRef):
+        ref = ref.name
+    if isinstance(ref, str) and ref in spec.text_columns:
+        properties = _schema_properties(spec.cls.get_schema())
+        if ref in properties:
+            return properties[ref]
+        # A column with no JSON field of its own: `given_name`/`surname`
+        # are text, `enclosed_by` a handle (a relationship's link column).
+        links = {link for _target, link in _RELATIONSHIPS.get(spec.table, {}).values()}
+        return {"type": "string", **({"maxLength": _HANDLE_MAX_LENGTH} if ref in links else {})}
+    return None
+
+
+def ignores_case(ref: Any, spec: ObjectTypeSpec) -> bool:
+    """Is `ref` text that `==`, `!=`, `<`, ..., and `in [...]` compare
+    ignoring case? Every string field is, except a handle: a handle is an
+    identifier, not text, and comparing it exactly keeps its index usable.
+
+    Case is folded for the ASCII letters only, the same on every backend:
+    SQLite's `NOCASE` (which sorting already uses), the same fold spelled
+    out on PostgreSQL, and `nocase_key` in the evaluator.
+    """
+    return _holds_text(ref, spec) and _schema_node(ref, spec).get("maxLength") != _HANDLE_MAX_LENGTH
+
+
+def _holds_text(ref: Any, spec: ObjectTypeSpec) -> bool:
+    """Can `ref` hold a string (a handle included)?"""
+    node = _schema_node(ref, spec)
+    if node is None:
+        return False
+    kinds = node.get("type")
+    kinds = kinds if isinstance(kinds, list) else [kinds]
+    return "string" in kinds
+
+
+_ASCII_FOLD = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"
+)
+
+
+def nocase_key(value: Any) -> Any:
+    """`value` with its ASCII letters lower-cased, if it's a string --
+    the fold `ignores_case` comparisons use, as SQLite's `NOCASE` does it."""
+    return value.translate(_ASCII_FOLD) if isinstance(value, str) else value
+
+
+def comparison_ignores_case(expr: Any, spec: ObjectTypeSpec) -> bool:
+    """Does `expr` (an `Eq`/`Ne`/`Lt`/.../`In`) compare text ignoring case?
+    Yes when it compares a text field (`ignores_case`) with a string, or
+    with another text field. `like(...)`, substring `in` and `regex(...)`
+    have rules of their own. The SQL (`Comparison.compile`, `In.compile`)
+    and the evaluator both ask this, so they can't disagree about it."""
+    if isinstance(expr, In):
+        return any(isinstance(v, str) for v in expr.values) and ignores_case(expr.column, spec)
+    if not isinstance(expr, Comparison) or expr.op not in _CASE_FOLDING_OPS:
+        return False
+    if isinstance(expr.value, _FIELD_VALUE_TYPES):
+        return ignores_case(expr.column, spec) and ignores_case(expr.value, spec)
+    return isinstance(expr.value, str) and ignores_case(expr.column, spec)
+
+
+def _fold_case_sql(sql: str, dialect: Optional[Dialect], ordering: bool) -> str:
+    """`sql` (a text value) compared ignoring case: `COLLATE NOCASE` on
+    SQLite; on PostgreSQL the same ASCII-only fold, in byte order for an
+    ordering comparison, so `<` agrees with SQLite and the evaluator rather
+    than with whatever the database's own collation does. On PostgreSQL a
+    literal on the other side is folded in Python (`nocase_key`) before
+    it's bound; SQLite's `NOCASE` takes care of it there."""
+    if dialect != Dialect.POSTGRESQL:
+        return f'{sql} COLLATE "NOCASE"'
+    folded = f"translate({sql}, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')"
+    return f'{folded} COLLATE "C"' if ordering else folded
+
+
+def _exact_order_sql(
+    sql: str, ref: Any, spec: ObjectTypeSpec, collation: Optional[str], dialect: Optional[Dialect]
+) -> str:
+    """`sql` for an ordering comparison that doesn't ignore case (a handle,
+    or text against a non-string): under an explicit `collation` as
+    before, otherwise in plain byte order -- SQLite's default, `COLLATE
+    "C"` on PostgreSQL -- as the evaluator compares it."""
+    if not _holds_text(ref, spec):
+        return sql
+    if collation:
+        return sql + _collate_suffix(True, collation, dialect)
+    return f'{sql} COLLATE "C"' if dialect == Dialect.POSTGRESQL else sql
 
 
 def _collate_suffix(

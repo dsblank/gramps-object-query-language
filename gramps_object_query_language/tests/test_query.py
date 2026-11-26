@@ -211,7 +211,7 @@ def test_compile_query_jsonpath_where_eq():
     path = JsonPath(("primary_name", "first_name"))
     query = Query(select=["handle"], where=Eq(path, "Root"))
     sql, params = compile_query(PERSON, query, dialect=Dialect.SQLITE)
-    assert "json_extract(json_data, ?) IS NOT DISTINCT FROM ?" in sql
+    assert 'json_extract(json_data, ?) COLLATE "NOCASE" IS NOT DISTINCT FROM ?' in sql
     assert params == ["$.primary_name.first_name", "Root", 50]
 
 
@@ -228,7 +228,7 @@ def test_compile_query_jsonpath_combined_with_plain_column():
     query = Query(select=["handle"], where=And(Eq("gender", 1), Eq(path, "Root")))
     sql, params = compile_query(PERSON, query, dialect=Dialect.SQLITE)
     assert "gender IS NOT DISTINCT FROM ?" in sql
-    assert "json_extract(json_data, ?) IS NOT DISTINCT FROM ?" in sql
+    assert 'json_extract(json_data, ?) COLLATE "NOCASE" IS NOT DISTINCT FROM ?' in sql
     # plain-column param first, then the JsonPath's own [path, value] pair --
     # matches left-to-right order of appearance in the compiled SQL text.
     assert params == [1, "$.primary_name.first_name", "Root", 50]
@@ -254,7 +254,7 @@ def test_compile_count_query_jsonpath_where():
     )
     assert sql == (
         "SELECT COUNT(*) FROM person WHERE "
-        "(json_extract(json_data, ?) IS NOT DISTINCT FROM ?)"
+        "(json_extract(json_data, ?) COLLATE \"NOCASE\" IS NOT DISTINCT FROM ?)"
     )
     assert params == ["$.primary_name.first_name", "Root"]  # no LIMIT param -- it's a COUNT
 
@@ -342,11 +342,11 @@ def test_compile_related_json_bool_where_eq_stays_bool():
 
 
 def test_compile_flat_non_bool_column_where_eq_unaffected():
-    # A non-bool flat column's literal is passed through untouched --
-    # coercion only kicks in for `bool_columns` members.
+    # A non-bool flat column's literal isn't coerced -- that only kicks in
+    # for `bool_columns` members. (Text is folded, to ignore case.)
     query = Query(select=["handle"], where=Eq("surname", "Smith"))
     sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
-    assert params[0] == "Smith"
+    assert params[0] == "smith"
 
 
 # --- select_normalizer: database values as their schema types ---------------
@@ -400,8 +400,11 @@ def test_compile_query_jsonpath_where_eq_str_postgresql_stays_text():
     path = JsonPath(("primary_name", "first_name"))
     query = Query(select=["handle"], where=Eq(path, "Root"))
     sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
-    assert "jsonb_extract_path_text(json_data::jsonb, ?, ?) IS NOT DISTINCT FROM ?" in sql
-    assert params == ["primary_name", "first_name", "Root", 50]
+    assert (
+        "translate(jsonb_extract_path_text(json_data::jsonb, ?, ?), "
+        "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') IS NOT DISTINCT FROM ?"
+    ) in sql
+    assert params == ["primary_name", "first_name", "root", 50]
 
 
 def test_compile_query_jsonpath_select_unaffected_by_value_casting():
@@ -940,7 +943,7 @@ def test_flat_column_field_vs_field_renders_as_column_not_literal():
         Query(select=["handle"], where=Eq("given_name", FlatColumnRef("surname"))),
         dialect=Dialect.SQLITE,
     )
-    assert "given_name IS NOT DISTINCT FROM surname" in sql
+    assert 'given_name COLLATE "NOCASE" IS NOT DISTINCT FROM surname COLLATE "NOCASE"' in sql
     # No bound parameter for "surname" -- it's a column reference, not a value.
     assert "surname" not in params
 
@@ -951,7 +954,7 @@ def test_bare_str_value_still_treated_as_literal_not_flat_column_field():
     sql, params = compile_query(
         PERSON, Query(select=["handle"], where=Eq("surname", "Smith")), dialect=Dialect.SQLITE
     )
-    assert "surname IS NOT DISTINCT FROM ?" in sql
+    assert 'surname COLLATE "NOCASE" IS NOT DISTINCT FROM ?' in sql
     assert params[0] == "Smith"
 
 
@@ -1608,11 +1611,16 @@ def test_ordering_comparison_gets_nocase_default_collation_on_sqlite():
     assert 'surname COLLATE "NOCASE" < ?' in sql
 
 
-def test_ordering_comparison_gets_no_default_collation_on_postgresql():
-    # No built-in NOCASE on PostgreSQL -- same fallback rule ORDER BY uses.
+def test_ordering_comparison_ignores_case_on_postgresql():
+    # No built-in NOCASE on PostgreSQL: the same ASCII fold, in byte order,
+    # so `<` means what it does on SQLite and in the evaluator.
     query = Query(select=["handle"], where=Lt(FlatColumnRef("surname"), "Smith"))
-    sql, _ = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
-    assert "COLLATE" not in sql
+    sql, params = compile_query(PERSON, query, dialect=Dialect.POSTGRESQL)
+    assert (
+        "translate(surname, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') "
+        'COLLATE "C" < ?'
+    ) in sql
+    assert params[0] == "smith"
 
 
 def test_ordering_comparison_uses_explicit_collation():
@@ -1621,16 +1629,22 @@ def test_ordering_comparison_uses_explicit_collation():
     assert 'surname COLLATE "de_DE" >= ?' in sql
 
 
-def test_equality_comparison_never_gets_a_collate_clause():
-    # `=`/`!=` are deliberately left alone -- a case-insensitive equality
-    # would change *matching* semantics (two differently-cased surnames
-    # would start comparing equal), which nothing asks for; only ordering
-    # needs to agree with ORDER BY. Checked against the count query (no
-    # implicit ORDER BY of its own) so the assertion isn't tripped up by
-    # compile_query's own always-collated trailing handle tiebreak.
+def test_equality_comparison_ignores_case_whatever_the_collation():
+    # `==` on text ignores case; a locale collation only decides ordering.
     query = Query(where=Eq(FlatColumnRef("surname"), "Smith"))
     sql, _ = compile_count_query(PERSON, query, collation="de_DE")
-    assert "COLLATE" not in sql
+    assert 'surname COLLATE "NOCASE" IS NOT DISTINCT FROM ?' in sql
+    assert "de_DE" not in sql
+
+
+def test_handle_comparison_is_exact():
+    # A handle is an identifier, not text: compared exactly, so its index
+    # still serves `handle == ...` -- also across a hop and in a list.
+    for expr in ("handle == 'abc'", "father_handle in ['abc']", "father.handle == 'abc'",
+                 "note_list[0] == 'abc'"):
+        spec, where = compile_expr("Family", expr)
+        sql, _ = compile_count_query(spec, Query(where=where), dialect=Dialect.SQLITE)
+        assert "COLLATE" not in sql, expr
 
 
 def test_ordering_comparison_collation_reaches_leaves_through_and_or_not():
@@ -2016,7 +2030,7 @@ def test_exists_sqlite_shape_with_condition():
     )
     assert "EXISTS (SELECT 1 FROM person AS person__target, json_each(family.json_data, ?) AS je" in sql
     assert "person__target.handle = json_extract(je.value, '$.ref')" in sql
-    assert "given_name IS NOT DISTINCT FROM ?" in sql
+    assert 'given_name COLLATE "NOCASE" IS NOT DISTINCT FROM ?' in sql
     assert params == ["$.child_ref_list", "Steve", 50]
 
 
@@ -2042,7 +2056,7 @@ def test_exists_postgresql_shape_ref_object_list():
         "jsonb_array_elements(family.json_data::jsonb -> 'child_ref_list') AS je(value)" in sql
     )
     assert "person__target.handle = je.value ->> 'ref'" in sql
-    assert params == ["Steve", 50]
+    assert params == ["steve", 50]
 
 
 def test_exists_flat_handle_list_sqlite_shape():
@@ -2491,7 +2505,7 @@ def test_json_array_exists_postgresql_shape():
         "'attribute_list') AS je(value)" in sql
     )
     assert "jsonb_extract_path_text(je.value::jsonb, ?)" in sql
-    assert params == ["value", "X", 50]
+    assert params == ["value", "x", 50]
 
 
 def test_json_array_exists_relationship_chained_shape():

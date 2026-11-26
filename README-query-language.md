@@ -701,8 +701,22 @@ relationship to its parents, and so on -- can be compared with its name.
 Gramps' own types match by their English name or by their name in the
 language Gramps is running in, ignoring case (`'census'` works too). Any
 other name means a custom type someone typed in, like "Tax list", and
-matches only that exact text. `type == 'Census'` is the same query as
+matches that name, ignoring case. `type == 'Census'` is the same query as
 `type.value == EventType.CENSUS`, and runs just as fast.
+
+### Goal: Find a name however it was capitalized
+
+```
+Person "surname == 'smith'"
+Person "given_name in ['john', 'JANE']"
+Person "regex(surname, '^Mc[A-Z]')"
+```
+
+Comparing text ignores case: the first line finds "Smith", "smith" and
+"SMITH" alike, and so do `<`, `>` and `in [...]`. Only the letters A-Z are
+folded, so an accented letter must match as written. When case matters --
+"McDonald" but not "Mcdonald" -- use `regex(...)`, which matches case
+exactly.
 
 ## Things GOQL can't do (yet)
 

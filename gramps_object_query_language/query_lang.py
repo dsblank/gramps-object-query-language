@@ -1700,15 +1700,6 @@ _LOOKUP_LISTS = {"attribute_list": AttributeType}
 _LOOKUP_BOUND = "_entry"
 
 
-def _builtin_type_values(type_class: type) -> Dict[str, int]:
-    """English name -> number for a GrampsType's built-in values, minus
-    Custom (every custom value is stored as Custom, so matching its number
-    would match them all). Built-ins are stored with an empty `string` and
-    only their number, so the name has to be looked up here."""
-    custom = type_class._CUSTOM
-    return {key: value for value, _label, key in type_class._DATAMAP if value != custom}
-
-
 class _TypedListLookup(ast.NodeTransformer):
     """`attribute_list['Age']` -> `[_entry for _entry in attribute_list if
     _entry.type.string == 'Age' or _entry.type.value == AttributeType.AGE][0]`:
@@ -1749,7 +1740,7 @@ class _TypedListLookup(ast.NodeTransformer):
             return ast.Compare(left=left, ops=[ast.Eq()], comparators=[ast.Constant(value=value)])
 
         condition: ast.expr = equals(field("type", "string"), key.value)
-        builtin = _builtin_type_values(type_class).get(key.value)
+        builtin = _type_name_value(type_class, key.value)
         if builtin is not None:
             condition = ast.BoolOp(op=ast.Or(), values=[condition, equals(field("type", "value"), builtin)])
         comp = ast.ListComp(
