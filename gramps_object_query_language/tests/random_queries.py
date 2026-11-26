@@ -52,9 +52,6 @@ COMPARE = ["==", "!=", "<", "<=", ">", ">="]
 #: steers around so that new ones stand out. Remove an entry once its fix
 #: lands, and the generator writes those expressions again.
 KNOWN_ISSUES = {
-    # `<`/`>` on strings: SQLite's SQL compares them with `COLLATE NOCASE`,
-    # the evaluator case-sensitively (and PostgreSQL by its collation).
-    "string-ordering",
     # PostgreSQL only, from here down.
     # A number field that can hold JSON `null` (`date.format`): "cannot
     # cast jsonb null to type numeric".
@@ -220,7 +217,11 @@ class QueryGenerator:
 
     def _string(self, path: Optional[str] = None) -> str:
         value = self._field_value(path, str)
-        return repr(self.pick(self.pools.strings) if value is None else value)
+        if value is None:
+            value = self.pick(self.pools.strings)
+        if self.chance(0.25):  # `==` is exact, `<` ignores case: test both
+            value = self.pick([value.upper(), value.lower(), value.swapcase()])
+        return repr(value)
 
     def _integer(self, path: Optional[str] = None) -> str:
         value = self._field_value(path, int)
@@ -450,6 +451,21 @@ class QueryGenerator:
 
     def generate(self, depth: int = 3) -> str:
         return self.condition(self._scope(depth), depth)
+
+    def order_by(self) -> List[Tuple[str, str]]:
+        """One or two sort columns, `(path, "asc" | "desc")`: text more
+        often than not, since that's where backends sort differently."""
+        self._selecting = True
+        try:
+            leaves = [l for l in self._leaves_in(self._scope(0)) if l[1] in ("string", "integer", "boolean")]
+        finally:
+            self._selecting = False
+        text = [l for l in leaves if l[1] == "string"]
+        columns = []
+        for _ in range(self.pick([1, 1, 2])):
+            path = self.pick_leaf(text if text and self.chance(0.7) else leaves)[0]
+            columns.append((path, self.pick(["asc", "desc"])))
+        return columns
 
     def value(self, depth: int = 2) -> str:
         """Something to `select`: a field, a count, a pick or arithmetic."""

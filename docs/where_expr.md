@@ -54,6 +54,17 @@ only ever recognized as the left-hand operand -- see
 [Counting a collection](#counting-a-collection-len) and
 [Array length](#array-length-lenpath).)
 
+Text compares exactly with `==`, `!=` and `in [...]` (`surname == 'smith'`
+doesn't find "Smith"), but ignoring case with `<`, `<=`, `>` and `>=`, so
+that a comparison agrees with how text [sorts](#sorting-the-same-paths-in-order_by):
+`surname < 'b'` is true for "Adams" and "adams" alike. Only the letters
+`A`-`Z` are folded, and text is otherwise compared character by
+character, the same on SQLite, PostgreSQL and under privacy filtering. A
+`collation` passed in (a locale's) decides `<`/`>` instead. This holds
+for every text field, on the record itself or through a relationship
+(`father.surname < 'b'`). For a case-insensitive match, use
+[`like(...)`](#in-contains-and-like).
+
 ## Combining conditions with `and`, `or`, and `not`
 
 Multiple comparisons can be joined with `and`:

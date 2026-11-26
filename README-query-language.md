@@ -585,11 +585,12 @@ for measurements.
 Text `order_by` columns sort case-insensitively (ASCII only) by default, so
 an uncapitalized surname prefix like "de Vos" or "von Hebel" interleaves
 with the rest of the alphabet instead of sorting after every "Z...". This
-holds on both the SQL path (SQLite's built-in `NOCASE` collation) and the
-evaluator/proxied path used under privacy filtering (a matching ASCII case
-fold) -- see ROADMAP.md's "Default `NOCASE` collation on the SQL path".
-It's ASCII-only case folding, not full locale collation, so accented
-letters aren't folded on either path.
+holds for every text field (`father.surname` too), on SQLite (its
+built-in `NOCASE` collation), on PostgreSQL (the same fold spelled out)
+and under privacy filtering -- see ROADMAP.md's "Default `NOCASE`
+collation on the SQL path". It's ASCII-only case folding, not full locale
+collation, so accented letters aren't folded anywhere. `<` and `>` on text
+ignore case the same way, so a filter agrees with the sort.
 
 Every path you can filter on, you can also return — `father.surname`,
 `primary_name.surname_list[0].surname`, `birth.date.sortval`. Add `as

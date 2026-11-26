@@ -55,8 +55,10 @@ from gramps_object_query_language.proxied_query import run_query
 from gramps_object_query_language.query import (
     _POSTGRESQL_PHYSICAL_COLUMN_OVERRIDES,
     Dialect,
+    OrderBy,
     Query,
     compile_query,
+    effective_order_by,
     select_normalizer,
 )
 from gramps_object_query_language.query_lang import compile_expr, parse_select_entry
@@ -175,12 +177,16 @@ class Harness:
         generator = QueryGenerator(namespace, self.pools, rng)
         expr = generator.generate()
         value = generator.value()
+        order = generator.order_by()
         where_msg = self._check_where(namespace, expr)
         value_msg = self._check_value(namespace, value)
-        for part, (outcome, _message) in (("where", where_msg), ("select", value_msg)):
+        order_msg = self._check_order(namespace, order, rng)
+        for part, (outcome, _message) in (
+            ("where", where_msg), ("select", value_msg), ("order_by", order_msg)
+        ):
             key = f"{part} {outcome}"
             self.stats[key] = self.stats.get(key, 0) + 1
-        for msg in (where_msg, value_msg):
+        for msg in (where_msg, value_msg, order_msg):
             if msg[0] == "failed":
                 return msg
         if where_msg[0] == "rejected" and value_msg[0] == "rejected":
@@ -219,6 +225,68 @@ class Harness:
                 lines.append(f"  {name} vs evaluator: only {name}: [{extra}]  only evaluator: [{missing}]")
         if lines:
             return "failed", "\n".join([header, *lines, "  " + self._sql_text(spec, query)])
+        return "ok", ""
+
+    def _check_order(self, namespace: str, order, rng: random.Random) -> Tuple[str, str]:
+        """Every record, sorted by `order`, must come back in the same order
+        everywhere; and so must a page taken after a cursor in the middle
+        (keyset paging), the way a client asks for its next page."""
+        header = f"{namespace} order_by: {order}"
+        spec, _ = compile_expr(namespace, "handle != ''")
+        try:
+            order_by = [OrderBy(path, direction) for path, direction in order]
+            compile_query(spec, Query(select=["handle"], order_by=order_by), dialect=Dialect.SQLITE)
+        except ValueError as error:
+            return "rejected", f"{header}\n  {error}"
+        expected = run_query(self.db, spec, None, order_by=order_by, select=["handle"])
+        expected = [row[0] for row in expected]
+        # The cursor: the sort values of a row in the middle, as the
+        # evaluator reads them, then its handle.
+        middle = expected[rng.randrange(len(expected))] if expected else None
+        after = None
+        if middle is not None:
+            columns = [ob.column for ob in effective_order_by(order_by)]
+            rows = run_query(self.db, spec, None, select=["handle", *columns])
+            after = next(tuple(row[1:]) for row in rows if row[0] == middle)
+        page_expected = run_query(
+            self.db, spec, None, order_by=order_by, select=["handle"], after=after, limit=5
+        ) if after else []
+        page_expected = [row[0] for row in page_expected]
+
+        def sql_runner(run_sql):
+            def run():
+                rows = [row[0] for row in run_sql(spec, Query(select=["handle"], order_by=order_by, limit=None))]
+                page = []
+                if after:
+                    page = [row[0] for row in run_sql(
+                        spec, Query(select=["handle"], order_by=order_by, after=after, limit=5)
+                    )]
+                return rows, page
+            return run
+
+        runners = {"sqlite": sql_runner(self._sqlite)}
+        if self.pg_conn is not None:
+            runners["postgresql"] = sql_runner(self._postgresql)
+        lines = []
+        for name, run in runners.items():
+            try:
+                rows, page = run()
+            except Exception as error:
+                return "failed", f"{header}\n  {name} raised {type(error).__name__}: {error}"
+            if rows != expected:
+                first = next(i for i, (a, b) in enumerate(zip(rows + [None], expected + [None])) if a != b)
+                lines.append(
+                    f"  {name} order differs from the evaluator's at row {first}: "
+                    f"{[self._name(h) for h in rows[first:first + 3]]} vs "
+                    f"{[self._name(h) for h in expected[first:first + 3]]}"
+                )
+            elif page != page_expected:
+                lines.append(
+                    f"  {name} page after {after!r}: {[self._name(h) for h in page]} vs "
+                    f"evaluator {[self._name(h) for h in page_expected]}"
+                )
+        if lines:
+            return "failed", "\n".join([header, *lines])
         return "ok", ""
 
     def _check_value(self, namespace: str, entry: str) -> Tuple[str, str]:
